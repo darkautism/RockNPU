@@ -1,0 +1,15 @@
+[package]
+name = "rocknpu"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+half = "2"
+onnx-protobuf = "0.2.3"
+rocket-runtime = { path = "../rocket-runtime" }
+rocknpu-conv = { path = "../rocknpu-conv" }
+rocknpu-onnx = { path = "../rocknpu-onnx" }
+rocknpu-ops = { path = "../rocknpu-ops" }
+
+[dev-dependencies]
+protobuf = "=3.4.0"

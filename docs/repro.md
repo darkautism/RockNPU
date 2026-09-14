@@ -490,8 +490,8 @@ cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-s
 Then run the full graph with both Conv nodes and the final MatMul on NPU:
 
 ```sh
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin mnist8_cnn_npu
-python3 /home/kautism/rocknpu/scripts/verify_mnist8.py mnist8-allnpu
+cargo run --release --manifest-path /build/rocknpu/Cargo.toml -p rocket-smoke --bin mnist8_cnn_npu
+python3 /build/rocknpu/scripts/verify_mnist8.py mnist8-allnpu
 ```
 
 Accepted stock-Rocket evidence:
@@ -510,11 +510,11 @@ The Python verifier must report `onnx_checker=PASS node_count=12 trace_count=12`
 Prepared Conv residency has separate low-level and full-graph gates:
 
 ```sh
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin conv_prepared
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin mnist8_cnn_prepared
-python3 /home/kautism/rocknpu/scripts/verify_mnist8.py mnist8-prepared
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin conv_prepared_bench
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin mnist8_conv_bench
+cargo run --release --manifest-path /build/rocknpu/Cargo.toml -p rocket-smoke --bin conv_prepared
+cargo run --release --manifest-path /build/rocknpu/Cargo.toml -p rocket-smoke --bin mnist8_cnn_prepared
+python3 /build/rocknpu/scripts/verify_mnist8.py mnist8-prepared
+cargo run --release --manifest-path /build/rocknpu/Cargo.toml -p rocket-smoke --bin conv_prepared_bench
+cargo run --release --manifest-path /build/rocknpu/Cargo.toml -p rocket-smoke --bin mnist8_conv_bench
 ```
 
 The prepared model must report two resident Conv tensors / 51,200 bytes, Conv scratch `weight_bytes=0`, no post-first-inference scratch growth, the same 100/100 top-1/reference trace result, and bit-identical streaming/prepared layer outputs. Representative warmed layer medians were `0.2080 -> 0.1945 ms` and `0.1207 -> 0.1070 ms`; a 40-inference block full-model comparison measured `0.9626 -> 0.8066 ms` (`1.194x`). Treat single sub-millisecond samples as scheduler-noisy and prefer the block result.
@@ -524,14 +524,55 @@ The prepared model must report two resident Conv tensors / 51,200 bytes, Conv sc
 Run the real RGB pretrained model on stock RK3588 Rocket:
 
 ```sh
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin cifar10_edgeinfer
+cargo run --release --manifest-path /build/rocknpu/Cargo.toml -p rocket-smoke --bin cifar10_edgeinfer
 ```
 
 Then independently validate all 13 intermediate tensors and final prediction against the original ONNX model:
 
 ```sh
-cd /home/kautism/rocknpu
+cd /build/rocknpu
 python3 scripts/verify_cifar10_edgeinfer.py
 ```
 
 Expected high-level result: three Conv and two Gemm nodes execute on NPU, prediction is class 8 (`ship`), each trace node remains within the verifier's ONNX-reference bound, CPU/NPU cross-backend max absolute difference is <= `0.002`, and final FP16 logits are bit-identical. The current measured cross-backend maximum is `0.00097656`.
+
+## High-level `rocknpu::Session` hardware gate
+
+Run the public Session API against the same real models from the formal build workspace:
+
+```sh
+cd /build/rocknpu
+cargo run -p rocket-smoke --bin session_models
+```
+
+This gate constructs each model through `rocknpu::Session::load`, so ONNX parsing and supported static weight preparation happen once before inference. It then exercises repeated `Session::run` calls without exposing `RocketDevice`, IOVA, register commands, or executor internals to the caller.
+
+Current accepted RK3588 evidence:
+
+```text
+MNIST-8:
+  eager resident weights = 2 Conv + 1 dense, 59,392 bytes
+  NPU placement = 2 Conv + 1 MatMul
+  top1 vs saved ONNX reference = 100/100
+  accuracy = 98/100
+  final max_abs = 0.02100563
+
+edge-infer CIFAR-10:
+  eager resident weights = 3 Conv + 2 dense, 104,448 bytes
+  NPU placement = 3 Conv + 2 Gemm
+  prediction = 8 (ship), reference = 8
+  final max_abs = 0.00475883
+```
+
+The Session gate checks final outputs against saved independent FP32 reference artifacts and checks the execution statistics/placement contract. It does not replace the trace-level standard oracle. After changing Session/frontend/backend behavior, also run the existing independent verifiers:
+
+```sh
+cargo run -p rocket-smoke --bin mnist8_cnn_prepared
+python3 scripts/verify_mnist8.py mnist8-prepared
+cargo run -p rocket-smoke --bin cifar10_edgeinfer
+python3 scripts/verify_cifar10_edgeinfer.py
+cargo run -p rocket-smoke --bin prepared_mnist
+python3 scripts/verify_real_mnist.py prepared-mnist-npu
+```
+
+All generated evidence remains under `/build/rocknpu/artifacts/` and is gitignored.

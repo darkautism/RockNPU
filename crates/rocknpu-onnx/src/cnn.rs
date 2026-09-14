@@ -2,9 +2,7 @@ use crate::{OnnxError, execute_dense_fp16};
 use half::f16;
 use onnx_protobuf::{AttributeValue, Message, ModelProto, TensorProto, tensor_proto};
 use rocknpu_conv::{Conv2dSpec, Fp16Conv2dExecutor, Fp16PreparedConvWeights};
-use rocknpu_ops::{
-    ExecutionTarget, MatmulPrecision, MatmulSpec, PreparedFp16Matmul, SingleNpuBackend,
-};
+use rocknpu_ops::{ExecutionTarget, PreparedFp16Matmul, SingleNpuBackend};
 use rocknpu_tensor::Matrix;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -407,6 +405,214 @@ impl CnnOnnxModel {
         self.nodes.len()
     }
 
+    /// Prepare every currently supported static NPU weight before the first run.
+    /// Shape propagation is deliberately limited to the ONNX subset executed by
+    /// this model type; unsupported or dynamic graph structures fail explicitly.
+    pub fn prepare_npu_weights<'d>(
+        &self,
+        input_dims: &[usize],
+        backend: &SingleNpuBackend<'d>,
+        conv: &Fp16Conv2dExecutor<'d>,
+    ) -> Result<CnnPreparedConvState<'d>, OnnxError> {
+        if input_dims.is_empty() || input_dims.contains(&0) {
+            return Err(OnnxError::InvalidModel(
+                "prepared CNN input dims must be nonzero".into(),
+            ));
+        }
+        let mut state = CnnPreparedConvState::new();
+        let mut shapes: HashMap<String, Vec<usize>> = HashMap::new();
+        shapes.insert(self.input_name.clone(), input_dims.to_vec());
+        let mut static_values: HashMap<String, TensorF16> = self
+            .initializers
+            .iter()
+            .filter_map(|(name, value)| match value {
+                ConstTensor::F16(tensor) => Some((name.clone(), tensor.clone())),
+                ConstTensor::I64 { .. } => None,
+            })
+            .collect();
+
+        for node in &self.nodes {
+            match node {
+                Node::Conv {
+                    input,
+                    weight,
+                    output,
+                    kernel,
+                    strides,
+                    pads,
+                    auto_pad,
+                    ..
+                } => {
+                    let x = shapes.get(input).ok_or_else(|| {
+                        OnnxError::InvalidModel(format!("missing Conv shape {input}"))
+                    })?;
+                    let w = self
+                        .initializers
+                        .get(weight)
+                        .ok_or_else(|| {
+                            OnnxError::InvalidModel(format!("missing Conv weight {weight}"))
+                        })?
+                        .f16()?;
+                    if x.len() != 4 || w.dims.len() != 4 {
+                        return Err(OnnxError::InvalidModel(
+                            "prepared Conv expects NCHW/OIHW".into(),
+                        ));
+                    }
+                    let (batch, cin, ih, iw) = (x[0], x[1], x[2], x[3]);
+                    let (oc, wcin, kh, kw) = (w.dims[0], w.dims[1], w.dims[2], w.dims[3]);
+                    if cin != wcin || *kernel != [kh, kw] {
+                        return Err(OnnxError::InvalidModel(
+                            "prepared Conv channel/kernel mismatch".into(),
+                        ));
+                    }
+                    let (oh, _, _) =
+                        spatial_geometry(ih, kh, strides[0], pads[0], pads[2], *auto_pad);
+                    let (ow, _, _) =
+                        spatial_geometry(iw, kw, strides[1], pads[1], pads[3], *auto_pad);
+                    shapes.insert(output.clone(), vec![batch, oc, oh, ow]);
+
+                    let pad = match auto_pad {
+                        AutoPad::SameUpper if kh % 2 == 1 && kw % 2 == 1 => {
+                            Some([(kh - 1) / 2, (kw - 1) / 2])
+                        }
+                        AutoPad::NotSet if pads[0] == pads[2] && pads[1] == pads[3] => {
+                            Some([pads[0], pads[1]])
+                        }
+                        _ => None,
+                    };
+                    if batch == 1
+                        && (1..=2).contains(&strides[0])
+                        && (1..=2).contains(&strides[1])
+                        && let Some([pt, pl]) = pad
+                        && !state.weights.contains_key(weight)
+                    {
+                        let spec = Conv2dSpec {
+                            ic: cin,
+                            ih,
+                            iw,
+                            oc,
+                            kh,
+                            kw,
+                            pad_top: pt,
+                            pad_left: pl,
+                            stride_y: strides[0],
+                            stride_x: strides[1],
+                        };
+                        state
+                            .weights
+                            .insert(weight.clone(), conv.prepare_weights(&w.values, spec)?);
+                    }
+                }
+                Node::MaxPool {
+                    input,
+                    output,
+                    kernel,
+                    strides,
+                    pads,
+                    auto_pad,
+                } => {
+                    let x = shapes.get(input).ok_or_else(|| {
+                        OnnxError::InvalidModel(format!("missing MaxPool shape {input}"))
+                    })?;
+                    if x.len() != 4 {
+                        return Err(OnnxError::InvalidModel(
+                            "prepared MaxPool expects NCHW".into(),
+                        ));
+                    }
+                    let (oh, _, _) =
+                        spatial_geometry(x[2], kernel[0], strides[0], pads[0], pads[2], *auto_pad);
+                    let (ow, _, _) =
+                        spatial_geometry(x[3], kernel[1], strides[1], pads[1], pads[3], *auto_pad);
+                    shapes.insert(output.clone(), vec![x[0], x[1], oh, ow]);
+                }
+                Node::Add { lhs, rhs, output } => {
+                    let shape = shapes
+                        .get(lhs)
+                        .or_else(|| shapes.get(rhs))
+                        .ok_or_else(|| {
+                            OnnxError::InvalidModel(
+                                "prepared Add has no runtime-shaped input".into(),
+                            )
+                        })?
+                        .clone();
+                    shapes.insert(output.clone(), shape);
+                }
+                Node::Relu { input, output } => {
+                    let shape = shapes
+                        .get(input)
+                        .ok_or_else(|| {
+                            OnnxError::InvalidModel(format!("missing Relu shape {input}"))
+                        })?
+                        .clone();
+                    shapes.insert(output.clone(), shape);
+                }
+                Node::Reshape {
+                    input,
+                    shape,
+                    output,
+                    allowzero,
+                } => {
+                    let target = self
+                        .initializers
+                        .get(shape)
+                        .ok_or_else(|| {
+                            OnnxError::InvalidModel("Reshape shape must be initializer".into())
+                        })?
+                        .i64_values()?;
+                    if let Some(input_shape) = shapes.get(input) {
+                        shapes.insert(
+                            output.clone(),
+                            resolve_reshape(input_shape, target, *allowzero)?,
+                        );
+                    } else if let Some(input_value) = static_values.get(input).cloned() {
+                        let dims = resolve_reshape(&input_value.dims, target, *allowzero)?;
+                        static_values.insert(
+                            output.clone(),
+                            TensorF16::from_vec(dims, input_value.values)?,
+                        );
+                    } else {
+                        return Err(OnnxError::InvalidModel(format!(
+                            "missing Reshape input {input}"
+                        )));
+                    }
+                }
+                Node::MatMul { lhs, rhs, output } => {
+                    let a = shapes.get(lhs).ok_or_else(|| {
+                        OnnxError::InvalidModel(format!("missing MatMul shape {lhs}"))
+                    })?;
+                    let w = static_values.get(rhs).ok_or_else(|| {
+                        OnnxError::Unsupported("prepared MatMul requires a static rhs value".into())
+                    })?;
+                    if a.len() != 2 || w.dims.len() != 2 || a[1] != w.dims[0] {
+                        return Err(OnnxError::InvalidModel(
+                            "prepared MatMul expects [M,K] x [K,N]".into(),
+                        ));
+                    }
+                    ensure_prepared_matmul_weight(rhs, w, backend, &mut state)?;
+                    shapes.insert(output.clone(), vec![a[0], w.dims[1]]);
+                }
+                Node::Gemm {
+                    lhs, rhs, output, ..
+                } => {
+                    let a = shapes.get(lhs).ok_or_else(|| {
+                        OnnxError::InvalidModel(format!("missing Gemm shape {lhs}"))
+                    })?;
+                    let w = static_values.get(rhs).ok_or_else(|| {
+                        OnnxError::Unsupported("prepared Gemm requires static weights".into())
+                    })?;
+                    if a.len() != 2 || w.dims.len() != 2 || a[1] != w.dims[1] {
+                        return Err(OnnxError::InvalidModel(
+                            "prepared Gemm expects A[M,K], B[N,K]".into(),
+                        ));
+                    }
+                    ensure_prepared_gemm_weight(rhs, w, backend, &mut state)?;
+                    shapes.insert(output.clone(), vec![a[0], w.dims[0]]);
+                }
+            }
+        }
+        Ok(state)
+    }
+
     pub fn run_fp16<'d>(
         &self,
         input: &TensorF16,
@@ -743,9 +949,21 @@ impl CnnOnnxModel {
                     }
                     let (m, k, n) = (a.dims[0], a.dims[1], w.dims[0]);
                     let am = Matrix::from_vec(m, k, a.values.clone())?;
-                    let bm = Matrix::from_vec(n, k, w.values.clone())?;
-                    let (outm, padded) =
-                        execute_dense_fp16(&am, &bm, target, single.as_deref_mut())?;
+                    let use_prepared_dense = target == ExecutionTarget::NpuSingle
+                        && prepared_conv.is_some()
+                        && single.is_some();
+                    let (outm, padded) = if use_prepared_dense {
+                        execute_gemm_prepared_fp16(
+                            &am,
+                            w,
+                            rhs,
+                            single.as_deref_mut().unwrap(),
+                            prepared_conv.as_deref_mut().unwrap(),
+                        )?
+                    } else {
+                        let bm = Matrix::from_vec(n, k, w.values.clone())?;
+                        execute_dense_fp16(&am, &bm, target, single.as_deref_mut())?
+                    };
                     let mut vals = outm.values().to_vec();
                     for r in 0..m {
                         for c in 0..n {
@@ -821,6 +1039,120 @@ fn align_dense_up(value: usize, alignment: usize) -> Result<usize, OnnxError> {
         .ok_or_else(|| OnnxError::InvalidModel("dense alignment overflow".into()))
 }
 
+fn ensure_prepared_dense_nk<'d>(
+    key: &str,
+    n: usize,
+    k: usize,
+    values_nk: &[f16],
+    backend: &SingleNpuBackend<'d>,
+    state: &mut CnnPreparedConvState<'d>,
+) -> Result<(), OnnxError> {
+    if values_nk.len() != n * k {
+        return Err(OnnxError::InvalidModel(
+            "prepared dense weight length mismatch".into(),
+        ));
+    }
+    let kp = align_dense_up(k, 32)?;
+    let np = align_dense_up(n, 16)?;
+    if let Some(prepared) = state.dense_weights.get(key) {
+        if !prepared.is_m_compatible() || prepared.k() != kp || prepared.n() != np {
+            return Err(OnnxError::InvalidModel(
+                "prepared dense shape changed across runs".into(),
+            ));
+        }
+        return Ok(());
+    }
+    let mut bv = vec![f16::ZERO; np * kp];
+    for row in 0..n {
+        bv[row * kp..row * kp + k].copy_from_slice(&values_nk[row * k..(row + 1) * k]);
+    }
+    let bp = Matrix::from_vec(np, kp, bv)?;
+    let prepared = backend.prepare_fp16_compatible_m(&bp)?;
+    state.dense_weights.insert(key.to_string(), prepared);
+    Ok(())
+}
+
+fn ensure_prepared_matmul_weight<'d>(
+    key: &str,
+    w_kn: &TensorF16,
+    backend: &SingleNpuBackend<'d>,
+    state: &mut CnnPreparedConvState<'d>,
+) -> Result<(), OnnxError> {
+    if w_kn.dims.len() != 2 {
+        return Err(OnnxError::InvalidModel(
+            "prepared MatMul weight must be rank 2".into(),
+        ));
+    }
+    let (k, n) = (w_kn.dims[0], w_kn.dims[1]);
+    let mut nk = vec![f16::ZERO; n * k];
+    for kk in 0..k {
+        for nn in 0..n {
+            nk[nn * k + kk] = w_kn.values[kk * n + nn];
+        }
+    }
+    ensure_prepared_dense_nk(key, n, k, &nk, backend, state)
+}
+
+fn ensure_prepared_gemm_weight<'d>(
+    key: &str,
+    w_nk: &TensorF16,
+    backend: &SingleNpuBackend<'d>,
+    state: &mut CnnPreparedConvState<'d>,
+) -> Result<(), OnnxError> {
+    if w_nk.dims.len() != 2 {
+        return Err(OnnxError::InvalidModel(
+            "prepared Gemm weight must be rank 2".into(),
+        ));
+    }
+    ensure_prepared_dense_nk(
+        key,
+        w_nk.dims[0],
+        w_nk.dims[1],
+        &w_nk.values,
+        backend,
+        state,
+    )
+}
+
+fn execute_prepared_dense_nk<'d>(
+    a: &Matrix<f16>,
+    key: &str,
+    n: usize,
+    k: usize,
+    values_nk: &[f16],
+    backend: &mut SingleNpuBackend<'d>,
+    state: &mut CnnPreparedConvState<'d>,
+) -> Result<(Matrix<f16>, bool), OnnxError> {
+    if a.cols() != k {
+        return Err(OnnxError::InvalidModel(
+            "prepared dense activation K mismatch".into(),
+        ));
+    }
+    ensure_prepared_dense_nk(key, n, k, values_nk, backend, state)?;
+    let m = a.rows();
+    let mp = align_dense_up(m, 4)?;
+    let kp = align_dense_up(k, 32)?;
+    let np = align_dense_up(n, 16)?;
+    let prepared = state
+        .dense_weights
+        .get(key)
+        .ok_or_else(|| OnnxError::InvalidModel("prepared dense insertion failed".into()))?;
+    let mut av = vec![f16::ZERO; mp * kp];
+    for r in 0..m {
+        av[r * kp..r * kp + k].copy_from_slice(&a.values()[r * k..(r + 1) * k]);
+    }
+    let ap = Matrix::from_vec(mp, kp, av)?;
+    let padded_out = backend.execute_prepared_fp16_compatible_m(prepared, &ap)?;
+    let mut cropped = vec![f16::ZERO; m * n];
+    for r in 0..m {
+        cropped[r * n..(r + 1) * n].copy_from_slice(&padded_out.values()[r * np..r * np + n]);
+    }
+    Ok((
+        Matrix::from_vec(m, n, cropped)?,
+        mp != m || kp != k || np != n,
+    ))
+}
+
 fn execute_dense_prepared_fp16<'d>(
     a: &Matrix<f16>,
     w_kn: &TensorF16,
@@ -833,53 +1165,37 @@ fn execute_dense_prepared_fp16<'d>(
             "prepared dense shape mismatch".into(),
         ));
     }
-    let m = a.rows();
-    let k = a.cols();
-    let n = w_kn.dims[1];
-    let mp = align_dense_up(m, 4)?;
-    let kp = align_dense_up(k, 32)?;
-    let np = align_dense_up(n, 16)?;
-    let spec = MatmulSpec::new(
-        mp,
-        kp,
-        np,
-        MatmulPrecision::Fp16Fast,
-        ExecutionTarget::NpuSingle,
-    );
-    if !state.dense_weights.contains_key(key) {
-        let mut bv = vec![f16::ZERO; np * kp];
-        for kk in 0..k {
-            for nn in 0..n {
-                bv[nn * kp + kk] = w_kn.values[kk * n + nn];
-            }
+    let (k, n) = (w_kn.dims[0], w_kn.dims[1]);
+    let mut nk = vec![f16::ZERO; n * k];
+    for kk in 0..k {
+        for nn in 0..n {
+            nk[nn * k + kk] = w_kn.values[kk * n + nn];
         }
-        let bp = Matrix::from_vec(np, kp, bv)?;
-        let prepared = backend.prepare_fp16(spec, &bp)?;
-        state.dense_weights.insert(key.to_string(), prepared);
     }
-    let prepared = state
-        .dense_weights
-        .get(key)
-        .ok_or_else(|| OnnxError::InvalidModel("prepared dense insertion failed".into()))?;
-    if prepared.spec() != spec {
+    execute_prepared_dense_nk(a, key, n, k, &nk, backend, state)
+}
+
+fn execute_gemm_prepared_fp16<'d>(
+    a: &Matrix<f16>,
+    w_nk: &TensorF16,
+    key: &str,
+    backend: &mut SingleNpuBackend<'d>,
+    state: &mut CnnPreparedConvState<'d>,
+) -> Result<(Matrix<f16>, bool), OnnxError> {
+    if w_nk.dims.len() != 2 || a.cols() != w_nk.dims[1] {
         return Err(OnnxError::InvalidModel(
-            "prepared dense shape changed across runs".into(),
+            "prepared Gemm shape mismatch".into(),
         ));
     }
-    let mut av = vec![f16::ZERO; mp * kp];
-    for r in 0..m {
-        av[r * kp..r * kp + k].copy_from_slice(&a.values()[r * k..(r + 1) * k]);
-    }
-    let ap = Matrix::from_vec(mp, kp, av)?;
-    let padded_out = backend.execute_prepared_fp16(prepared, &ap)?;
-    let mut cropped = vec![f16::ZERO; m * n];
-    for r in 0..m {
-        cropped[r * n..(r + 1) * n].copy_from_slice(&padded_out.values()[r * np..r * np + n]);
-    }
-    Ok((
-        Matrix::from_vec(m, n, cropped)?,
-        mp != m || kp != k || np != n,
-    ))
+    execute_prepared_dense_nk(
+        a,
+        key,
+        w_nk.dims[0],
+        w_nk.dims[1],
+        &w_nk.values,
+        backend,
+        state,
+    )
 }
 
 fn require_arity(

@@ -347,22 +347,30 @@ The current validated CNN/dense path includes the subset needed by the real-mode
 
 Some operators execute on the RK3588 NPU and some currently use CPU fallback. Unsupported models/operators should fail explicitly rather than silently invoking an external proprietary runtime.
 
-## Intended end-user API
+## High-level Rust Session API
 
-The project is moving toward a high-level experience such as:
+A first developer-preview `rocknpu::Session` API is now implemented:
+
+```rust,ignore
+use rocknpu::{Session, Tensor};
+
+let session = Session::load("model.onnx")?;
+let input = Tensor::from_f32(vec![1, 3, 32, 32], pixels)?;
+let output = session.run(input)?;
+println!("{:?}", output.stats());
+```
+
+`Session::load` parses the ONNX graph once, validates the current single-`FLOAT` input/output contract, opens the Rocket backend, and eagerly prepares supported static `Conv`/`MatMul`/`Gemm` weights into resident NPU buffers. Repeated `run()` calls reuse that model state rather than reparsing or repacking the model. `Session::prepare_stats()` exposes resident-weight preparation statistics, while each `RunOutput` carries explicit operator placement and timing statistics.
+
+The Session currently targets the same deliberately small ONNX subset listed above. CPU fallback remains part of the execution plan for supported small operators such as `Add`, `Relu`, `MaxPool`, and `Reshape`; unsupported graph structures fail explicitly. `SessionOptions::cpu()` is also available for an explicit CPU session.
+
+The command-line interface is still future work. The intended direction remains:
 
 ```sh
 rocknpu run model.onnx --input input.npy --output output.npy
 ```
 
-and a Rust session API conceptually like:
-
-```rust,ignore
-let session = rocknpu::Session::load("model.onnx")?;
-let output = session.run(input)?;
-```
-
-**These high-level interfaces are the intended product direction, not a claim that the final CLI/session API is already stable today.**
+The Rust API is a developer preview rather than a stability guarantee, but it is now a real, hardware-tested interface rather than a conceptual placeholder.
 
 Frameworks such as Candle should eventually be able to use RockNPU as an RK3588 NPU backend without reimplementing RK3588 register commands, layouts, memory management and Rocket submission themselves.
 
@@ -371,6 +379,7 @@ Frameworks such as Candle should eventually be able to use RockNPU as an RK3588 
 Current workspace crates:
 
 ```text
+rocknpu           high-level Session/Tensor API and model runtime ownership
 rocket-uapi       Linux Rocket UAPI structs/ioctl wrappers
 rocket-runtime    safe Rocket device/BO/submit/wait ownership layer
 rocknpu-regcmd    RK3588 register-command encoders and planners

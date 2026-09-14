@@ -121,6 +121,7 @@ dependencies = [
  "onnx-protobuf",
  "protobuf",
  "rocket-runtime",
+ "rocknpu",
  "rocknpu-conv",
  "rocknpu-matmul",
  "rocknpu-onnx",
@@ -134,6 +135,19 @@ name = "rocket-uapi"
 version = "0.1.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "rocknpu"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "onnx-protobuf",
+ "protobuf",
+ "rocket-runtime",
+ "rocknpu-conv",
+ "rocknpu-onnx",
+ "rocknpu-ops",
 ]
 
 [[package]]

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/rocknpu",
   "crates/rocket-uapi",
   "crates/rocket-runtime",
   "crates/rocknpu-regcmd",

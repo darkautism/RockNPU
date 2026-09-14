@@ -15,3 +15,4 @@ rocknpu-onnx = { path = "../rocknpu-onnx" }
 onnx-protobuf = "0.2.3"
 protobuf = "=3.4.0"
 rocknpu-conv={path="../rocknpu-conv"}
+rocknpu={path="../rocknpu"}
