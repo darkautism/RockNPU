@@ -624,3 +624,69 @@ python3 -c "import numpy as np; a=np.load('artifacts/cli-mnist8-npu.npy'); r=np.
 ```
 
 This gate proves the documented end-user ONNX command path itself, rather than only the lower-level smoke binaries. It does not expand the ONNX operator set or claim general NumPy dtype/layout support.
+
+## TinyLlama GGUF first-token hardware gate
+
+The first real LLM gate uses `TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf`. The validated artifact is 667,814,880 bytes and can be fetched from the public second-state TinyLlama GGUF mirror:
+
+```sh
+cd /build/rocknpu
+curl -L --fail --retry 3 \
+  -o artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf \
+  https://huggingface.co/second-state/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf
+stat -c '%s %n' artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf
+```
+
+Expected size:
+
+```text
+667814880 artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf
+```
+
+Run the RockNPU first-token path on the real RK3588 NPU:
+
+```sh
+cargo run -p rocket-smoke --bin llm_gguf -- \
+  artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf Hello npu
+```
+
+Accepted model metadata and result:
+
+```text
+vocab_size=32000 hidden_size=2048 intermediate_size=5632
+layers=22 heads=32 kv_heads=4 head_dim=64 context=2048
+rope_theta=10000 rope_style=Normal
+LLM GGUF FIRST TOKEN PASS target=npu prompt_tokens=2 padded_tokens=4 token_id=29892 text="," npu_linears=154 cpu_linears=1
+```
+
+The 154 NPU Linears are exactly seven projections across each of 22 transformer blocks. The current LM head is the one CPU Linear because M=1 decode/GEMV has not yet been optimized for the NPU. Quantized GGUF layer weights are converted to FP16 before preparation; only one block's prepared projection weights need to be resident at a time.
+
+First compare with the separate `llama-gguf` CPU model implementation:
+
+```sh
+cargo run -p rocknpu-llm --example gguf_reference -- \
+  artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf Hello
+```
+
+Expected:
+
+```text
+LLAMA-GGUF REFERENCE FIRST TOKEN prompt_tokens=2 token_id=29892 text=","
+```
+
+A stronger oracle uses an external llama.cpp checkout outside the RockNPU tree. The accepted run used llama.cpp commit `391fac16460f15233a7740550d858ac96df3419d`; it is validation material, not a RockNPU dependency:
+
+```sh
+git clone https://github.com/ggml-org/llama.cpp.git /build/llama.cpp-reference
+git -C /build/llama.cpp-reference checkout 391fac16460f15233a7740550d858ac96df3419d
+cmake -S /build/llama.cpp-reference -B /build/llama.cpp-reference/build \
+  -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF
+cmake --build /build/llama.cpp-reference/build --target llama-completion -j 8
+/build/llama.cpp-reference/build/bin/llama-completion \
+  -m /build/rocknpu/artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf \
+  -no-cnv -p Hello -n 1 --temp 0 --no-warmup --verbose-prompt --log-verbosity 0
+```
+
+The raw completion is `Hello,`, so the first generated token text is again `","`. `-no-cnv` is required: allowing the model's chat template changes the prompt semantics and is not the same gate.
+
+This is a correctness milestone, not a performance claim. The initial debug-build RockNPU run took roughly 112 seconds because the current path repeatedly converts Q4_K_M weights to FP16 and prepares each layer. Multi-token chat is not yet implemented: the next gate is per-layer KV-cache integration and an autoregressive decode loop, followed by M=1 NPU/GEMV and native quantized-kernel optimization.

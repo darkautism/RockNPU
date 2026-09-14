@@ -1,7 +1,7 @@
 use half::f16;
 use rocket_runtime::RocketDevice;
 use rocknpu_llm::{
-    HybridLinear, LinearExecution, TransformerBlock, TransformerBlockConfig,
+    HybridLinear, LinearExecution, RopeStyle, TransformerBlock, TransformerBlockConfig,
     TransformerBlockWeights,
 };
 use rocknpu_ops::SingleNpuBackend;
@@ -86,6 +86,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         intermediate_size: 256,
         rms_norm_eps: 1e-5,
         rope_theta: 10_000.0,
+        rope_style: RopeStyle::Normal,
     };
     let weights = block_weights(config);
     let cpu_block = TransformerBlock::prepare(config, weights.clone(), None)?;

@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bytemuck = "1"
 half = "2"
+llama-gguf = { version = "0.14", default-features = false }
 rocknpu-ops = { path = "../rocknpu-ops" }
 rocknpu-tensor = { path = "../rocknpu-tensor" }

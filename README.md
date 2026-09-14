@@ -403,7 +403,7 @@ The core boundary now begins below model-format parsing with `Graph -> Executabl
 
 ## LLM / transformer status
 
-The first model-format-independent LLM runtime slice now exists in `rocknpu-llm`. It implements CPU-reference RMSNorm, Llama/Qwen rotate-half RoPE, causal MHA/GQA attention, SwiGLU, residuals and a bounded KV-cache container, plus `HybridLinear` resident FP16 weights over the existing RockNPU MatMul backend.
+The first model-format-independent LLM runtime slice now exists in `rocknpu-llm`. It implements CPU-reference RMSNorm, explicit Llama/TinyLlama `Normal` RoPE and Qwen2 `NeoX` RoPE, causal MHA/GQA attention, SwiGLU, residuals and a bounded KV-cache container, plus `HybridLinear` resident FP16 weights over the existing RockNPU MatMul backend.
 
 The intended first-stage placement is now hardware-proven on RK3588:
 
@@ -411,14 +411,14 @@ The intended first-stage placement is now hardware-proven on RK3588:
 large aligned prefill projections -> resident RockNPU NPU MatMul
 RMSNorm / RoPE / GQA attention    -> CPU initially
 SwiGLU / residual glue            -> CPU initially
-M=1 decode projections            -> CPU until GEMV is benchmarked/proven
+M=1 decode projections / LM head  -> CPU until GEMV is benchmarked/proven
 ```
 
-A transformer-sized `hidden=896`, eight-token resident projection executes on the real NPU and matches the CPU oracle within FP16 tolerance. A complete synthetic Llama/Qwen-style block with Q/K/V/O plus gate/up/down projections also passes on hardware with all seven Linear operations placed on NPU while the transformer glue remains on CPU.
+The first real GGUF correctness gate is now complete. RockNPU loads `TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf`, tokenizes the raw prompt `Hello`, dequantizes one transformer layer at a time to FP16, and executes all 22 layers. All seven projections per layer are resident NPU MatMuls, so the run dispatches 154 Linear operations to the real RK3588 NPU; the current M=1 LM head remains on CPU. With BOS enabled, the two prompt tokens are end-padded to four rows for the current aligned prefill MatMul contract, and the generated greedy next token is ID `29892`, text `","`.
 
-The remaining first-token boundary is therefore integration rather than basic transformer math: load one real Llama-family GGUF, map/dequantize its weights into the RockNPU block representation, perform token embedding, run the block stack, apply final RMSNorm and LM head, and use the GGUF tokenizer to compare the generated next token against an independent reference. Multi-token generation additionally needs per-layer KV-cache integration and a decode loop.
+That token is independently reproduced by both `llama-gguf`'s own CPU inference path and a separately built `llama.cpp` raw-completion oracle. The latter used llama.cpp commit `391fac16460f15233a7740550d858ac96df3419d` with conversation/chat templating explicitly disabled. This closes the first-token LLM correctness milestone rather than merely proving a synthetic transformer block.
 
-The first target should be a biasless Llama-family model such as TinyLlama before Qwen2-style projection-bias support is added. Quantized GGUF weights may initially be dequantized to FP16 at load time for correctness; native INT4/INT8 NPU execution remains a later optimization.
+The current GGUF path is deliberately correctness-first: common GGUF F16/BF16 and Q4/Q5/Q8/K-quant weights are converted to FP16 before RockNPU preparation, and the external `llama-gguf` crate is used for GGUF/tokenizer/format support rather than as the RockNPU execution backend. Multi-token generation still needs per-layer KV-cache integration plus an autoregressive decode loop. Native quantized NPU kernels and an NPU/GEMV path for M=1 decode remain later performance work.
 
 ## Architecture
 

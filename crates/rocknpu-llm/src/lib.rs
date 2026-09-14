@@ -6,9 +6,13 @@ use rocknpu_ops::{
 use rocknpu_tensor::{Matrix, TensorError};
 use std::fmt;
 
+mod gguf;
+pub use gguf::{FirstTokenResult, GgufLlama, GgufModelInfo};
+
 #[derive(Debug)]
 pub enum LlmError {
     InvalidShape(String),
+    Gguf(String),
     Tensor(TensorError),
     Op(OpError),
 }
@@ -17,6 +21,7 @@ impl fmt::Display for LlmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidShape(message) => write!(f, "invalid LLM tensor shape: {message}"),
+            Self::Gguf(message) => write!(f, "GGUF frontend error: {message}"),
             Self::Tensor(error) => error.fmt(f),
             Self::Op(error) => error.fmt(f),
         }
@@ -88,7 +93,15 @@ pub fn rms_norm(
     Ok(output)
 }
 
-/// Llama/Qwen-style rotate-half RoPE over [seq, heads, head_dim].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RopeStyle {
+    /// Original Llama/TinyLlama layout: rotate consecutive even/odd pairs.
+    Normal,
+    /// NeoX/Qwen2 layout: rotate matching elements from the two head-dimension halves.
+    NeoX,
+}
+
+/// Rotary position embedding over [seq, heads, head_dim].
 pub fn apply_rope(
     values: &mut [f16],
     seq: usize,
@@ -96,8 +109,9 @@ pub fn apply_rope(
     head_dim: usize,
     position_start: usize,
     theta: f32,
+    style: RopeStyle,
 ) -> Result<(), LlmError> {
-    if seq == 0 || heads == 0 || head_dim == 0 || head_dim % 2 != 0 {
+    if seq == 0 || heads == 0 || head_dim == 0 || !head_dim.is_multiple_of(2) {
         return Err(LlmError::InvalidShape(
             "RoPE requires nonzero seq/heads and an even head_dim".into(),
         ));
@@ -127,10 +141,14 @@ pub fn apply_rope(
         for head in 0..heads {
             let base = (token * heads + head) * head_dim;
             for i in 0..half {
-                let left = values[base + i].to_f32();
-                let right = values[base + half + i].to_f32();
-                values[base + i] = f16::from_f32(left * cos[i] - right * sin[i]);
-                values[base + half + i] = f16::from_f32(right * cos[i] + left * sin[i]);
+                let (left_index, right_index) = match style {
+                    RopeStyle::Normal => (base + 2 * i, base + 2 * i + 1),
+                    RopeStyle::NeoX => (base + i, base + half + i),
+                };
+                let left = values[left_index].to_f32();
+                let right = values[right_index].to_f32();
+                values[left_index] = f16::from_f32(left * cos[i] - right * sin[i]);
+                values[right_index] = f16::from_f32(right * cos[i] + left * sin[i]);
             }
         }
     }
@@ -169,7 +187,7 @@ impl AttentionConfig {
                 "attention head counts and head_dim must be nonzero".into(),
             ));
         }
-        if self.query_heads % self.kv_heads != 0 {
+        if !self.query_heads.is_multiple_of(self.kv_heads) {
             return Err(LlmError::InvalidShape(
                 "query_heads must be divisible by kv_heads for GQA".into(),
             ));
@@ -224,14 +242,14 @@ pub fn causal_attention(
             let kv_head = q_head / queries_per_kv;
             let q_base = (query * config.query_heads + q_head) * config.head_dim;
             let mut max_score = f32::NEG_INFINITY;
-            for key in 0..visible {
+            for (key, score_slot) in scores.iter_mut().enumerate().take(visible) {
                 let k_base = (key * config.kv_heads + kv_head) * config.head_dim;
                 let mut dot = 0.0f32;
                 for dim in 0..config.head_dim {
                     dot += q[q_base + dim].to_f32() * k[k_base + dim].to_f32();
                 }
                 let score = dot * scale;
-                scores[key] = score;
+                *score_slot = score;
                 max_score = max_score.max(score);
             }
             let mut denominator = 0.0f32;
@@ -242,9 +260,9 @@ pub fn causal_attention(
             let out_base = q_base;
             for dim in 0..config.head_dim {
                 let mut sum = 0.0f32;
-                for key in 0..visible {
+                for (key, &score) in scores.iter().enumerate().take(visible) {
                     let v_base = (key * config.kv_heads + kv_head) * config.head_dim;
-                    sum += scores[key] / denominator * v[v_base + dim].to_f32();
+                    sum += score / denominator * v[v_base + dim].to_f32();
                 }
                 output[out_base + dim] = f16::from_f32(sum);
             }
@@ -346,7 +364,7 @@ impl<'d> HybridLinear<'d> {
         weights: Vec<f16>,
     ) -> Result<Self, LlmError> {
         let weights = Matrix::from_vec(out_features, in_features, weights)?;
-        let prepared = if in_features % 32 == 0 && out_features % 16 == 0 {
+        let prepared = if in_features.is_multiple_of(32) && out_features.is_multiple_of(16) {
             backend
                 .map(|backend| backend.prepare_fp16_compatible_m(&weights))
                 .transpose()?
@@ -375,7 +393,7 @@ impl<'d> HybridLinear<'d> {
         rows: usize,
     ) -> Result<(Vec<f16>, LinearExecution), LlmError> {
         let input = Matrix::from_vec(rows, self.in_features(), input.to_vec())?;
-        if rows % 4 == 0
+        if rows.is_multiple_of(4)
             && let (Some(backend), Some(prepared)) = (backend, self.prepared.as_ref())
         {
             let output = backend.execute_prepared_fp16_compatible_m(prepared, &input)?;
@@ -405,6 +423,7 @@ pub struct TransformerBlockConfig {
     pub intermediate_size: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
+    pub rope_style: RopeStyle,
 }
 
 impl TransformerBlockConfig {
@@ -598,6 +617,7 @@ impl<'d> TransformerBlock<'d> {
             self.config.head_dim,
             position_start,
             self.config.rope_theta,
+            self.config.rope_style,
         )?;
         apply_rope(
             &mut k,
@@ -606,6 +626,7 @@ impl<'d> TransformerBlock<'d> {
             self.config.head_dim,
             position_start,
             self.config.rope_theta,
+            self.config.rope_style,
         )?;
         let attention = causal_attention(
             &q,
@@ -642,9 +663,7 @@ impl<'d> TransformerBlock<'d> {
             .run(backend.as_deref_mut(), &normalized, tokens)?;
         stats.record(execution);
         let activated = swiglu(&gate, &up)?;
-        let (ffn_output, execution) =
-            self.down_proj
-                .run(backend.as_deref_mut(), &activated, tokens)?;
+        let (ffn_output, execution) = self.down_proj.run(backend, &activated, tokens)?;
         stats.record(execution);
         Ok((residual_add(&after_attention, &ffn_output)?, stats))
     }
@@ -686,16 +705,22 @@ mod tests {
     fn rope_position_zero_is_identity_and_preserves_pair_norm() {
         let original = f16s(&[1.0, 2.0, 3.0, 4.0]);
         let mut zero = original.clone();
-        apply_rope(&mut zero, 1, 1, 4, 0, 10_000.0).unwrap();
+        apply_rope(&mut zero, 1, 1, 4, 0, 10_000.0, RopeStyle::Normal).unwrap();
         assert_eq!(zero, original);
 
         let mut rotated = original.clone();
-        apply_rope(&mut rotated, 1, 1, 4, 3, 10_000.0).unwrap();
-        for i in 0..2 {
-            let before = original[i].to_f32().powi(2) + original[2 + i].to_f32().powi(2);
-            let after = rotated[i].to_f32().powi(2) + rotated[2 + i].to_f32().powi(2);
+        apply_rope(&mut rotated, 1, 1, 4, 3, 10_000.0, RopeStyle::Normal).unwrap();
+        for pair in 0..2 {
+            let left = 2 * pair;
+            let right = left + 1;
+            let before = original[left].to_f32().powi(2) + original[right].to_f32().powi(2);
+            let after = rotated[left].to_f32().powi(2) + rotated[right].to_f32().powi(2);
             assert!((before - after).abs() < 0.02);
         }
+
+        let mut neox = original.clone();
+        apply_rope(&mut neox, 1, 1, 4, 3, 10_000.0, RopeStyle::NeoX).unwrap();
+        assert_ne!(rotated, neox);
     }
 
     #[test]
@@ -717,9 +742,7 @@ mod tests {
     #[test]
     fn kv_cache_appends_and_clears() {
         let mut cache = KvCache::new(2, 4, 8).unwrap();
-        cache
-            .append(&vec![f16::ONE; 16], &vec![f16::ZERO; 16], 2)
-            .unwrap();
+        cache.append(&[f16::ONE; 16], &[f16::ZERO; 16], 2).unwrap();
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.keys().len(), 16);
         cache.clear();
@@ -760,6 +783,7 @@ mod tests {
             intermediate_size: 128,
             rms_norm_eps: 1e-5,
             rope_theta: 10_000.0,
+            rope_style: RopeStyle::Normal,
         };
         let block = TransformerBlock::prepare(config, tiny_block_weights(config), None).unwrap();
         let input = vec![f16::from_f32(0.01); 4 * config.hidden_size];
