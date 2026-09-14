@@ -1,0 +1,17 @@
+[package]
+name = "rocket-smoke"
+version = "0.1.0"
+edition = "2024"
+default-run = "rocket-smoke"
+
+[dependencies]
+half = "2"
+rocket-runtime = { path = "../rocket-runtime" }
+rocknpu-regcmd = { path = "../rocknpu-regcmd" }
+rocknpu-matmul = { path = "../rocknpu-matmul" }
+rocknpu-ops = { path = "../rocknpu-ops" }
+rocknpu-tensor = { path = "../rocknpu-tensor" }
+rocknpu-onnx = { path = "../rocknpu-onnx" }
+onnx-protobuf = "0.2.3"
+protobuf = "=3.4.0"
+rocknpu-conv={path="../rocknpu-conv"}

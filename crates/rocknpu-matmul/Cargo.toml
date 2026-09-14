@@ -1,0 +1,10 @@
+[package]
+name = "rocknpu-matmul"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+half = { version = "2", features = ["bytemuck"] }
+bytemuck = "1"
+rocket-runtime = { path = "../rocket-runtime" }
+rocknpu-regcmd = { path = "../rocknpu-regcmd" }

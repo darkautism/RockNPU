@@ -1,0 +1,10 @@
+[package]
+name = "rocknpu-ops"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+half = "2"
+rocket-runtime = { path = "../rocket-runtime" }
+rocknpu-matmul = { path = "../rocknpu-matmul" }
+rocknpu-tensor = { path = "../rocknpu-tensor" }

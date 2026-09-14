@@ -1,0 +1,9 @@
+[package]
+name = "rocknpu-conv"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+half = "2"
+rocket-runtime = { path = "../rocket-runtime" }
+rocknpu-regcmd = { path = "../rocknpu-regcmd" }

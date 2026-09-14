@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/rocket-uapi",
+  "crates/rocket-runtime",
+  "crates/rocknpu-regcmd",
+  "crates/rocknpu-conv",
+  "crates/rocknpu-matmul",
+  "crates/rocknpu-ops",
+  "crates/rocknpu-onnx",
+  "crates/rocknpu-tensor",
+  "crates/rocket-smoke",
+]
