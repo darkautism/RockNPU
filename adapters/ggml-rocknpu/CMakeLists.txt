@@ -1,0 +1,40 @@
+cmake_minimum_required(VERSION 3.16)
+project(ggml-rocknpu LANGUAGES CXX)
+
+set(GGML_SOURCE_DIR "" CACHE PATH "Path to a llama.cpp ggml directory")
+if(NOT GGML_SOURCE_DIR)
+    message(FATAL_ERROR "Set GGML_SOURCE_DIR to <llama.cpp>/ggml")
+endif()
+
+get_filename_component(ROCKNPU_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+find_program(CARGO_EXECUTABLE cargo REQUIRED)
+set(ROCKNPU_CAPI_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/rust-target")
+set(ROCKNPU_CAPI_LIBRARY "${ROCKNPU_CAPI_TARGET_DIR}/release/librocknpu_capi.so")
+
+add_custom_target(rocknpu-capi-build
+    COMMAND "${CARGO_EXECUTABLE}" build --release -p rocknpu-capi --target-dir "${ROCKNPU_CAPI_TARGET_DIR}"
+    WORKING_DIRECTORY "${ROCKNPU_SOURCE_DIR}"
+    COMMENT "Building RockNPU C ABI bridge"
+    VERBATIM
+)
+
+add_library(ggml-rocknpu SHARED src/ggml-rocknpu.cpp)
+add_dependencies(ggml-rocknpu rocknpu-capi-build)
+target_compile_features(ggml-rocknpu PRIVATE cxx_std_17)
+target_compile_definitions(ggml-rocknpu PRIVATE GGML_BACKEND_DL)
+target_include_directories(ggml-rocknpu PRIVATE
+    "${GGML_SOURCE_DIR}/include"
+    "${GGML_SOURCE_DIR}/src"
+    "${ROCKNPU_SOURCE_DIR}/crates/rocknpu-capi/include"
+)
+target_link_directories(ggml-rocknpu PRIVATE "${ROCKNPU_CAPI_TARGET_DIR}/release")
+target_link_libraries(ggml-rocknpu PRIVATE rocknpu_capi)
+set_target_properties(ggml-rocknpu PROPERTIES
+    OUTPUT_NAME "ggml-rocknpu"
+    BUILD_RPATH "$ORIGIN"
+)
+add_custom_command(TARGET ggml-rocknpu POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "${ROCKNPU_CAPI_LIBRARY}"
+        "$<TARGET_FILE_DIR:ggml-rocknpu>/librocknpu_capi.so"
+)

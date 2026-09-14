@@ -1,0 +1,12 @@
+[package]
+name = "rocknpu-capi"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+half = "2"
+rocket-runtime = { path = "../rocket-runtime" }
+rocknpu-matmul = { path = "../rocknpu-matmul" }

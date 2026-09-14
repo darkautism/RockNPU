@@ -428,6 +428,7 @@ Current workspace crates:
 
 ```text
 rocknpu           high-level Graph/Executable/Session runtime API
+rocknpu-capi      narrow C ABI for external framework/backend adapters
 rocknpu-ir        frontend-neutral graph, node, constant and tensor metadata IR
 rocknpu-llm       hybrid Llama/Qwen transformer primitives and runtime building blocks
 rocket-uapi       Linux Rocket UAPI structs/ioctl wrappers
@@ -444,6 +445,8 @@ rocket-smoke      real-hardware correctness/performance gates
 Detailed architecture and hardware findings are in [`docs/architecture.md`](docs/architecture.md).
 
 The project goal/non-goals are in [`docs/goal.md`](docs/goal.md).
+
+An out-of-tree GGML adapter now proves the external backend boundary without modifying llama.cpp: stock llama.cpp dynamically loads `libggml-rocknpu.so`, discovers the real Rocket-backed `ROCKNPU0` device through `rocknpu-capi`, and stock `test-backend-ops` passes the first aligned F16/F32 `MUL_MAT` against its independent CPU reference. GGML ABI details remain confined to `adapters/ggml-rocknpu`; see its README and `docs/repro.md` for the exact gate.
 
 ## Correctness policy
 
@@ -489,7 +492,7 @@ Please assume all of the following today:
 - API stability is not guaranteed yet.
 - ONNX coverage is incomplete.
 - Quantized INT8 execution is not yet the primary production path.
-- Hybrid transformer execution is implemented and hardware-proven, but loading a real GGUF and generating text is not completed yet.
+- Real TinyLlama GGUF loading and autoregressive generation are hardware-proven; decode performance and model/operator coverage remain incomplete.
 - Performance tuning is still ongoing.
 - RK3588 is the hardware target with real end-to-end validation today.
 - A working Rocket-enabled kernel/device tree is mandatory for NPU execution.

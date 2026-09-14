@@ -740,3 +740,48 @@ RockNPU, `llama-gguf`, and llama.cpp agree on the first eight generated tokens. 
 Therefore exact greedy token identity is a hard cross-runtime requirement only on numerically stable reference steps. Near-tied candidates must be investigated with logits and reported as numerical precision divergence rather than mislabeled as a K/V-state failure. The project also keeps a unit differential where cached single-token decode matches full-sequence recomputation for the same transformer block.
 
 This remains a correctness milestone rather than a performance claim. Q4_K_M weights are currently converted to FP16, prefill uses the NPU, and M=1 projection/LM-head decode stays on CPU. The next performance work is native quantized execution and a validated NPU GEMV/decode path.
+
+## Stock GGML dynamic-backend gate
+
+RockNPU can be loaded by an unmodified llama.cpp build as an out-of-tree GGML backend. The validated external ABI is llama.cpp commit `391fac16460f15233a7740550d858ac96df3419d`; GGML ABI types remain confined to `adapters/ggml-rocknpu`.
+
+Build the adapter and its Rust C ABI sidecar:
+
+```sh
+cmake -S adapters/ggml-rocknpu \
+  -B target/ggml-rocknpu \
+  -DGGML_SOURCE_DIR=/build/llama.cpp-reference/ggml
+cmake --build target/ggml-rocknpu -j 8
+```
+
+First prove stock llama.cpp discovers the real Rocket-backed device:
+
+```sh
+GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" \
+  /build/llama.cpp-reference/build/bin/llama-cli --list-devices
+```
+
+Expected device:
+
+```text
+ROCKNPU0: RockNPU RK3588
+```
+
+Then run one deliberately narrow stock GGML correctness test:
+
+```sh
+GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" \
+  /build/llama.cpp-reference/build/bin/test-backend-ops \
+  test -b ROCKNPU0 -o MUL_MAT \
+  -p type_a=f16,type_b=f32,m=16,n=4,k=256
+```
+
+Accepted result:
+
+```text
+MUL_MAT(type_a=f16,type_b=f32,m=16,n=4,k=256,...): OK
+1/1 tests passed
+Backend ROCKNPU: OK
+```
+
+The test data and CPU reference are owned by stock llama.cpp. The RockNPU path is `GGML -> libggml-rocknpu.so -> rocknpu-capi -> Fp16MatmulExecutor -> RocketDevice -> RK3588 NPU`. The adapter currently accepts only contiguous, unbatched F16-weight/F32-activation MatMul where RockNPU's existing alignment contract holds; unsupported GGML operations and layouts are rejected explicitly.

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/rocknpu",
+  "crates/rocknpu-capi",
   "crates/rocknpu-ir",
   "crates/rocknpu-llm",
   "crates/rocket-uapi",

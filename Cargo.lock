@@ -617,6 +617,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rocknpu-capi"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "rocket-runtime",
+ "rocknpu-matmul",
+]
+
+[[package]]
 name = "rocknpu-conv"
 version = "0.1.0"
 dependencies = [
