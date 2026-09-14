@@ -401,6 +401,25 @@ Both paths are hardware-tested developer previews. Current real-model CLI gates 
 
 The core boundary now begins below model-format parsing with `Graph -> Executable -> Session`. It is still intentionally small, but future ONNX, GGUF/LLM, Candle, or other inference frontends can target that same contract rather than duplicating partitioning, lowering, tensor layout, preparation/residency, scheduling, CPU fallback, or RK3588/Rocket execution.
 
+## LLM / transformer status
+
+The first model-format-independent LLM runtime slice now exists in `rocknpu-llm`. It implements CPU-reference RMSNorm, Llama/Qwen rotate-half RoPE, causal MHA/GQA attention, SwiGLU, residuals and a bounded KV-cache container, plus `HybridLinear` resident FP16 weights over the existing RockNPU MatMul backend.
+
+The intended first-stage placement is now hardware-proven on RK3588:
+
+```text
+large aligned prefill projections -> resident RockNPU NPU MatMul
+RMSNorm / RoPE / GQA attention    -> CPU initially
+SwiGLU / residual glue            -> CPU initially
+M=1 decode projections            -> CPU until GEMV is benchmarked/proven
+```
+
+A transformer-sized `hidden=896`, eight-token resident projection executes on the real NPU and matches the CPU oracle within FP16 tolerance. A complete synthetic Llama/Qwen-style block with Q/K/V/O plus gate/up/down projections also passes on hardware with all seven Linear operations placed on NPU while the transformer glue remains on CPU.
+
+The remaining first-token boundary is therefore integration rather than basic transformer math: load one real Llama-family GGUF, map/dequantize its weights into the RockNPU block representation, perform token embedding, run the block stack, apply final RMSNorm and LM head, and use the GGUF tokenizer to compare the generated next token against an independent reference. Multi-token generation additionally needs per-layer KV-cache integration and a decode loop.
+
+The first target should be a biasless Llama-family model such as TinyLlama before Qwen2-style projection-bias support is added. Quantized GGUF weights may initially be dequantized to FP16 at load time for correctness; native INT4/INT8 NPU execution remains a later optimization.
+
 ## Architecture
 
 Current workspace crates:
@@ -408,6 +427,7 @@ Current workspace crates:
 ```text
 rocknpu           high-level Graph/Executable/Session runtime API
 rocknpu-ir        frontend-neutral graph, node, constant and tensor metadata IR
+rocknpu-llm       hybrid Llama/Qwen transformer primitives and runtime building blocks
 rocket-uapi       Linux Rocket UAPI structs/ioctl wrappers
 rocket-runtime    safe Rocket device/BO/submit/wait ownership layer
 rocknpu-regcmd    RK3588 register-command encoders and planners
@@ -467,7 +487,7 @@ Please assume all of the following today:
 - API stability is not guaranteed yet.
 - ONNX coverage is incomplete.
 - Quantized INT8 execution is not yet the primary production path.
-- GGUF/LLM frontend support is a goal, not a completed feature.
+- Hybrid transformer execution is implemented and hardware-proven, but loading a real GGUF and generating text is not completed yet.
 - Performance tuning is still ongoing.
 - RK3588 is the hardware target with real end-to-end validation today.
 - A working Rocket-enabled kernel/device tree is mandatory for NPU execution.

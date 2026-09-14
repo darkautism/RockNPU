@@ -123,6 +123,7 @@ dependencies = [
  "rocket-runtime",
  "rocknpu",
  "rocknpu-conv",
+ "rocknpu-llm",
  "rocknpu-matmul",
  "rocknpu-onnx",
  "rocknpu-ops",
@@ -165,6 +166,15 @@ name = "rocknpu-ir"
 version = "0.1.0"
 dependencies = [
  "half",
+]
+
+[[package]]
+name = "rocknpu-llm"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "rocknpu-ops",
+ "rocknpu-tensor",
 ]
 
 [[package]]

@@ -10,6 +10,7 @@ rocket-runtime = { path = "../rocket-runtime" }
 rocknpu-regcmd = { path = "../rocknpu-regcmd" }
 rocknpu-matmul = { path = "../rocknpu-matmul" }
 rocknpu-ops = { path = "../rocknpu-ops" }
+rocknpu-llm = { path = "../rocknpu-llm" }
 rocknpu-tensor = { path = "../rocknpu-tensor" }
 rocknpu-onnx = { path = "../rocknpu-onnx" }
 onnx-protobuf = "0.2.3"

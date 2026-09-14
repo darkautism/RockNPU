@@ -754,9 +754,9 @@ The partitioner owns transitions between CPU row-major tensors and NPU-native la
 
 ## 15. GGUF / LLM direction
 
-Do not start the LLM frontend until generic MatMul/GEMM works across multiple shapes.
+The former prerequisite for starting LLM work is now satisfied: generic MatMul/GEMM, resident weights, dynamic compatible-M execution and CPU fallback are hardware-proven across multiple shapes.
 
-First LLM family should be one of Qwen or Llama. The minimum useful execution plan is allowed to be hybrid:
+The first LLM runtime slice is implemented in `rocknpu-llm`. It currently targets Llama/Qwen-style dense transformer blocks with a deliberately hybrid execution plan:
 
 ```text
 MatMul / large projections -> NPU
@@ -766,9 +766,11 @@ attention glue           -> CPU initially
 sampling/tokenizer       -> CPU
 ```
 
+`HybridLinear` prepares compatible FP16 weights once and executes aligned prefill rows on the NPU; `M=1` decode intentionally falls back to CPU until GEMV-like execution has its own measurements. CPU-reference RMSNorm, rotate-half RoPE, causal MHA/GQA attention, SwiGLU, residuals and a KV-cache container are implemented. A complete synthetic transformer block is hardware-gated with seven resident Q/K/V/O/gate/up/down projections on NPU and CPU transformer glue, and its final output is compared against the same block running entirely on CPU.
+
 Move bottlenecks only after each operation has a hardware/CPU differential test.
 
-The first LLM correctness milestone remains: load one GGUF, accept a prompt, generate the correct next token(s). Performance comes after correctness.
+The first LLM correctness milestone is now narrower: load one real GGUF, use its tokenizer/embedding/weights, run the full layer stack plus final norm/LM head, accept a prompt, and match an independent reference next token. Multi-token generation follows by connecting the existing KV-cache primitive to each block and adding the autoregressive decode loop. Performance comes after correctness.
 
 ## 16. Unknown hardware capabilities / blockers
 
@@ -825,7 +827,7 @@ Focused follow-ups remain:
 5. keep low-4-GiB pressure bounded and add explicit allocator failure/recovery behavior if larger real models approach the aperture,
 6. do not expand into training/autograd/general framework APIs.
 
-A third CNN model becomes useful after this Conv robustness sweep because it can then test generalization rather than introduce another one-off lowering. GGUF/transformer work remains later.
+The Conv robustness work remains useful for CNN coverage, but GGUF/transformer work is no longer deferred: the hybrid transformer math path is now active and hardware-proven. The immediate LLM work is real GGUF/tokenizer/weight integration and the first independently verified next token.
 
 ## 18. Host setup changes made during this round
 
