@@ -35,22 +35,29 @@ A real pretrained standard-format model must load from its original `.onnx`, exe
 
 This criterion is now met by the external pretrained Pico-CNN MNIST MLP gate: four Gemm layers execute on RK3588 NPU and the first 50 canonical MNIST test images have identical top-1 predictions to ONNX ReferenceEvaluator.
 
-## User-facing runtime milestone
+## Runtime boundary and reference frontend
 
-The first ONNX command-line path is now implemented on top of the high-level Session runtime:
-
-```text
-rocknpu run model.onnx --input input.npy --output output.npy
-```
-
-For the currently supported ONNX subset, the CLI accepts C-order `float32` NumPy tensors, prepares static NPU weights once, executes the model through Rocket, writes a standard `.npy` output, and exposes CPU execution as an explicit target. Official MNIST-8 and edge-infer CIFAR-10 have both passed this path on real RK3588 hardware with independent reference checks.
-
-This is a product milestone, not the end state. The next long-term interface goals are:
+RockNPU's primary product boundary is the **middle layer**, not a standalone inference frontend. The intended architecture is:
 
 ```text
-rocknpu run model.gguf
-Candle / framework adapter -> same RockNPU runtime/compiler
-multi-input / multi-output and broader dtype / quantized model contracts
+Candle / ONNX frontend / GGUF frontend / application runtime
+                         |
+                         v
+                 frontend adapter
+                         |
+                         v
+              RockNPU core contract
+        graph/IR + partition + lowering
+        layout/tiling + residency + scheduling
+                  /              \
+          CPU fallback       RK3588 backend
+                                  |
+                                  v
+                         Linux accel/rocket
 ```
 
-Those interfaces should feed the same project-owned compiler/backend rather than duplicate RK3588 register-command, layout, residency, or Rocket submission logic.
+A frontend or inference framework should call RockNPU; it should not need to know RK3588 register commands, Rocket BO/IOVA details, native tensor packing, or NPU scheduling rules.
+
+The current `rocknpu::Session::load("model.onnx")` and `rocknpu run model.onnx --input input.npy --output output.npy` paths are useful **bootstrap/reference frontends**. They prove the complete stack and provide a reproducible integration/debug harness, but ONNX parsing and CLI file I/O are not the long-term core runtime boundary.
+
+The next architecture milestone is therefore a frontend-neutral compiler/runtime contract that multiple adapters can target. ONNX import, a future GGUF/LLM frontend, and Candle/framework integration should all lower into the same project-owned graph/executable representation and use the same preparation, placement, residency, scheduling, CPU fallback, and Rocket backend machinery.

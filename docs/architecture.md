@@ -4,23 +4,29 @@ Status: first RK3588 hardware vertical slice is working on 2026-09-14.
 
 ## 1. Goal and non-goals
 
-The target stack is:
+The target stack is deliberately split into frontend adapters, a frontend-neutral RockNPU core, and the RK3588/Rocket backend:
 
 ```text
-ONNX / GGUF / safetensors
-        |
-        v
-Rust frontend + internal IR + partitioner/compiler
-        |
-        v
-Rust RK3588 tensor/layout/regcmd backend
-        |
-        v
-Linux DRM accel Rocket UAPI
-        |
-        v
-RK3588 NPU
+Candle / ONNX frontend / GGUF frontend / application runtime
+                         |
+                         v
+                  frontend adapters
+                         |
+                         v
+              RockNPU core compiler/runtime
+        graph IR / partition / shape / placement
+        layout / tiling / residency / scheduling
+                  /                 \
+          CPU fallback         RK3588 backend
+                                    |
+                                    v
+                         Linux DRM accel Rocket UAPI
+                                    |
+                                    v
+                                RK3588 NPU
 ```
+
+The inference frontend is a caller of RockNPU. Model-format parsing belongs in adapters/frontends; RK3588 register commands, native layouts, residency, scheduling and Rocket submission belong behind the RockNPU core/backend boundary. The current ONNX `Session` and CLI are bootstrap/reference frontends over this stack, not the final core abstraction.
 
 The project does not depend on `librknnrt.so`, `librkllmrt.so`, RKNN Toolkit, or RKLLM Toolkit. `.rknn` and `.rkllm` compatibility is explicitly outside the first architecture milestone. The kernel driver is not forked: use upstream `drivers/accel/rocket/` unless a demonstrated hardware limitation makes that impossible.
 

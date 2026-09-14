@@ -347,9 +347,9 @@ The current validated CNN/dense path includes the subset needed by the real-mode
 
 Some operators execute on the RK3588 NPU and some currently use CPU fallback. Unsupported models/operators should fail explicitly rather than silently invoking an external proprietary runtime.
 
-## High-level Rust Session API
+## Reference ONNX frontend and Session façade
 
-A first developer-preview `rocknpu::Session` API is now implemented:
+A first developer-preview `rocknpu::Session` façade is now implemented for the current ONNX reference frontend:
 
 ```rust,ignore
 use rocknpu::{Session, Tensor};
@@ -364,7 +364,7 @@ println!("{:?}", output.stats());
 
 The Session currently targets the same deliberately small ONNX subset listed above. CPU fallback remains part of the execution plan for supported small operators such as `Add`, `Relu`, `MaxPool`, and `Reshape`; unsupported graph structures fail explicitly. `SessionOptions::cpu()` is also available for an explicit CPU session.
 
-The same runtime is now exposed through a first developer-preview CLI:
+For end-to-end integration and debugging, the same ONNX reference frontend is also exposed through a thin developer-preview CLI:
 
 ```sh
 rocknpu run model.onnx --input input.npy --output output.npy
@@ -378,9 +378,9 @@ cargo run -p rocknpu -- run model.onnx --input input.npy --output output.npy
 
 The CLI accepts C-order NumPy `.npy` tensors with `float32` elements, targets `/dev/accel/accel0` by default, supports `--target cpu` for explicit CPU execution, and accepts `--device <path>` for an alternate Rocket device. It uses the same eager Session preparation and reports resident-weight plus NPU-placement statistics after each run. The emitted `.npy` output is readable by standard NumPy.
 
-Both the Rust API and CLI are developer previews rather than stability guarantees, but they are real hardware-tested interfaces rather than conceptual placeholders. Current real-model CLI gates cover official MNIST-8 and edge-infer CIFAR-10 on RK3588.
+Both paths are hardware-tested developer previews. Current real-model CLI gates cover official MNIST-8 and edge-infer CIFAR-10 on RK3588. The CLI is a **reference frontend / integration harness**, not the architectural center of RockNPU.
 
-Frameworks such as Candle should eventually be able to use RockNPU as an RK3588 NPU backend without reimplementing RK3588 register commands, layouts, memory management and Rocket submission themselves.
+The long-term core boundary sits below model-format parsing: a frontend-neutral RockNPU compiler/runtime contract should accept work from ONNX, GGUF/LLM, Candle, or other inference frontends and own partitioning, lowering, tensor layout, preparation/residency, scheduling, CPU fallback, and RK3588/Rocket execution. Frameworks such as Candle should call this layer as an RK3588 backend without reimplementing those details.
 
 ## Architecture
 
