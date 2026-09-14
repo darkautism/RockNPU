@@ -620,7 +620,9 @@ dependencies = [
 name = "rocknpu-capi"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "half",
+ "llama-gguf",
  "rocket-runtime",
  "rocknpu-matmul",
 ]

@@ -446,7 +446,7 @@ Detailed architecture and hardware findings are in [`docs/architecture.md`](docs
 
 The project goal/non-goals are in [`docs/goal.md`](docs/goal.md).
 
-An out-of-tree GGML adapter now proves the external backend boundary without modifying llama.cpp: stock llama.cpp dynamically loads `libggml-rocknpu.so`, discovers the real Rocket-backed `ROCKNPU0` device through `rocknpu-capi`, and stock `test-backend-ops` passes the first aligned F16/F32 `MUL_MAT` against its independent CPU reference. GGML ABI details remain confined to `adapters/ggml-rocknpu`; see its README and `docs/repro.md` for the exact gate.
+An out-of-tree GGML adapter now proves the external backend boundary without modifying llama.cpp: stock llama.cpp dynamically loads `libggml-rocknpu.so`, discovers the real Rocket-backed `ROCKNPU0` device through `rocknpu-capi`, and stock `test-backend-ops` validates aligned F16 and Q4_K/F32 `MUL_MAT` against its independent CPU reference. A real TinyLlama Q4_K_M prefill through stock llama.cpp executes 131 Q4_K MatMuls at the RockNPU `graph_compute` boundary and matches the stock CPU greedy next token for the validated four-token prompt. GGML ABI details remain confined to `adapters/ggml-rocknpu`; see its README and `docs/repro.md` for the exact gates.
 
 ## Correctness policy
 

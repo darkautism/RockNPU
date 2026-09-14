@@ -4,7 +4,9 @@ Out-of-tree GGML dynamic backend adapter for RockNPU. It is loaded by an unmodif
 
 The adapter is the only layer allowed to depend on GGML backend ABI types. RockNPU core/runtime crates remain GGML-independent. C++ calls the narrow `rocknpu-capi` ABI, which owns the Rust/Rocket boundary.
 
-Validated against llama.cpp commit `391fac16460f15233a7740550d858ac96df3419d`.
+Validated against unmodified llama.cpp commit `391fac16460f15233a7740550d858ac96df3419d`.
+
+For normal `GGML_BACKEND_PATH` auto-loading, build llama.cpp with its stock dynamic-backend option enabled (`-DGGML_BACKEND_DL=ON`). A build with static CPU registration (`GGML_BACKEND_DL=OFF`) can still load this plugin through tools that explicitly call `ggml_backend_load_all`, such as `--list-devices` and `test-backend-ops`, but ordinary completion does not automatically load the environment-provided plugin in that configuration.
 
 ## Build and discovery
 
@@ -26,16 +28,20 @@ ROCKNPU0: RockNPU RK3588
 
 Device registration is not a C++ stub: `ggml_backend_score` and the registry call `rocknpu_device_count()`, which probes availability through Rust `RocketDevice::open()`.
 
-## First compute gate
+## Supported compute slice
 
-The first deliberately narrow operation is contiguous, unbatched `GGML_OP_MUL_MAT`:
+The deliberately narrow operation is contiguous, unbatched `GGML_OP_MUL_MAT`:
 
 ```text
-src0 weights:     F16 [N,K]
+src0 weights:     F16 or Q4_K [N,K]
 src1 activations: F32 [M,K]
 dst:              F32 [M,N]
-M % 4 == 0, K % 32 == 0, N % 16 == 0
+M % 4 == 0, N % 16 == 0
+F16: K % 32 == 0
+Q4_K: K % 256 == 0
 ```
+
+Q4_K blocks are forwarded unchanged across the C++ adapter boundary, decoded in Rust by `rocknpu-capi`, converted to the existing FP16 weight contract, and then executed by `Fp16MatmulExecutor`. This is a correctness-first bridge to real quantized GGUF models, not a native Q4_K NPU kernel or a performance claim.
 
 Everything else is rejected by `supports_op` rather than silently falling back inside the adapter.
 
@@ -69,4 +75,47 @@ stock GGML
   -> RK3588 NPU
 ```
 
-This is an integration/correctness gate, not broad GGML coverage. Quantized weights, M=1 decode, batching, permutations, and additional GGML ops remain unsupported here until each gets its own external gate.
+The Q4_K-specific stock oracle is:
+
+```sh
+GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" \
+  /build/llama.cpp-reference/build-dl/bin/test-backend-ops \
+  test -b ROCKNPU0 -o MUL_MAT -p q4_K
+```
+
+Accepted on RK3588: `6/6 tests passed`; unsupported M=1/non-multiple-of-4, batched, permuted, and F16-activation variants remain explicitly rejected.
+
+## Real TinyLlama gate
+
+Configure the same unmodified llama.cpp source with dynamic backends:
+
+```sh
+cmake -S /build/llama.cpp-reference \
+  -B /build/llama.cpp-reference/build-dl \
+  -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON
+cmake --build /build/llama.cpp-reference/build-dl --target llama-completion test-backend-ops -j 8
+```
+
+Then run a four-token prompt so the current NPU M alignment is satisfied:
+
+```sh
+ROCKNPU_GGML_TRACE=1 \
+GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" \
+  /build/llama.cpp-reference/build-dl/bin/llama-completion \
+  -fit off -ngl 0 \
+  -m artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf \
+  -no-cnv -p "The capital of" -n 1 --temp 0 --no-warmup
+```
+
+The independent stock CPU run greedily produces `" the"`. The RockNPU run produces the same continuation and reports:
+
+```text
+ROCKNPU GGML TRACE mul_mat type=q4_K M=4 K=2048 N=2048
+ROCKNPU GGML TRACE mul_mat type=q4_K M=4 K=2048 N=256
+ROCKNPU GGML TRACE mul_mat type=q4_K M=4 K=2048 N=5632
+ROCKNPU GGML TRACE mul_mat type=q4_K M=4 K=5632 N=2048
+...
+ROCKNPU GGML TRACE summary q4_K_mul_mat=131 f16_mul_mat=0
+```
+
+The trace is opt-in and emitted at the actual RockNPU `graph_compute` boundary, so this proves real TinyLlama prefill nodes entered the backend rather than merely being accepted by `supports_op`. M=1 decode, Q6_K tensors, batching, permutations, and additional GGML ops remain unsupported and fall to other scheduler backends. Native Q4_K execution and persistent/prepacked GGML weights are future performance work.

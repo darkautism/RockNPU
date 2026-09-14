@@ -7,6 +7,8 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
+bytemuck = "1"
 half = "2"
+llama-gguf = { version = "0.14", default-features = false }
 rocket-runtime = { path = "../rocket-runtime" }
 rocknpu-matmul = { path = "../rocknpu-matmul" }
