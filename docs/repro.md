@@ -625,7 +625,7 @@ python3 -c "import numpy as np; a=np.load('artifacts/cli-mnist8-npu.npy'); r=np.
 
 This gate proves the documented end-user ONNX command path itself, rather than only the lower-level smoke binaries. It does not expand the ONNX operator set or claim general NumPy dtype/layout support.
 
-## TinyLlama GGUF first-token hardware gate
+## TinyLlama GGUF autoregressive hardware gates
 
 The first real LLM gate uses `TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf`. The validated artifact is 667,814,880 bytes and can be fetched from the public second-state TinyLlama GGUF mirror:
 
@@ -689,4 +689,54 @@ cmake --build /build/llama.cpp-reference/build --target llama-completion -j 8
 
 The raw completion is `Hello,`, so the first generated token text is again `","`. `-no-cnv` is required: allowing the model's chat template changes the prompt semantics and is not the same gate.
 
-This is a correctness milestone, not a performance claim. The initial debug-build RockNPU run took roughly 112 seconds because the current path repeatedly converts Q4_K_M weights to FP16 and prepares each layer. Multi-token chat is not yet implemented: the next gate is per-layer KV-cache integration and an autoregressive decode loop, followed by M=1 NPU/GEMV and native quantized-kernel optimization.
+### Autoregressive KV-cache gate
+
+The runtime now retains one K/V cache per transformer layer and performs incremental one-token decode. During prefill, only the real prompt rows are cached even when end-padding is added to make the NPU MatMul row count legal. After each layer's prefill, its Rocket resident-weight BOs are released while the one-time dequantized FP16 matrices are retained for the current CPU M=1 decode path.
+
+Use a high-margin sequence to make exact cross-runtime greedy comparison meaningful:
+
+```sh
+cargo run --release -p rocket-smoke --bin llm_gguf -- \
+  artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf \
+  "1, 2, 3, 4, 5, 6, 7, 8," npu 32
+```
+
+Accepted RK3588 result:
+
+```text
+prompt_tokens=25 padded_tokens=28
+text=" 9, 10, 11, 12, 13, 14, 15, 16, "
+prefill_npu=154 prefill_cpu=0
+decode_npu=0 decode_cpu=4774 lm_head_cpu=32
+```
+
+The exact 32 generated token IDs are:
+
+```text
+[29871, 29929, 29892, 29871, 29896, 29900, 29892, 29871,
+ 29896, 29896, 29892, 29871, 29896, 29906, 29892, 29871,
+ 29896, 29941, 29892, 29871, 29896, 29946, 29892, 29871,
+ 29896, 29945, 29892, 29871, 29896, 29953, 29892, 29871]
+```
+
+Run the independent Rust CPU model with the same prompt and token budget:
+
+```sh
+cargo run --release -p rocknpu-llm --example gguf_reference -- \
+  artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf \
+  "1, 2, 3, 4, 5, 6, 7, 8," 32
+```
+
+It must reproduce all 32 IDs and the same decoded string. The separately built llama.cpp raw-completion oracle must also produce the same sequence; the validated numeric prompt has large top-1/top-2 margins throughout, making it suitable for an exact greedy gate.
+
+A semantic prompt is also exercised:
+
+```text
+The capital of France is -> " Paris.\n\n2. B."
+```
+
+RockNPU, `llama-gguf`, and llama.cpp agree on the first eight generated tokens. Extending that particular greedy sequence exposes a useful precision boundary at token 9: llama.cpp's native Q4_K path ranks token `29907` (`C`) above token `315` (` C`) by about `0.125`, while the FP16-dequantized Rust reference ranks `315` above `29907` by about `0.040`. Once either near-tied token is chosen, later greedy history naturally diverges.
+
+Therefore exact greedy token identity is a hard cross-runtime requirement only on numerically stable reference steps. Near-tied candidates must be investigated with logits and reported as numerical precision divergence rather than mislabeled as a K/V-state failure. The project also keeps a unit differential where cached single-token decode matches full-sequence recomputation for the same transformer block.
+
+This remains a correctness milestone rather than a performance claim. Q4_K_M weights are currently converted to FP16, prefill uses the NPU, and M=1 projection/LM-head decode stays on CPU. The next performance work is native quantized execution and a validated NPU GEMV/decode path.

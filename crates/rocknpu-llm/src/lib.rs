@@ -7,7 +7,7 @@ use rocknpu_tensor::{Matrix, TensorError};
 use std::fmt;
 
 mod gguf;
-pub use gguf::{FirstTokenResult, GgufLlama, GgufModelInfo};
+pub use gguf::{FirstTokenResult, GenerationResult, GgufLlama, GgufModelInfo};
 
 #[derive(Debug)]
 pub enum LlmError {
@@ -386,6 +386,10 @@ impl<'d> HybridLinear<'d> {
         self.prepared.is_some()
     }
 
+    pub fn release_resident_npu_weights(&mut self) {
+        self.prepared = None;
+    }
+
     pub fn run(
         &self,
         backend: Option<&mut SingleNpuBackend<'d>>,
@@ -574,20 +578,65 @@ impl<'d> TransformerBlock<'d> {
         .count()
     }
 
+    /// Drop Rocket resident-weight BOs while retaining the dequantized FP16 matrices.
+    /// This is useful after NPU prefill when current M=1 decode intentionally runs on CPU.
+    pub fn release_resident_npu_weights(&mut self) {
+        self.q_proj.release_resident_npu_weights();
+        self.k_proj.release_resident_npu_weights();
+        self.v_proj.release_resident_npu_weights();
+        self.o_proj.release_resident_npu_weights();
+        self.gate_proj.release_resident_npu_weights();
+        self.up_proj.release_resident_npu_weights();
+        self.down_proj.release_resident_npu_weights();
+    }
+
     /// Full prefill for one transformer block. Large projections may run on NPU;
     /// normalization, RoPE, causal GQA, SwiGLU and residuals stay on CPU for now.
     pub fn run_prefill(
         &self,
-        mut backend: Option<&mut SingleNpuBackend<'d>>,
+        backend: Option<&mut SingleNpuBackend<'d>>,
         input: &[f16],
         tokens: usize,
         position_start: usize,
     ) -> Result<(Vec<f16>, TransformerBlockStats), LlmError> {
-        if tokens == 0 || input.len() != tokens.saturating_mul(self.config.hidden_size) {
+        self.run_prefill_cached(backend, input, tokens, tokens, position_start, None)
+    }
+
+    /// Prefill while retaining only the real (unpadded) K/V rows in `cache`.
+    /// `tokens` may include end-padding rows used solely to satisfy NPU MatMul geometry;
+    /// `active_tokens` is the semantic prompt length and therefore the number of cache rows.
+    pub fn run_prefill_cached(
+        &self,
+        mut backend: Option<&mut SingleNpuBackend<'d>>,
+        input: &[f16],
+        tokens: usize,
+        active_tokens: usize,
+        position_start: usize,
+        cache: Option<&mut KvCache>,
+    ) -> Result<(Vec<f16>, TransformerBlockStats), LlmError> {
+        if tokens == 0
+            || active_tokens == 0
+            || active_tokens > tokens
+            || input.len() != tokens.saturating_mul(self.config.hidden_size)
+        {
             return Err(LlmError::InvalidShape(
-                "Transformer prefill input must have shape [tokens, hidden_size]".into(),
+                "Transformer prefill input must have shape [tokens, hidden_size] with 0 < active_tokens <= tokens"
+                    .into(),
             ));
         }
+        if let Some(cache) = cache.as_ref() {
+            if !cache.is_empty() || position_start != 0 {
+                return Err(LlmError::InvalidShape(
+                    "cached prefill currently requires an empty KV cache at position zero".into(),
+                ));
+            }
+            if cache.kv_heads != self.config.kv_heads || cache.head_dim != self.config.head_dim {
+                return Err(LlmError::InvalidShape(
+                    "KV cache geometry does not match transformer block".into(),
+                ));
+            }
+        }
+
         let mut stats = TransformerBlockStats::default();
         let normalized = rms_norm(
             input,
@@ -628,6 +677,10 @@ impl<'d> TransformerBlock<'d> {
             self.config.rope_theta,
             self.config.rope_style,
         )?;
+        if let Some(cache) = cache {
+            let active_kv = active_tokens.saturating_mul(self.config.kv_size());
+            cache.append(&k[..active_kv], &v[..active_kv], active_tokens)?;
+        }
         let attention = causal_attention(
             &q,
             &k,
@@ -664,6 +717,95 @@ impl<'d> TransformerBlock<'d> {
         stats.record(execution);
         let activated = swiglu(&gate, &up)?;
         let (ffn_output, execution) = self.down_proj.run(backend, &activated, tokens)?;
+        stats.record(execution);
+        Ok((residual_add(&after_attention, &ffn_output)?, stats))
+    }
+
+    /// Decode one token against the retained per-layer KV cache.
+    pub fn run_decode(
+        &self,
+        mut backend: Option<&mut SingleNpuBackend<'d>>,
+        input: &[f16],
+        cache: &mut KvCache,
+    ) -> Result<(Vec<f16>, TransformerBlockStats), LlmError> {
+        if input.len() != self.config.hidden_size {
+            return Err(LlmError::InvalidShape(
+                "Transformer decode input must have shape [1, hidden_size]".into(),
+            ));
+        }
+        if cache.kv_heads != self.config.kv_heads || cache.head_dim != self.config.head_dim {
+            return Err(LlmError::InvalidShape(
+                "KV cache geometry does not match transformer block".into(),
+            ));
+        }
+        if cache.len() >= cache.capacity() {
+            return Err(LlmError::InvalidShape("KV cache is full".into()));
+        }
+
+        let position = cache.len();
+        let mut stats = TransformerBlockStats::default();
+        let normalized = rms_norm(
+            input,
+            1,
+            self.config.hidden_size,
+            &self.attention_norm,
+            self.config.rms_norm_eps,
+        )?;
+        let (mut q, execution) = self.q_proj.run(backend.as_deref_mut(), &normalized, 1)?;
+        stats.record(execution);
+        let (mut k, execution) = self.k_proj.run(backend.as_deref_mut(), &normalized, 1)?;
+        stats.record(execution);
+        let (v, execution) = self.v_proj.run(backend.as_deref_mut(), &normalized, 1)?;
+        stats.record(execution);
+        apply_rope(
+            &mut q,
+            1,
+            self.config.query_heads,
+            self.config.head_dim,
+            position,
+            self.config.rope_theta,
+            self.config.rope_style,
+        )?;
+        apply_rope(
+            &mut k,
+            1,
+            self.config.kv_heads,
+            self.config.head_dim,
+            position,
+            self.config.rope_theta,
+            self.config.rope_style,
+        )?;
+        cache.append(&k, &v, 1)?;
+        let attention = causal_attention(
+            &q,
+            cache.keys(),
+            cache.values(),
+            1,
+            cache.len(),
+            position,
+            AttentionConfig {
+                query_heads: self.config.query_heads,
+                kv_heads: self.config.kv_heads,
+                head_dim: self.config.head_dim,
+            },
+        )?;
+        let (attention_output, execution) =
+            self.o_proj.run(backend.as_deref_mut(), &attention, 1)?;
+        stats.record(execution);
+        let after_attention = residual_add(input, &attention_output)?;
+        let normalized = rms_norm(
+            &after_attention,
+            1,
+            self.config.hidden_size,
+            &self.ffn_norm,
+            self.config.rms_norm_eps,
+        )?;
+        let (gate, execution) = self.gate_proj.run(backend.as_deref_mut(), &normalized, 1)?;
+        stats.record(execution);
+        let (up, execution) = self.up_proj.run(backend.as_deref_mut(), &normalized, 1)?;
+        stats.record(execution);
+        let activated = swiglu(&gate, &up)?;
+        let (ffn_output, execution) = self.down_proj.run(backend, &activated, 1)?;
         stats.record(execution);
         Ok((residual_add(&after_attention, &ffn_output)?, stats))
     }
@@ -807,5 +949,53 @@ mod tests {
                 .iter()
                 .all(|value| (value.to_f32() - 8.0).abs() < 0.01)
         );
+    }
+
+    #[test]
+    fn cached_decode_matches_full_prefill_last_row() {
+        let config = TransformerBlockConfig {
+            hidden_size: 64,
+            query_heads: 2,
+            kv_heads: 1,
+            head_dim: 32,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            rope_style: RopeStyle::Normal,
+        };
+        let block = TransformerBlock::prepare(config, tiny_block_weights(config), None).unwrap();
+        let input: Vec<f16> = (0..3 * config.hidden_size)
+            .map(|index| f16::from_f32(((index % 19) as f32 - 9.0) / 64.0))
+            .collect();
+        let (full, _) = block.run_prefill(None, &input, 3, 0).unwrap();
+
+        let mut cache = KvCache::new(config.kv_heads, config.head_dim, 8).unwrap();
+        let (prefill, _) = block
+            .run_prefill_cached(
+                None,
+                &input[..2 * config.hidden_size],
+                2,
+                2,
+                0,
+                Some(&mut cache),
+            )
+            .unwrap();
+        assert_eq!(prefill.len(), 2 * config.hidden_size);
+        assert_eq!(cache.len(), 2);
+        let (decoded, stats) = block
+            .run_decode(None, &input[2 * config.hidden_size..], &mut cache)
+            .unwrap();
+        assert_eq!(cache.len(), 3);
+        assert_eq!(stats.npu_linears, 0);
+        assert_eq!(stats.cpu_linears, 7);
+
+        let expected = &full[2 * config.hidden_size..];
+        assert_eq!(decoded.len(), expected.len());
+        let max_abs = decoded
+            .iter()
+            .zip(expected)
+            .map(|(got, want)| (got.to_f32() - want.to_f32()).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_abs <= 0.001, "cached decode max_abs={max_abs}");
     }
 }

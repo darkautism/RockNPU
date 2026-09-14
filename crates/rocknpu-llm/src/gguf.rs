@@ -1,6 +1,6 @@
 use crate::{
-    HybridLinear, LinearExecution, LlmError, RopeStyle, TransformerBlock, TransformerBlockConfig,
-    TransformerBlockStats, TransformerBlockWeights, rms_norm,
+    HybridLinear, KvCache, LinearExecution, LlmError, RopeStyle, TransformerBlock,
+    TransformerBlockConfig, TransformerBlockStats, TransformerBlockWeights, rms_norm,
 };
 use bytemuck::{Pod, pod_read_unaligned};
 use half::{bf16, f16};
@@ -42,6 +42,19 @@ pub struct FirstTokenResult {
     pub text: String,
     pub npu_linears: usize,
     pub cpu_linears: usize,
+    pub padded_tokens: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenerationResult {
+    pub prompt_tokens: Vec<u32>,
+    pub generated_tokens: Vec<u32>,
+    pub text: String,
+    pub prefill_npu_linears: usize,
+    pub prefill_cpu_linears: usize,
+    pub decode_npu_linears: usize,
+    pub decode_cpu_linears: usize,
+    pub lm_head_cpu_linears: usize,
     pub padded_tokens: usize,
 }
 
@@ -141,20 +154,49 @@ impl GgufLlama {
 
     pub fn first_token<'d>(
         &self,
-        mut backend: Option<&mut SingleNpuBackend<'d>>,
+        backend: Option<&mut SingleNpuBackend<'d>>,
         prompt: &str,
         add_bos: bool,
     ) -> Result<FirstTokenResult, LlmError> {
+        let generated = self.generate_greedy(backend, prompt, add_bos, 1)?;
+        let token_id = *generated
+            .generated_tokens
+            .first()
+            .ok_or_else(|| LlmError::Gguf("generation produced no token".into()))?;
+        Ok(FirstTokenResult {
+            prompt_tokens: generated.prompt_tokens,
+            token_id,
+            text: generated.text,
+            npu_linears: generated.prefill_npu_linears + generated.decode_npu_linears,
+            cpu_linears: generated.prefill_cpu_linears
+                + generated.decode_cpu_linears
+                + generated.lm_head_cpu_linears,
+            padded_tokens: generated.padded_tokens,
+        })
+    }
+
+    pub fn generate_greedy<'d>(
+        &self,
+        mut backend: Option<&mut SingleNpuBackend<'d>>,
+        prompt: &str,
+        add_bos: bool,
+        max_new_tokens: usize,
+    ) -> Result<GenerationResult, LlmError> {
+        if max_new_tokens == 0 {
+            return Err(LlmError::Gguf(
+                "generation requires max_new_tokens > 0".into(),
+            ));
+        }
         let prompt_tokens = self.tokenize(prompt, add_bos)?;
         if prompt_tokens.is_empty() {
             return Err(LlmError::Gguf(
                 "prompt tokenized to an empty sequence".into(),
             ));
         }
-        if prompt_tokens.len() > self.config.max_seq_len {
+        if prompt_tokens.len().saturating_add(max_new_tokens) > self.config.max_seq_len {
             return Err(LlmError::Gguf(format!(
-                "prompt has {} tokens but model context is {}",
-                prompt_tokens.len(),
+                "prompt plus generation budget is {} tokens but model context is {}",
+                prompt_tokens.len().saturating_add(max_new_tokens),
                 self.config.max_seq_len
             )));
         }
@@ -164,39 +206,41 @@ impl GgufLlama {
         let padded_tokens = prompt_tokens.len().div_ceil(4) * 4;
         let mut hidden = vec![f16::ZERO; padded_tokens * self.config.hidden_size];
         for (row, token) in prompt_tokens.iter().copied().enumerate() {
-            let token = token as usize;
-            if token >= self.config.vocab_size {
-                return Err(LlmError::Gguf(format!(
-                    "token {token} is outside vocabulary {}",
-                    self.config.vocab_size
-                )));
-            }
-            let src = token * self.config.hidden_size;
+            let embedding = self.embedding_row(token)?;
             let dst = row * self.config.hidden_size;
-            hidden[dst..dst + self.config.hidden_size]
-                .copy_from_slice(&self.embedding[src..src + self.config.hidden_size]);
+            hidden[dst..dst + self.config.hidden_size].copy_from_slice(embedding);
         }
 
-        let mut total_stats = TransformerBlockStats::default();
+        let mut blocks = Vec::with_capacity(self.layers.len());
+        let mut caches = Vec::with_capacity(self.layers.len());
+        let mut prefill_stats = TransformerBlockStats::default();
         for layer_index in 0..self.layers.len() {
             let (block_config, weights) = self.block(layer_index)?;
-            let block = TransformerBlock::prepare(block_config, weights, backend.as_deref())?;
-            let (next, stats) =
-                block.run_prefill(backend.as_deref_mut(), &hidden, padded_tokens, 0)?;
-            total_stats.npu_linears += stats.npu_linears;
-            total_stats.cpu_linears += stats.cpu_linears;
+            let mut block = TransformerBlock::prepare(block_config, weights, backend.as_deref())?;
+            let mut cache = KvCache::new(
+                block_config.kv_heads,
+                block_config.head_dim,
+                self.config.max_seq_len,
+            )?;
+            let (next, stats) = block.run_prefill_cached(
+                backend.as_deref_mut(),
+                &hidden,
+                padded_tokens,
+                prompt_tokens.len(),
+                0,
+                Some(&mut cache),
+            )?;
+            prefill_stats.npu_linears += stats.npu_linears;
+            prefill_stats.cpu_linears += stats.cpu_linears;
             hidden = next;
+
+            // Current M=1 decode is CPU by policy. Retain the one-time FP16 dequantized
+            // matrices but release Rocket resident-weight BOs before moving to the next layer.
+            block.release_resident_npu_weights();
+            blocks.push(block);
+            caches.push(cache);
         }
 
-        let normalized = rms_norm(
-            &hidden,
-            padded_tokens,
-            self.config.hidden_size,
-            &self.final_norm,
-            self.final_norm_eps,
-        )?;
-        let last = (prompt_tokens.len() - 1) * self.config.hidden_size;
-        let last_hidden = &normalized[last..last + self.config.hidden_size];
         let output_weights = linear_weights(&self.output)?;
         let lm_head = HybridLinear::prepare(
             None,
@@ -204,25 +248,80 @@ impl GgufLlama {
             self.config.hidden_size,
             output_weights,
         )?;
-        let (logits, execution) = lm_head.run(None, last_hidden, 1)?;
-        debug_assert_eq!(execution, LinearExecution::Cpu);
-        let token_id = logits
-            .iter()
-            .enumerate()
-            .max_by(|(_, left), (_, right)| left.to_f32().total_cmp(&right.to_f32()))
-            .map(|(index, _)| index as u32)
-            .ok_or_else(|| LlmError::Gguf("LM head produced no logits".into()))?;
-        let text = self.decode_token(token_id)?;
-        Ok(FirstTokenResult {
+        let last = (prompt_tokens.len() - 1) * self.config.hidden_size;
+        let mut next_token =
+            self.select_next_token(&lm_head, &hidden[last..last + self.config.hidden_size])?;
+
+        let mut generated_tokens = Vec::with_capacity(max_new_tokens);
+        let mut decode_stats = TransformerBlockStats::default();
+        let eos_token = self.tokenizer.special_tokens.eos_token_id;
+        while generated_tokens.len() < max_new_tokens {
+            generated_tokens.push(next_token);
+            if next_token == eos_token || generated_tokens.len() == max_new_tokens {
+                break;
+            }
+
+            hidden = self.embedding_row(next_token)?.to_vec();
+            for (block, cache) in blocks.iter().zip(&mut caches) {
+                let (next, stats) = block.run_decode(None, &hidden, cache)?;
+                decode_stats.npu_linears += stats.npu_linears;
+                decode_stats.cpu_linears += stats.cpu_linears;
+                hidden = next;
+            }
+            next_token = self.select_next_token(&lm_head, &hidden)?;
+        }
+
+        let text = self
+            .tokenizer
+            .decode(&generated_tokens)
+            .map_err(frontend_error)?;
+        let lm_head_cpu_linears = generated_tokens.len();
+        Ok(GenerationResult {
             prompt_tokens,
-            token_id,
+            generated_tokens,
             text,
-            npu_linears: total_stats.npu_linears,
-            cpu_linears: total_stats.cpu_linears + 1,
+            prefill_npu_linears: prefill_stats.npu_linears,
+            prefill_cpu_linears: prefill_stats.cpu_linears,
+            decode_npu_linears: decode_stats.npu_linears,
+            decode_cpu_linears: decode_stats.cpu_linears,
+            lm_head_cpu_linears,
             padded_tokens,
         })
     }
 
+    fn embedding_row(&self, token: u32) -> Result<&[f16], LlmError> {
+        let token = token as usize;
+        if token >= self.config.vocab_size {
+            return Err(LlmError::Gguf(format!(
+                "token {token} is outside vocabulary {}",
+                self.config.vocab_size
+            )));
+        }
+        let start = token * self.config.hidden_size;
+        Ok(&self.embedding[start..start + self.config.hidden_size])
+    }
+
+    fn select_next_token<'d>(
+        &self,
+        lm_head: &HybridLinear<'d>,
+        hidden: &[f16],
+    ) -> Result<u32, LlmError> {
+        let normalized = rms_norm(
+            hidden,
+            1,
+            self.config.hidden_size,
+            &self.final_norm,
+            self.final_norm_eps,
+        )?;
+        let (logits, execution) = lm_head.run(None, &normalized, 1)?;
+        debug_assert_eq!(execution, LinearExecution::Cpu);
+        logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.to_f32().total_cmp(&right.to_f32()))
+            .map(|(index, _)| index as u32)
+            .ok_or_else(|| LlmError::Gguf("LM head produced no logits".into()))
+    }
     fn block(
         &self,
         layer_index: usize,
