@@ -364,13 +364,21 @@ println!("{:?}", output.stats());
 
 The Session currently targets the same deliberately small ONNX subset listed above. CPU fallback remains part of the execution plan for supported small operators such as `Add`, `Relu`, `MaxPool`, and `Reshape`; unsupported graph structures fail explicitly. `SessionOptions::cpu()` is also available for an explicit CPU session.
 
-The command-line interface is still future work. The intended direction remains:
+The same runtime is now exposed through a first developer-preview CLI:
 
 ```sh
 rocknpu run model.onnx --input input.npy --output output.npy
 ```
 
-The Rust API is a developer preview rather than a stability guarantee, but it is now a real, hardware-tested interface rather than a conceptual placeholder.
+From the workspace, the equivalent development invocation is:
+
+```sh
+cargo run -p rocknpu -- run model.onnx --input input.npy --output output.npy
+```
+
+The CLI accepts C-order NumPy `.npy` tensors with `float32` elements, targets `/dev/accel/accel0` by default, supports `--target cpu` for explicit CPU execution, and accepts `--device <path>` for an alternate Rocket device. It uses the same eager Session preparation and reports resident-weight plus NPU-placement statistics after each run. The emitted `.npy` output is readable by standard NumPy.
+
+Both the Rust API and CLI are developer previews rather than stability guarantees, but they are real hardware-tested interfaces rather than conceptual placeholders. Current real-model CLI gates cover official MNIST-8 and edge-infer CIFAR-10 on RK3588.
 
 Frameworks such as Candle should eventually be able to use RockNPU as an RK3588 NPU backend without reimplementing RK3588 register commands, layouts, memory management and Rocket submission themselves.
 

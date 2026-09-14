@@ -576,3 +576,51 @@ python3 scripts/verify_real_mnist.py prepared-mnist-npu
 ```
 
 All generated evidence remains under `/build/rocknpu/artifacts/` and is gitignored.
+
+## High-level `rocknpu run` CLI gate
+
+The CLI uses standard C-order `float32` NumPy `.npy` files and the same Session runtime as the Rust API. Build the two checked input files from the existing canonical artifacts:
+
+```sh
+cd /build/rocknpu
+python3 -c "import numpy as np; x=np.fromfile('artifacts/mnist8-input100-f32.bin',dtype='<f4').reshape(100,1,28,28); np.save('artifacts/cli-mnist8-input.npy',x[:1]); x=np.fromfile('artifacts/cifar10-edgeinfer-input-f32.bin',dtype='<f4').reshape(1,3,32,32); np.save('artifacts/cli-cifar10-input.npy',x)"
+```
+
+First validate the file/CLI contract without NPU dependence:
+
+```sh
+cargo run -p rocknpu -- run artifacts/mnist-8.onnx --input artifacts/cli-mnist8-input.npy --output artifacts/cli-mnist8-cpu.npy --target cpu
+cargo run -p rocknpu -- run artifacts/cifar10-edgeinfer.onnx --input artifacts/cli-cifar10-input.npy --output artifacts/cli-cifar10-cpu.npy --target cpu
+```
+
+Then run the identical interface on Rocket/NPU:
+
+```sh
+cargo run -p rocknpu -- run artifacts/mnist-8.onnx --input artifacts/cli-mnist8-input.npy --output artifacts/cli-mnist8-npu.npy
+cargo run -p rocknpu -- run artifacts/cifar10-edgeinfer.onnx --input artifacts/cli-cifar10-input.npy --output artifacts/cli-cifar10-npu.npy
+```
+
+Current accepted debug-build RK3588 evidence:
+
+```text
+MNIST-8 CLI NPU:
+  resident_bytes=59392
+  npu_conv=2 npu_dense=1
+  output shape=(1,10)
+  max_abs vs saved FP32 reference=0.0132598877
+
+CIFAR-10 CLI NPU:
+  resident_bytes=104448
+  npu_conv=3 npu_dense=2
+  output shape=(1,10)
+  prediction=8 (ship)
+  max_abs vs saved FP32 reference=0.0047588348
+```
+
+Finally prove NumPy can read the RockNPU-produced files and that top-1 remains equal to the saved references:
+
+```sh
+python3 -c "import numpy as np; a=np.load('artifacts/cli-mnist8-npu.npy'); r=np.fromfile('artifacts/mnist8-ref100-f32.bin',dtype='<f4').reshape(100,10)[:1]; assert a.dtype==np.float32 and a.shape==(1,10) and a.argmax(1)[0]==r.argmax(1)[0]; a=np.load('artifacts/cli-cifar10-npu.npy'); r=np.fromfile('artifacts/cifar10-edgeinfer-ref-f32.bin',dtype='<f4').reshape(1,10); assert a.dtype==np.float32 and a.shape==(1,10) and a.argmax(1)[0]==r.argmax(1)[0]==8; print('PASS: rocknpu CLI NumPy round-trip + RK3588 inference')"
+```
+
+This gate proves the documented end-user ONNX command path itself, rather than only the lower-level smoke binaries. It does not expand the ONNX operator set or claim general NumPy dtype/layout support.

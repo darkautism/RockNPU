@@ -81,6 +81,221 @@ impl Tensor {
     pub const fn dtype(&self) -> DType {
         DType::F32
     }
+
+    pub fn load_npy(path: impl AsRef<Path>) -> Result<Self, Error> {
+        let bytes = fs::read(path)?;
+        Self::from_npy_bytes(&bytes)
+    }
+
+    pub fn save_npy(&self, path: impl AsRef<Path>) -> Result<(), Error> {
+        fs::write(path, self.to_npy_bytes()?)?;
+        Ok(())
+    }
+
+    pub fn from_npy_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        const MAGIC: &[u8; 6] = b"\x93NUMPY";
+        if bytes.len() < 10 || &bytes[..6] != MAGIC {
+            return Err(Error::InvalidInput("invalid NumPy .npy magic".into()));
+        }
+        let major = bytes[6];
+        let (header_start, header_len) = match major {
+            1 => {
+                let len = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+                (10usize, len)
+            }
+            2 | 3 => {
+                if bytes.len() < 12 {
+                    return Err(Error::InvalidInput("truncated NumPy .npy header".into()));
+                }
+                let len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+                (12usize, len)
+            }
+            _ => {
+                return Err(Error::InvalidInput(format!(
+                    "unsupported NumPy .npy version {major}.{}",
+                    bytes[7]
+                )));
+            }
+        };
+        let header_end = header_start
+            .checked_add(header_len)
+            .ok_or_else(|| Error::InvalidInput("NumPy .npy header length overflow".into()))?;
+        if header_end > bytes.len() {
+            return Err(Error::InvalidInput("truncated NumPy .npy header".into()));
+        }
+        let header = std::str::from_utf8(&bytes[header_start..header_end])
+            .map_err(|_| Error::InvalidInput("NumPy .npy header is not UTF-8/ASCII".into()))?;
+        let descr = npy_string_field(header, "descr")?;
+        if npy_bool_field(header, "fortran_order")? {
+            return Err(Error::InvalidInput(
+                "Fortran-order NumPy arrays are not supported; use C-order".into(),
+            ));
+        }
+        let shape = npy_shape_field(header)?;
+        let little_endian = match descr.as_str() {
+            "<f4" => true,
+            ">f4" => false,
+            "=f4" | "f4" if cfg!(target_endian = "little") => true,
+            "=f4" | "f4" => false,
+            _ => {
+                return Err(Error::InvalidInput(format!(
+                    "unsupported NumPy dtype {descr:?}; expected float32"
+                )));
+            }
+        };
+        let elements = shape.iter().try_fold(1usize, |acc, &d| acc.checked_mul(d));
+        let data_len = elements
+            .and_then(|v| v.checked_mul(4))
+            .ok_or_else(|| Error::InvalidInput("NumPy shape byte length overflow".into()))?;
+        let data = &bytes[header_end..];
+        if data.len() != data_len {
+            return Err(Error::InvalidInput(format!(
+                "NumPy payload length {} does not match shape {:?} ({data_len} bytes)",
+                data.len(),
+                shape
+            )));
+        }
+        let values = data
+            .chunks_exact(4)
+            .map(|chunk| {
+                let raw = [chunk[0], chunk[1], chunk[2], chunk[3]];
+                if little_endian {
+                    f32::from_le_bytes(raw)
+                } else {
+                    f32::from_be_bytes(raw)
+                }
+            })
+            .collect();
+        Self::from_f32(shape, values)
+    }
+
+    pub fn to_npy_bytes(&self) -> Result<Vec<u8>, Error> {
+        let shape = if self.shape.len() == 1 {
+            format!("({},)", self.shape[0])
+        } else {
+            format!(
+                "({})",
+                self.shape
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let dict = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': {shape}, }}");
+        let (major, preamble, header) = encode_npy_header(&dict)?;
+        let mut out = Vec::with_capacity(
+            preamble + header.len() + self.values.len().saturating_mul(std::mem::size_of::<f32>()),
+        );
+        out.extend_from_slice(b"\x93NUMPY");
+        out.extend_from_slice(&[major, 0]);
+        match major {
+            1 => out.extend_from_slice(&(header.len() as u16).to_le_bytes()),
+            2 => out.extend_from_slice(&(header.len() as u32).to_le_bytes()),
+            _ => unreachable!(),
+        }
+        out.extend_from_slice(header.as_bytes());
+        for &value in &self.values {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        Ok(out)
+    }
+}
+
+fn npy_field_tail<'a>(header: &'a str, key: &str) -> Result<&'a str, Error> {
+    let single = format!("'{key}'");
+    let double = format!("\"{key}\"");
+    let key_pos = header
+        .find(&single)
+        .or_else(|| header.find(&double))
+        .ok_or_else(|| Error::InvalidInput(format!("NumPy header missing {key:?}")))?;
+    let after_key = &header[key_pos + key.len() + 2..];
+    let colon = after_key
+        .find(':')
+        .ok_or_else(|| Error::InvalidInput(format!("NumPy header malformed {key:?}")))?;
+    Ok(after_key[colon + 1..].trim_start())
+}
+
+fn npy_string_field(header: &str, key: &str) -> Result<String, Error> {
+    let tail = npy_field_tail(header, key)?;
+    let quote = tail
+        .as_bytes()
+        .first()
+        .copied()
+        .filter(|q| *q == b'\'' || *q == b'"')
+        .ok_or_else(|| Error::InvalidInput(format!("NumPy header {key:?} is not a string")))?;
+    let rest = &tail[1..];
+    let end = rest
+        .find(quote as char)
+        .ok_or_else(|| Error::InvalidInput(format!("NumPy header unterminated {key:?}")))?;
+    Ok(rest[..end].to_string())
+}
+
+fn npy_bool_field(header: &str, key: &str) -> Result<bool, Error> {
+    let tail = npy_field_tail(header, key)?;
+    if tail.starts_with("False") {
+        Ok(false)
+    } else if tail.starts_with("True") {
+        Ok(true)
+    } else {
+        Err(Error::InvalidInput(format!(
+            "NumPy header {key:?} is not a boolean"
+        )))
+    }
+}
+
+fn npy_shape_field(header: &str) -> Result<Vec<usize>, Error> {
+    let tail = npy_field_tail(header, "shape")?;
+    let start = tail
+        .find('(')
+        .ok_or_else(|| Error::InvalidInput("NumPy header shape is not a tuple".into()))?;
+    let end = tail[start + 1..]
+        .find(')')
+        .map(|v| v + start + 1)
+        .ok_or_else(|| Error::InvalidInput("NumPy header shape tuple is unterminated".into()))?;
+    let body = &tail[start + 1..end];
+    let mut dims = Vec::new();
+    for raw in body.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let dim = raw
+            .parse::<usize>()
+            .map_err(|_| Error::InvalidInput(format!("invalid NumPy shape dimension {raw:?}")))?;
+        if dim == 0 {
+            return Err(Error::InvalidInput(
+                "zero-sized NumPy dimensions are not supported yet".into(),
+            ));
+        }
+        dims.push(dim);
+    }
+    if dims.is_empty() {
+        return Err(Error::InvalidInput(
+            "scalar NumPy arrays are not supported yet".into(),
+        ));
+    }
+    Ok(dims)
+}
+
+fn encode_npy_header(dict: &str) -> Result<(u8, usize, String), Error> {
+    fn padded(dict: &str, preamble: usize) -> String {
+        let unpadded = dict.len() + 1;
+        let padding = (64 - ((preamble + unpadded) % 64)) % 64;
+        let mut header = String::with_capacity(unpadded + padding);
+        header.push_str(dict);
+        header.extend(std::iter::repeat_n(' ', padding));
+        header.push('\n');
+        header
+    }
+
+    let v1 = padded(dict, 10);
+    if u16::try_from(v1.len()).is_ok() {
+        return Ok((1, 10, v1));
+    }
+    let v2 = padded(dict, 12);
+    u32::try_from(v2.len()).map_err(|_| Error::InvalidInput("NumPy header is too large".into()))?;
+    Ok((2, 12, v2))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -705,6 +920,60 @@ mod tests {
     fn tensor_rejects_bad_shape() {
         assert!(Tensor::from_f32(vec![2, 2], vec![0.0; 3]).is_err());
         assert!(Tensor::from_f32(vec![2, 0], Vec::new()).is_err());
+    }
+
+    #[test]
+    fn npy_round_trip_preserves_tensor() {
+        let tensor = Tensor::from_f32(vec![2, 3], vec![0.0, 1.25, -2.5, 3.0, 4.5, -6.75]).unwrap();
+        let bytes = tensor.to_npy_bytes().unwrap();
+        assert_eq!(&bytes[..6], b"\x93NUMPY");
+        assert_eq!(
+            (10 + u16::from_le_bytes([bytes[8], bytes[9]]) as usize) % 64,
+            0
+        );
+        assert_eq!(Tensor::from_npy_bytes(&bytes).unwrap(), tensor);
+    }
+
+    #[test]
+    fn npy_rejects_fortran_order_and_non_f32() {
+        let tensor = Tensor::from_f32(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let mut fortran = tensor.to_npy_bytes().unwrap();
+        let false_pos = fortran
+            .windows(5)
+            .position(|window| window == b"False")
+            .unwrap();
+        fortran[false_pos..false_pos + 5].copy_from_slice(b"True ");
+        assert!(matches!(
+            Tensor::from_npy_bytes(&fortran),
+            Err(Error::InvalidInput(message)) if message.contains("Fortran-order")
+        ));
+
+        let mut f64_header = tensor.to_npy_bytes().unwrap();
+        let dtype_pos = f64_header
+            .windows(3)
+            .position(|window| window == b"<f4")
+            .unwrap();
+        f64_header[dtype_pos..dtype_pos + 3].copy_from_slice(b"<f8");
+        assert!(matches!(
+            Tensor::from_npy_bytes(&f64_header),
+            Err(Error::InvalidInput(message)) if message.contains("float32")
+        ));
+    }
+
+    #[test]
+    fn npy_reads_big_endian_f32() {
+        let tensor = Tensor::from_f32(vec![2], vec![1.5, -9.25]).unwrap();
+        let mut bytes = tensor.to_npy_bytes().unwrap();
+        let dtype_pos = bytes
+            .windows(3)
+            .position(|window| window == b"<f4")
+            .unwrap();
+        bytes[dtype_pos..dtype_pos + 3].copy_from_slice(b">f4");
+        let header_end = 10 + u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+        for chunk in bytes[header_end..].chunks_exact_mut(4) {
+            chunk.reverse();
+        }
+        assert_eq!(Tensor::from_npy_bytes(&bytes).unwrap(), tensor);
     }
 
     #[test]

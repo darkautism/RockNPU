@@ -35,13 +35,22 @@ A real pretrained standard-format model must load from its original `.onnx`, exe
 
 This criterion is now met by the external pretrained Pico-CNN MNIST MLP gate: four Gemm layers execute on RK3588 NPU and the first 50 canonical MNIST test images have identical top-1 predictions to ONNX ReferenceEvaluator.
 
-## Long-term interface
+## User-facing runtime milestone
 
-Desired user-facing direction:
+The first ONNX command-line path is now implemented on top of the high-level Session runtime:
 
 ```text
-rocknpu run model.onnx
-rocknpu run model.gguf
+rocknpu run model.onnx --input input.npy --output output.npy
 ```
 
-with framework adapters such as Candle feeding the same backend/compiler rather than duplicating it.
+For the currently supported ONNX subset, the CLI accepts C-order `float32` NumPy tensors, prepares static NPU weights once, executes the model through Rocket, writes a standard `.npy` output, and exposes CPU execution as an explicit target. Official MNIST-8 and edge-infer CIFAR-10 have both passed this path on real RK3588 hardware with independent reference checks.
+
+This is a product milestone, not the end state. The next long-term interface goals are:
+
+```text
+rocknpu run model.gguf
+Candle / framework adapter -> same RockNPU runtime/compiler
+multi-input / multi-output and broader dtype / quantized model contracts
+```
+
+Those interfaces should feed the same project-owned compiler/backend rather than duplicate RK3588 register-command, layout, residency, or Rocket submission logic.
