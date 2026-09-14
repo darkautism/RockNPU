@@ -6,6 +6,7 @@ edition="2024"
 [dependencies]
 half="2"
 onnx-protobuf="0.2.3"
+rocknpu-ir={path="../rocknpu-ir"}
 rocknpu-ops={path="../rocknpu-ops"}
 rocknpu-tensor={path="../rocknpu-tensor"}
 rocknpu-conv={path="../rocknpu-conv"}

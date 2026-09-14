@@ -347,6 +347,25 @@ The current validated CNN/dense path includes the subset needed by the real-mode
 
 Some operators execute on the RK3588 NPU and some currently use CPU fallback. Unsupported models/operators should fail explicitly rather than silently invoking an external proprietary runtime.
 
+## Frontend-neutral middle-layer contract
+
+The first model-format-neutral boundary is now implemented. A framework or model frontend can produce RockNPU IR and enter the runtime without passing ONNX bytes or using the CLI:
+
+```rust,ignore
+use rocknpu::{Executable, Graph, Session};
+
+let graph: Graph = frontend.lower_to_rocknpu()?;
+let executable = Executable::compile(graph)?;
+let session = Session::from_executable(executable)?;
+let output = session.run(input)?;
+```
+
+`rocknpu-ir` owns the shared `Graph`, `Node`, tensor metadata, constants and current operator attributes. `Executable::compile` validates the current runtime contract and derives device-independent preparation geometry. `Session` then binds that executable to CPU or Rocket/NPU resources and performs resident-weight preparation.
+
+The ONNX adapter exposes `rocknpu_onnx::import_graph(bytes) -> Graph`. The imported graph owns its constants, so the source model bytes can be dropped before `Executable` or `Session` is created. `Session::from_graph` is a convenience form of `Executable::compile` followed by `Session::from_executable`.
+
+This is the first real framework-facing contract, not a claim that compiler separation is finished. The validated CNN graph executor still lives inside `rocknpu-onnx` internally; moving that executor ownership fully below the model-format adapter is the next cleanup step. The public boundary no longer requires an ONNX model, however, and the same `Graph -> Executable -> Session` path is available to future Candle/GGUF adapters.
+
 ## Reference ONNX frontend and Session façade
 
 A first developer-preview `rocknpu::Session` façade is now implemented for the current ONNX reference frontend:
@@ -360,7 +379,7 @@ let output = session.run(input)?;
 println!("{:?}", output.stats());
 ```
 
-`Session::load` parses the ONNX graph once, validates the current single-`FLOAT` input/output contract, opens the Rocket backend, and eagerly prepares supported static `Conv`/`MatMul`/`Gemm` weights into resident NPU buffers. Repeated `run()` calls reuse that model state rather than reparsing or repacking the model. `Session::prepare_stats()` exposes resident-weight preparation statistics, while each `RunOutput` carries explicit operator placement and timing statistics.
+`Session::load` is the ONNX convenience path: it imports the model once into the same shared `Graph`, compiles it to `Executable`, opens the Rocket backend, and eagerly prepares supported static `Conv`/`MatMul`/`Gemm` weights into resident NPU buffers. Repeated `run()` calls reuse that model state rather than reparsing or repacking the model. `Session::prepare_stats()` exposes resident-weight preparation statistics, while each `RunOutput` carries explicit operator placement and timing statistics.
 
 The Session currently targets the same deliberately small ONNX subset listed above. CPU fallback remains part of the execution plan for supported small operators such as `Add`, `Relu`, `MaxPool`, and `Reshape`; unsupported graph structures fail explicitly. `SessionOptions::cpu()` is also available for an explicit CPU session.
 
@@ -380,14 +399,15 @@ The CLI accepts C-order NumPy `.npy` tensors with `float32` elements, targets `/
 
 Both paths are hardware-tested developer previews. Current real-model CLI gates cover official MNIST-8 and edge-infer CIFAR-10 on RK3588. The CLI is a **reference frontend / integration harness**, not the architectural center of RockNPU.
 
-The long-term core boundary sits below model-format parsing: a frontend-neutral RockNPU compiler/runtime contract should accept work from ONNX, GGUF/LLM, Candle, or other inference frontends and own partitioning, lowering, tensor layout, preparation/residency, scheduling, CPU fallback, and RK3588/Rocket execution. Frameworks such as Candle should call this layer as an RK3588 backend without reimplementing those details.
+The core boundary now begins below model-format parsing with `Graph -> Executable -> Session`. It is still intentionally small, but future ONNX, GGUF/LLM, Candle, or other inference frontends can target that same contract rather than duplicating partitioning, lowering, tensor layout, preparation/residency, scheduling, CPU fallback, or RK3588/Rocket execution.
 
 ## Architecture
 
 Current workspace crates:
 
 ```text
-rocknpu           high-level Session/Tensor API and model runtime ownership
+rocknpu           high-level Graph/Executable/Session runtime API
+rocknpu-ir        frontend-neutral graph, node, constant and tensor metadata IR
 rocket-uapi       Linux Rocket UAPI structs/ioctl wrappers
 rocket-runtime    safe Rocket device/BO/submit/wait ownership layer
 rocknpu-regcmd    RK3588 register-command encoders and planners

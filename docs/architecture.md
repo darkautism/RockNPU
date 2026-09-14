@@ -26,7 +26,9 @@ Candle / ONNX frontend / GGUF frontend / application runtime
                                 RK3588 NPU
 ```
 
-The inference frontend is a caller of RockNPU. Model-format parsing belongs in adapters/frontends; RK3588 register commands, native layouts, residency, scheduling and Rocket submission belong behind the RockNPU core/backend boundary. The current ONNX `Session` and CLI are bootstrap/reference frontends over this stack, not the final core abstraction.
+The inference frontend is a caller of RockNPU. Model-format parsing belongs in adapters/frontends; RK3588 register commands, native layouts, residency, scheduling and Rocket submission belong behind the RockNPU core/backend boundary. The public middle-layer entry is now `Graph -> Executable -> Session`: adapters produce the shared `rocknpu-ir::Graph`, `Executable` performs device-independent contract/shape validation, and `Session` binds it to CPU or Rocket/NPU state. `Session::load(ONNX)` and the CLI remain reference-frontend conveniences over that path.
+
+The crate split is one step behind the public boundary: the currently validated CNN executor implementation still resides in `rocknpu-onnx` and can also be constructed from a neutral `Graph`. Its model-format-independent execution code should be moved below the ONNX adapter in the next internal refactor; new frontend APIs must target the shared IR rather than add another format-specific executor.
 
 The project does not depend on `librknnrt.so`, `librkllmrt.so`, RKNN Toolkit, or RKLLM Toolkit. `.rknn` and `.rkllm` compatibility is explicitly outside the first architecture milestone. The kernel driver is not forked: use upstream `drivers/accel/rocket/` unless a demonstrated hardware limitation makes that impossible.
 

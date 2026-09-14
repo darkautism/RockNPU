@@ -1,12 +1,11 @@
 use half::f16;
-use onnx_protobuf::{
-    Message, ModelProto, ValueInfoProto, tensor_proto, tensor_shape_proto, type_proto,
-};
 use rocket_runtime::RocketDevice;
 use rocknpu_conv::Fp16Conv2dExecutor;
-use rocknpu_onnx::{CnnOnnxModel, CnnRunStats, CnnTimingStats, TensorF16};
+pub use rocknpu_ir::{
+    AutoPad, ConstantTensor, DType, F16Tensor, Graph, Node, TensorSpec as TensorInfo,
+};
+use rocknpu_onnx::{CnnOnnxModel, CnnRunStats, CnnTimingStats, TensorF16, import_graph};
 use rocknpu_ops::{ExecutionTarget, SingleNpuBackend};
-use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -39,11 +38,6 @@ impl From<std::io::Error> for Error {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DType {
-    F32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -298,27 +292,6 @@ fn encode_npy_header(dict: &str) -> Result<(u8, usize, String), Error> {
     Ok((2, 12, v2))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TensorInfo {
-    name: String,
-    dtype: DType,
-    shape: Vec<Option<usize>>,
-}
-
-impl TensorInfo {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub const fn dtype(&self) -> DType {
-        self.dtype
-    }
-
-    pub fn shape(&self) -> &[Option<usize>] {
-        &self.shape
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionTarget {
     Npu,
@@ -447,17 +420,51 @@ impl RunOutput {
     }
 }
 
-struct ModelMetadata {
-    input: TensorInfo,
-    output: TensorInfo,
-}
-
 enum Command {
     Run {
         input: Tensor,
         reply: mpsc::Sender<Result<(Tensor, ExecutionStats), String>>,
     },
     Shutdown,
+}
+
+#[derive(Debug, Clone)]
+pub struct Executable {
+    model: CnnOnnxModel,
+    input: TensorInfo,
+    output: TensorInfo,
+    prepare_dims: Vec<usize>,
+}
+
+impl Executable {
+    pub fn compile(graph: Graph) -> Result<Self, Error> {
+        let input = graph.input().clone();
+        let output = graph.output().clone();
+        if input.dtype() != DType::F32 || output.dtype() != DType::F32 {
+            return Err(Error::InvalidModel(
+                "Executable currently requires F32 graph input/output".into(),
+            ));
+        }
+        let prepare_dims = concrete_prepare_dims(&input)?;
+        Ok(Self {
+            model: CnnOnnxModel::from_graph(graph),
+            input,
+            output,
+            prepare_dims,
+        })
+    }
+
+    pub fn input(&self) -> &TensorInfo {
+        &self.input
+    }
+
+    pub fn output(&self) -> &TensorInfo {
+        &self.output
+    }
+
+    pub fn graph(&self) -> &Graph {
+        self.model.graph()
+    }
 }
 
 pub struct Session {
@@ -482,8 +489,32 @@ impl Session {
     }
 
     fn from_bytes_with_options(bytes: Vec<u8>, options: SessionOptions) -> Result<Self, Error> {
-        let metadata = parse_metadata(&bytes)?;
-        let prepare_dims = concrete_prepare_dims(&metadata.input)?;
+        let graph = import_graph(&bytes).map_err(|error| Error::InvalidModel(error.to_string()))?;
+        Self::from_graph_with_options(graph, options)
+    }
+
+    pub fn from_graph(graph: Graph) -> Result<Self, Error> {
+        Self::from_graph_with_options(graph, SessionOptions::default())
+    }
+
+    pub fn from_graph_with_options(graph: Graph, options: SessionOptions) -> Result<Self, Error> {
+        Self::from_executable_with_options(Executable::compile(graph)?, options)
+    }
+
+    pub fn from_executable(executable: Executable) -> Result<Self, Error> {
+        Self::from_executable_with_options(executable, SessionOptions::default())
+    }
+
+    pub fn from_executable_with_options(
+        executable: Executable,
+        options: SessionOptions,
+    ) -> Result<Self, Error> {
+        let Executable {
+            model,
+            input,
+            output,
+            prepare_dims,
+        } = executable;
         let (tx, rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         let target = options.target;
@@ -491,8 +522,8 @@ impl Session {
         let worker = thread::Builder::new()
             .name("rocknpu-session".into())
             .spawn(move || match target {
-                SessionTarget::Npu => npu_worker(bytes, prepare_dims, device_path, ready_tx, rx),
-                SessionTarget::Cpu => cpu_worker(bytes, ready_tx, rx),
+                SessionTarget::Npu => npu_worker(model, prepare_dims, device_path, ready_tx, rx),
+                SessionTarget::Cpu => cpu_worker(model, ready_tx, rx),
             })
             .map_err(Error::Io)?;
 
@@ -511,8 +542,8 @@ impl Session {
         };
 
         Ok(Self {
-            input: metadata.input,
-            output: metadata.output,
+            input,
+            output,
             prepare_stats,
             tx,
             worker: Some(worker),
@@ -542,10 +573,10 @@ impl Session {
     }
 
     pub fn run_named(&self, name: &str, input: Tensor) -> Result<RunOutput, Error> {
-        if name != self.input.name {
+        if name != self.input.name() {
             return Err(Error::InvalidInput(format!(
                 "model input is {:?}, got {name:?}",
-                self.input.name
+                self.input.name()
             )));
         }
         validate_shape(&self.input, input.shape())?;
@@ -561,7 +592,7 @@ impl Session {
             .map_err(|_| Error::Runtime("session worker exited during run".into()))?
             .map_err(Error::Runtime)?;
         Ok(RunOutput {
-            name: self.output.name.clone(),
+            name: self.output.name().to_string(),
             tensor,
             stats,
         })
@@ -578,19 +609,12 @@ impl Drop for Session {
 }
 
 fn npu_worker(
-    bytes: Vec<u8>,
+    model: CnnOnnxModel,
     prepare_dims: Vec<usize>,
     device_path: PathBuf,
     ready: mpsc::Sender<Result<PrepareStats, String>>,
     rx: mpsc::Receiver<Command>,
 ) {
-    let model = match CnnOnnxModel::from_bytes(&bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = ready.send(Err(e.to_string()));
-            return;
-        }
-    };
     let device = match RocketDevice::open_path(device_path.to_string_lossy().as_ref()) {
         Ok(v) => v,
         Err(e) => {
@@ -666,17 +690,10 @@ fn npu_worker(
 }
 
 fn cpu_worker(
-    bytes: Vec<u8>,
+    model: CnnOnnxModel,
     ready: mpsc::Sender<Result<PrepareStats, String>>,
     rx: mpsc::Receiver<Command>,
 ) {
-    let model = match CnnOnnxModel::from_bytes(&bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = ready.send(Err(e.to_string()));
-            return;
-        }
-    };
     if ready.send(Ok(PrepareStats::default())).is_err() {
         return;
     }
@@ -711,109 +728,17 @@ fn cpu_worker(
     }
 }
 
-fn parse_metadata(bytes: &[u8]) -> Result<ModelMetadata, Error> {
-    let model = ModelProto::parse_from_bytes(bytes)
-        .map_err(|e| Error::InvalidModel(format!("ONNX protobuf: {e}")))?;
-    let graph = model
-        .graph
-        .as_ref()
-        .ok_or_else(|| Error::InvalidModel("ONNX model has no graph".into()))?;
-    let initializer_names: HashSet<&str> =
-        graph.initializer.iter().map(|v| v.name.as_str()).collect();
-    let inputs: Vec<_> = graph
-        .input
-        .iter()
-        .filter(|v| !initializer_names.contains(v.name.as_str()))
-        .collect();
-    if inputs.len() != 1 {
-        return Err(Error::InvalidModel(format!(
-            "Session currently requires exactly one runtime input, got {}",
-            inputs.len()
-        )));
-    }
-    if graph.output.len() != 1 {
-        return Err(Error::InvalidModel(format!(
-            "Session currently requires exactly one output, got {}",
-            graph.output.len()
-        )));
-    }
-    Ok(ModelMetadata {
-        input: parse_tensor_info(inputs[0])?,
-        output: parse_tensor_info(&graph.output[0])?,
-    })
-}
-
-fn parse_tensor_info(value: &ValueInfoProto) -> Result<TensorInfo, Error> {
-    if value.name.is_empty() {
-        return Err(Error::InvalidModel("tensor value has no name".into()));
-    }
-    let ty = value
-        .type_
-        .as_ref()
-        .ok_or_else(|| Error::InvalidModel(format!("{} has no type", value.name)))?;
-    let tensor = match ty.value.as_ref() {
-        Some(type_proto::Value::TensorType(v)) => v,
-        _ => {
-            return Err(Error::InvalidModel(format!(
-                "{} is not a tensor value",
-                value.name
-            )));
-        }
-    };
-    if tensor.elem_type != tensor_proto::DataType::FLOAT as i32 {
-        return Err(Error::InvalidModel(format!(
-            "{} currently requires ONNX FLOAT input/output metadata, dtype={}",
-            value.name, tensor.elem_type
-        )));
-    }
-    let shape = tensor
-        .shape
-        .as_ref()
-        .ok_or_else(|| Error::InvalidModel(format!("{} has no shape", value.name)))?;
-    if shape.dim.is_empty() {
-        return Err(Error::InvalidModel(format!(
-            "{} scalar tensors are not supported yet",
-            value.name
-        )));
-    }
-    let mut dims = Vec::with_capacity(shape.dim.len());
-    for dim in &shape.dim {
-        match dim.value.as_ref() {
-            Some(tensor_shape_proto::dimension::Value::DimValue(v)) if *v > 0 => {
-                dims.push(Some(*v as usize));
-            }
-            Some(tensor_shape_proto::dimension::Value::DimValue(v)) => {
-                return Err(Error::InvalidModel(format!(
-                    "{} has nonpositive dimension {v}",
-                    value.name
-                )));
-            }
-            Some(tensor_shape_proto::dimension::Value::DimParam(_)) | None => dims.push(None),
-            Some(_) => {
-                return Err(Error::InvalidModel(format!(
-                    "{} uses an unsupported dimension metadata variant",
-                    value.name
-                )));
-            }
-        }
-    }
-    Ok(TensorInfo {
-        name: value.name.clone(),
-        dtype: DType::F32,
-        shape: dims,
-    })
-}
-
 fn concrete_prepare_dims(info: &TensorInfo) -> Result<Vec<usize>, Error> {
-    let mut dims = Vec::with_capacity(info.shape.len());
-    for (index, dim) in info.shape.iter().copied().enumerate() {
+    let mut dims = Vec::with_capacity(info.shape().len());
+    for (index, dim) in info.shape().iter().copied().enumerate() {
         match dim {
             Some(v) => dims.push(v),
             None if index == 0 => dims.push(1),
             None => {
                 return Err(Error::InvalidModel(format!(
                     "{} has dynamic non-batch dimension {}; load-time NPU preparation requires static feature/spatial dimensions",
-                    info.name, index
+                    info.name(),
+                    index
                 )));
             }
         }
@@ -822,19 +747,19 @@ fn concrete_prepare_dims(info: &TensorInfo) -> Result<Vec<usize>, Error> {
 }
 
 fn validate_shape(info: &TensorInfo, got: &[usize]) -> Result<(), Error> {
-    if got.len() != info.shape.len() {
+    if got.len() != info.shape().len() {
         return Err(Error::InvalidInput(format!(
             "{} expects rank {}, got shape {:?}",
-            info.name,
-            info.shape.len(),
+            info.name(),
+            info.shape().len(),
             got
         )));
     }
-    for (index, (&actual, expected)) in got.iter().zip(&info.shape).enumerate() {
+    for (index, (&actual, expected)) in got.iter().zip(info.shape()).enumerate() {
         if actual == 0 {
             return Err(Error::InvalidInput(format!(
                 "{} dimension {index} must be nonzero",
-                info.name
+                info.name()
             )));
         }
         if let Some(expected) = expected
@@ -842,7 +767,7 @@ fn validate_shape(info: &TensorInfo, got: &[usize]) -> Result<(), Error> {
         {
             return Err(Error::InvalidInput(format!(
                 "{} dimension {index} must be {expected}, got {actual}",
-                info.name
+                info.name()
             )));
         }
     }
@@ -853,8 +778,8 @@ fn validate_shape(info: &TensorInfo, got: &[usize]) -> Result<(), Error> {
 mod tests {
     use super::*;
     use onnx_protobuf::{
-        GraphProto, NodeProto, OperatorSetIdProto, TensorProto, TensorShapeProto, TypeProto,
-        tensor_shape_proto,
+        GraphProto, Message, ModelProto, NodeProto, OperatorSetIdProto, TensorProto,
+        TensorShapeProto, TypeProto, ValueInfoProto, tensor_proto, tensor_shape_proto, type_proto,
     };
     use protobuf::MessageField;
 
@@ -993,6 +918,30 @@ mod tests {
         assert_eq!(out.stats().matmul_nodes, 1);
         assert_eq!(out.stats().add_nodes, 1);
         assert_eq!(out.stats().npu_dense_nodes, 0);
+    }
+
+    #[test]
+    fn frontend_graph_runs_without_model_bytes() {
+        let bytes = fixture();
+        let graph = import_graph(&bytes).unwrap();
+        drop(bytes);
+        let executable = Executable::compile(graph).unwrap();
+        assert_eq!(executable.input().name(), "input");
+        assert_eq!(executable.output().name(), "output");
+        assert_eq!(executable.graph().nodes().len(), 2);
+        let session =
+            Session::from_executable_with_options(executable, SessionOptions::cpu()).unwrap();
+        assert_eq!(session.input().name(), "input");
+        assert_eq!(session.output().name(), "output");
+        let input = Tensor::from_f32(
+            vec![4, 32],
+            (0..128).map(|i| (i % 7) as f32 * 0.25).collect(),
+        )
+        .unwrap();
+        let out = session.run(input).unwrap();
+        assert_eq!(out.tensor().shape(), &[4, 16]);
+        assert_eq!(out.stats().matmul_nodes, 1);
+        assert_eq!(out.stats().add_nodes, 1);
     }
 
     #[test]

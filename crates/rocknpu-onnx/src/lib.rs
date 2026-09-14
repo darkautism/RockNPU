@@ -13,10 +13,11 @@ mod prepared;
 mod prepared_pool;
 pub use cnn::{
     CnnOnnxModel, CnnPreparedConvState, CnnPreparedConvStats, CnnPreparedDenseStats, CnnRunStats,
-    CnnTimingStats, TensorF16, TensorTrace,
+    CnnTimingStats, TensorTrace,
 };
 pub use prepared::{PreparedModelStats, PreparedNpuModel};
 pub use prepared_pool::{PreparedPoolModelStats, PreparedPoolNpuModel};
+pub use rocknpu_ir::F16Tensor as TensorF16;
 
 #[derive(Debug)]
 pub enum OnnxError {
@@ -29,6 +30,7 @@ pub enum OnnxError {
     Tensor(TensorError),
     Op(OpError),
     Conv(rocknpu_conv::ConvError),
+    Ir(rocknpu_ir::IrError),
 }
 impl fmt::Display for OnnxError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -42,6 +44,7 @@ impl fmt::Display for OnnxError {
             Self::Tensor(e) => e.fmt(f),
             Self::Op(e) => e.fmt(f),
             Self::Conv(e) => e.fmt(f),
+            Self::Ir(e) => e.fmt(f),
         }
     }
 }
@@ -60,6 +63,17 @@ impl From<rocknpu_conv::ConvError> for OnnxError {
     fn from(v: rocknpu_conv::ConvError) -> Self {
         Self::Conv(v)
     }
+}
+impl From<rocknpu_ir::IrError> for OnnxError {
+    fn from(v: rocknpu_ir::IrError) -> Self {
+        Self::Ir(v)
+    }
+}
+
+/// Import the currently supported ONNX subset into RockNPU's frontend-neutral IR.
+/// The returned graph owns all constants and does not borrow the source model bytes.
+pub fn import_graph(bytes: &[u8]) -> Result<rocknpu_ir::Graph, OnnxError> {
+    Ok(CnnOnnxModel::from_bytes(bytes)?.into_graph())
 }
 #[derive(Debug, Clone)]
 pub(crate) struct ConstTensor {

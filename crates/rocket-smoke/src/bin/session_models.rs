@@ -1,5 +1,6 @@
 use half::f16;
-use rocknpu::{Session, Tensor};
+use rocknpu::{Executable, Session, Tensor};
+use rocknpu_onnx::import_graph;
 use std::{error::Error, fs};
 
 fn read_f32(path: &str) -> Result<Vec<f32>, Box<dyn Error>> {
@@ -22,6 +23,14 @@ fn argmax(values: &[f32]) -> usize {
         .unwrap()
 }
 
+fn graph_session(path: &str) -> Result<Session, Box<dyn Error>> {
+    let model_bytes = fs::read(path)?;
+    let graph = import_graph(&model_bytes)?;
+    drop(model_bytes);
+    let executable = Executable::compile(graph)?;
+    Ok(Session::from_executable(executable)?)
+}
+
 fn run_mnist8() -> Result<(), Box<dyn Error>> {
     let inputs = read_f32("artifacts/mnist8-input100-f32.bin")?;
     let reference = read_f32("artifacts/mnist8-ref100-f32.bin")?;
@@ -30,7 +39,7 @@ fn run_mnist8() -> Result<(), Box<dyn Error>> {
         return Err("MNIST-8 artifact size mismatch".into());
     }
 
-    let session = Session::load("artifacts/mnist-8.onnx")?;
+    let session = graph_session("artifacts/mnist-8.onnx")?;
     let prepare = session.prepare_stats();
     if prepare.conv_weight_tensors != 2
         || prepare.dense_weight_tensors != 1
@@ -100,7 +109,7 @@ fn run_cifar10() -> Result<(), Box<dyn Error>> {
         return Err("CIFAR-10 artifact size mismatch".into());
     }
 
-    let session = Session::load("artifacts/cifar10-edgeinfer.onnx")?;
+    let session = graph_session("artifacts/cifar10-edgeinfer.onnx")?;
     let prepare = session.prepare_stats();
     if prepare.conv_weight_tensors != 3
         || prepare.dense_weight_tensors != 2

@@ -1,40 +1,17 @@
 use crate::{OnnxError, execute_dense_fp16};
 use half::f16;
-use onnx_protobuf::{AttributeValue, Message, ModelProto, TensorProto, tensor_proto};
+use onnx_protobuf::{
+    AttributeValue, Message, ModelProto, TensorProto, ValueInfoProto, tensor_proto,
+    tensor_shape_proto, type_proto,
+};
 use rocknpu_conv::{Conv2dSpec, Fp16Conv2dExecutor, Fp16PreparedConvWeights};
+use rocknpu_ir::{
+    AutoPad, ConstantTensor as ConstTensor, DType, F16Tensor as TensorF16, Graph, Node, TensorSpec,
+};
 use rocknpu_ops::{ExecutionTarget, PreparedFp16Matmul, SingleNpuBackend};
 use rocknpu_tensor::Matrix;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct TensorF16 {
-    dims: Vec<usize>,
-    values: Vec<f16>,
-}
-impl TensorF16 {
-    pub fn from_vec(dims: Vec<usize>, values: Vec<f16>) -> Result<Self, OnnxError> {
-        if dims.is_empty() || dims.iter().any(|&d| d == 0) {
-            return Err(OnnxError::InvalidModel(
-                "tensor dims must be nonzero".into(),
-            ));
-        }
-        let expected = checked_elements(&dims)?;
-        if expected != values.len() {
-            return Err(OnnxError::InvalidModel(format!(
-                "tensor value count {} != {expected}",
-                values.len()
-            )));
-        }
-        Ok(Self { dims, values })
-    }
-    pub fn dims(&self) -> &[usize] {
-        &self.dims
-    }
-    pub fn values(&self) -> &[f16] {
-        &self.values
-    }
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TensorTrace {
@@ -143,85 +120,8 @@ pub struct CnnRunStats {
 }
 
 #[derive(Debug, Clone)]
-enum ConstTensor {
-    F16(TensorF16),
-    I64 { _dims: Vec<usize>, values: Vec<i64> },
-}
-impl ConstTensor {
-    fn f16(&self) -> Result<&TensorF16, OnnxError> {
-        match self {
-            Self::F16(v) => Ok(v),
-            _ => Err(OnnxError::InvalidModel("expected FLOAT initializer".into())),
-        }
-    }
-    fn i64_values(&self) -> Result<&[i64], OnnxError> {
-        match self {
-            Self::I64 { values, .. } => Ok(values),
-            _ => Err(OnnxError::InvalidModel("expected INT64 initializer".into())),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum AutoPad {
-    NotSet,
-    SameUpper,
-}
-
-#[derive(Debug, Clone)]
-enum Node {
-    Conv {
-        input: String,
-        weight: String,
-        bias: Option<String>,
-        output: String,
-        kernel: [usize; 2],
-        strides: [usize; 2],
-        pads: [usize; 4],
-        auto_pad: AutoPad,
-    },
-    MaxPool {
-        input: String,
-        output: String,
-        kernel: [usize; 2],
-        strides: [usize; 2],
-        pads: [usize; 4],
-        auto_pad: AutoPad,
-    },
-    Add {
-        lhs: String,
-        rhs: String,
-        output: String,
-    },
-    Relu {
-        input: String,
-        output: String,
-    },
-    Reshape {
-        input: String,
-        shape: String,
-        output: String,
-        allowzero: bool,
-    },
-    MatMul {
-        lhs: String,
-        rhs: String,
-        output: String,
-    },
-    Gemm {
-        lhs: String,
-        rhs: String,
-        bias: String,
-        output: String,
-    },
-}
-
-#[derive(Debug, Clone)]
 pub struct CnnOnnxModel {
-    input_name: String,
-    output_name: String,
-    nodes: Vec<Node>,
-    initializers: HashMap<String, ConstTensor>,
+    graph: Graph,
 }
 
 impl CnnOnnxModel {
@@ -237,22 +137,25 @@ impl CnnOnnxModel {
             initializers.insert(t.name.clone(), parse_const(t)?);
         }
         let initializer_names: HashSet<&str> = initializers.keys().map(String::as_str).collect();
-        let input_name = graph
+        let inputs: Vec<_> = graph
             .input
             .iter()
-            .map(|v| v.name.as_str())
-            .find(|n| !initializer_names.contains(*n))
-            .ok_or(OnnxError::MissingInput)?
-            .to_string();
-        let output_name = graph
-            .output
-            .first()
-            .ok_or(OnnxError::MissingOutput)?
-            .name
-            .clone();
-        if output_name.is_empty() {
-            return Err(OnnxError::MissingOutput);
+            .filter(|value| !initializer_names.contains(value.name.as_str()))
+            .collect();
+        if inputs.len() != 1 {
+            return Err(OnnxError::InvalidModel(format!(
+                "RockNPU IR currently requires exactly one runtime input, got {}",
+                inputs.len()
+            )));
         }
+        if graph.output.len() != 1 {
+            return Err(OnnxError::InvalidModel(format!(
+                "RockNPU IR currently requires exactly one output, got {}",
+                graph.output.len()
+            )));
+        }
+        let input = parse_tensor_spec(inputs[0])?;
+        let output = parse_tensor_spec(&graph.output[0])?;
         let mut nodes = Vec::with_capacity(graph.node.len());
         for n in &graph.node {
             if !n.domain.is_empty() && n.domain != "ai.onnx" {
@@ -394,15 +297,24 @@ impl CnnOnnxModel {
             }
         }
         Ok(Self {
-            input_name,
-            output_name,
-            nodes,
-            initializers,
+            graph: Graph::new(input, output, nodes, initializers)?,
         })
     }
 
+    pub fn from_graph(graph: Graph) -> Self {
+        Self { graph }
+    }
+
+    pub fn graph(&self) -> &Graph {
+        &self.graph
+    }
+
+    pub fn into_graph(self) -> Graph {
+        self.graph
+    }
+
     pub fn node_count(&self) -> usize {
-        self.nodes.len()
+        self.graph.nodes().len()
     }
 
     /// Prepare every currently supported static NPU weight before the first run.
@@ -421,9 +333,10 @@ impl CnnOnnxModel {
         }
         let mut state = CnnPreparedConvState::new();
         let mut shapes: HashMap<String, Vec<usize>> = HashMap::new();
-        shapes.insert(self.input_name.clone(), input_dims.to_vec());
+        shapes.insert(self.graph.input().name().to_string(), input_dims.to_vec());
         let mut static_values: HashMap<String, TensorF16> = self
-            .initializers
+            .graph
+            .constants()
             .iter()
             .filter_map(|(name, value)| match value {
                 ConstTensor::F16(tensor) => Some((name.clone(), tensor.clone())),
@@ -431,7 +344,7 @@ impl CnnOnnxModel {
             })
             .collect();
 
-        for node in &self.nodes {
+        for node in self.graph.nodes() {
             match node {
                 Node::Conv {
                     input,
@@ -447,7 +360,8 @@ impl CnnOnnxModel {
                         OnnxError::InvalidModel(format!("missing Conv shape {input}"))
                     })?;
                     let w = self
-                        .initializers
+                        .graph
+                        .constants()
                         .get(weight)
                         .ok_or_else(|| {
                             OnnxError::InvalidModel(format!("missing Conv weight {weight}"))
@@ -553,7 +467,8 @@ impl CnnOnnxModel {
                     allowzero,
                 } => {
                     let target = self
-                        .initializers
+                        .graph
+                        .constants()
                         .get(shape)
                         .ok_or_else(|| {
                             OnnxError::InvalidModel("Reshape shape must be initializer".into())
@@ -705,11 +620,11 @@ impl CnnOnnxModel {
         trace_enabled: bool,
     ) -> Result<(TensorF16, CnnRunStats, Vec<TensorTrace>), OnnxError> {
         let mut values: HashMap<String, TensorF16> = HashMap::new();
-        values.insert(self.input_name.clone(), input.clone());
+        values.insert(self.graph.input().name().to_string(), input.clone());
         let mut stats = CnnRunStats::default();
         let mut trace = Vec::new();
         let graph_started = timing.as_ref().map(|_| Instant::now());
-        for node in &self.nodes {
+        for node in self.graph.nodes() {
             let node_started = timing.as_ref().map(|_| Instant::now());
             let (op, name, result) = match node {
                 Node::Conv {
@@ -726,7 +641,8 @@ impl CnnOnnxModel {
                         OnnxError::InvalidModel(format!("missing Conv input {input}"))
                     })?;
                     let w = self
-                        .initializers
+                        .graph
+                        .constants()
                         .get(weight)
                         .ok_or_else(|| {
                             OnnxError::InvalidModel(format!("missing Conv weight {weight}"))
@@ -802,7 +718,8 @@ impl CnnOnnxModel {
                     };
                     let y = if let Some(bias_name) = bias {
                         let b = self
-                            .initializers
+                            .graph
+                            .constants()
                             .get(bias_name)
                             .ok_or_else(|| {
                                 OnnxError::InvalidModel(format!("missing Conv bias {bias_name}"))
@@ -831,8 +748,8 @@ impl CnnOnnxModel {
                     ("MaxPool", output, y)
                 }
                 Node::Add { lhs, rhs, output } => {
-                    let l = resolve_f16(lhs, &values, &self.initializers)?;
-                    let r = resolve_f16(rhs, &values, &self.initializers)?;
+                    let l = resolve_f16(lhs, &values, self.graph.constants())?;
+                    let r = resolve_f16(rhs, &values, self.graph.constants())?;
                     let y = add_broadcast(l, r)?;
                     stats.add_nodes += 1;
                     ("Add", output, y)
@@ -857,9 +774,10 @@ impl CnnOnnxModel {
                     output,
                     allowzero,
                 } => {
-                    let x = resolve_f16(input, &values, &self.initializers)?;
+                    let x = resolve_f16(input, &values, self.graph.constants())?;
                     let shape = self
-                        .initializers
+                        .graph
+                        .constants()
                         .get(shape)
                         .ok_or_else(|| {
                             OnnxError::InvalidModel("Reshape shape must be initializer".into())
@@ -874,7 +792,7 @@ impl CnnOnnxModel {
                     let a = values.get(lhs).ok_or_else(|| {
                         OnnxError::InvalidModel(format!("missing MatMul lhs {lhs}"))
                     })?;
-                    let w = resolve_f16(rhs, &values, &self.initializers)?;
+                    let w = resolve_f16(rhs, &values, self.graph.constants())?;
                     if a.dims.len() != 2 || w.dims.len() != 2 || a.dims[1] != w.dims[0] {
                         return Err(OnnxError::InvalidModel(
                             "CNN MatMul expects [M,K] x [K,N]".into(),
@@ -924,14 +842,16 @@ impl CnnOnnxModel {
                         OnnxError::InvalidModel(format!("missing Gemm lhs {lhs}"))
                     })?;
                     let w = self
-                        .initializers
+                        .graph
+                        .constants()
                         .get(rhs)
                         .ok_or_else(|| {
                             OnnxError::InvalidModel(format!("missing Gemm weight {rhs}"))
                         })?
                         .f16()?;
                     let b = self
-                        .initializers
+                        .graph
+                        .constants()
                         .get(bias)
                         .ok_or_else(|| {
                             OnnxError::InvalidModel(format!("missing Gemm bias {bias}"))
@@ -1005,7 +925,7 @@ impl CnnOnnxModel {
             values.insert(name.clone(), result);
         }
         let out = values
-            .remove(&self.output_name)
+            .remove(self.graph.output().name())
             .ok_or_else(|| OnnxError::InvalidModel("CNN graph output not produced".into()))?;
         if let (Some(t), Some(started)) = (timing.as_deref_mut(), graph_started) {
             t.total_ns = started.elapsed().as_nanos();
@@ -1014,18 +934,21 @@ impl CnnOnnxModel {
     }
 
     fn is_static_f16_value(&self, name: &str) -> bool {
-        if matches!(self.initializers.get(name), Some(ConstTensor::F16(_))) {
+        if matches!(self.graph.constants().get(name), Some(ConstTensor::F16(_))) {
             return true;
         }
-        self.nodes.iter().any(|node| match node {
+        self.graph.nodes().iter().any(|node| match node {
             Node::Reshape {
                 input,
                 shape,
                 output,
                 ..
             } if output == name => {
-                matches!(self.initializers.get(input), Some(ConstTensor::F16(_)))
-                    && matches!(self.initializers.get(shape), Some(ConstTensor::I64 { .. }))
+                matches!(self.graph.constants().get(input), Some(ConstTensor::F16(_)))
+                    && matches!(
+                        self.graph.constants().get(shape),
+                        Some(ConstTensor::I64 { .. })
+                    )
             }
             _ => false,
         })
@@ -1325,6 +1248,57 @@ fn checked_elements(dims: &[usize]) -> Result<usize, OnnxError> {
         .ok_or_else(|| OnnxError::InvalidModel("tensor element count overflow".into()))
 }
 
+fn parse_tensor_spec(value: &ValueInfoProto) -> Result<TensorSpec, OnnxError> {
+    if value.name.is_empty() {
+        return Err(OnnxError::InvalidModel("tensor value has no name".into()));
+    }
+    let ty = value
+        .type_
+        .as_ref()
+        .ok_or_else(|| OnnxError::InvalidModel(format!("{} has no type", value.name)))?;
+    let tensor = match ty.value.as_ref() {
+        Some(type_proto::Value::TensorType(value)) => value,
+        _ => {
+            return Err(OnnxError::InvalidModel(format!(
+                "{} is not a tensor value",
+                value.name
+            )));
+        }
+    };
+    if tensor.elem_type != tensor_proto::DataType::FLOAT as i32 {
+        return Err(OnnxError::Unsupported(format!(
+            "{} currently requires FLOAT graph input/output metadata, dtype={}",
+            value.name, tensor.elem_type
+        )));
+    }
+    let shape = tensor
+        .shape
+        .as_ref()
+        .ok_or_else(|| OnnxError::InvalidModel(format!("{} has no shape", value.name)))?;
+    let mut dims = Vec::with_capacity(shape.dim.len());
+    for dim in &shape.dim {
+        match dim.value.as_ref() {
+            Some(tensor_shape_proto::dimension::Value::DimValue(dim_value)) if *dim_value > 0 => {
+                dims.push(Some(*dim_value as usize));
+            }
+            Some(tensor_shape_proto::dimension::Value::DimValue(dim_value)) => {
+                return Err(OnnxError::InvalidModel(format!(
+                    "{} has nonpositive dimension {dim_value}",
+                    value.name
+                )));
+            }
+            Some(tensor_shape_proto::dimension::Value::DimParam(_)) | None => dims.push(None),
+            Some(_) => {
+                return Err(OnnxError::InvalidModel(format!(
+                    "{} uses an unsupported dimension metadata variant",
+                    value.name
+                )));
+            }
+        }
+    }
+    Ok(TensorSpec::new(value.name.clone(), DType::F32, dims)?)
+}
+
 fn parse_const(t: &TensorProto) -> Result<ConstTensor, OnnxError> {
     let dims: Vec<usize> = t
         .dims
@@ -1388,10 +1362,7 @@ fn parse_const(t: &TensorProto) -> Result<ConstTensor, OnnxError> {
         if v.len() != expected {
             return Err(OnnxError::InvalidModel("INT64 initializer count".into()));
         }
-        Ok(ConstTensor::I64 {
-            _dims: dims,
-            values: v,
-        })
+        Ok(ConstTensor::I64 { dims, values: v })
     } else {
         Err(OnnxError::Unsupported(format!(
             "CNN initializer dtype {}",
@@ -1408,10 +1379,10 @@ fn resolve_f16<'a>(
     if let Some(v) = values.get(name) {
         return Ok(v);
     }
-    initializers
+    Ok(initializers
         .get(name)
         .ok_or_else(|| OnnxError::InvalidModel(format!("missing value {name}")))?
-        .f16()
+        .f16()?)
 }
 
 fn resolve_reshape(
@@ -1547,7 +1518,7 @@ fn conv2d(
             }
         }
     }
-    TensorF16::from_vec(vec![batch, cout, oh, ow], out)
+    Ok(TensorF16::from_vec(vec![batch, cout, oh, ow], out)?)
 }
 
 fn add_conv_bias(x: &TensorF16, bias: &TensorF16) -> Result<TensorF16, OnnxError> {
@@ -1567,7 +1538,7 @@ fn add_conv_bias(x: &TensorF16, bias: &TensorF16) -> Result<TensorF16, OnnxError
             }
         }
     }
-    TensorF16::from_vec(x.dims.clone(), out)
+    Ok(TensorF16::from_vec(x.dims.clone(), out)?)
 }
 
 fn maxpool2d(
@@ -1615,7 +1586,7 @@ fn maxpool2d(
                 }
             }
         }
-        return TensorF16::from_vec(vec![batch, c, oh, ow], out);
+        return Ok(TensorF16::from_vec(vec![batch, c, oh, ow], out)?);
     }
 
     let (oh, pt, _) = spatial_geometry(h, kernel[0], strides[0], pads[0], pads[2], auto);
@@ -1655,7 +1626,7 @@ fn maxpool2d(
             }
         }
     }
-    TensorF16::from_vec(vec![batch, c, oh, ow], out)
+    Ok(TensorF16::from_vec(vec![batch, c, oh, ow], out)?)
 }
 
 fn add_broadcast(a: &TensorF16, b: &TensorF16) -> Result<TensorF16, OnnxError> {
@@ -1668,7 +1639,7 @@ fn add_broadcast(a: &TensorF16, b: &TensorF16) -> Result<TensorF16, OnnxError> {
             .zip(&b.values)
             .map(|(&x, &y)| f16::from_f32(x.to_f32() + y.to_f32()))
             .collect();
-        return TensorF16::from_vec(a.dims.clone(), out);
+        return Ok(TensorF16::from_vec(a.dims.clone(), out)?);
     }
 
     // NCHW activation + per-channel bias is the dominant CNN Add shape. ONNX
@@ -1714,7 +1685,7 @@ fn add_broadcast(a: &TensorF16, b: &TensorF16) -> Result<TensorF16, OnnxError> {
         }
         out.push(f16::from_f32(a.values[ai].to_f32() + b.values[bi].to_f32()));
     }
-    TensorF16::from_vec(od, out)
+    Ok(TensorF16::from_vec(od, out)?)
 }
 
 fn add_nchw_channel_bias(

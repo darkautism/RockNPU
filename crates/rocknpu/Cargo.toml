@@ -5,11 +5,12 @@ edition = "2024"
 
 [dependencies]
 half = "2"
-onnx-protobuf = "0.2.3"
 rocket-runtime = { path = "../rocket-runtime" }
+rocknpu-ir = { path = "../rocknpu-ir" }
 rocknpu-conv = { path = "../rocknpu-conv" }
 rocknpu-onnx = { path = "../rocknpu-onnx" }
 rocknpu-ops = { path = "../rocknpu-ops" }
 
 [dev-dependencies]
+onnx-protobuf = "0.2.3"
 protobuf = "=3.4.0"

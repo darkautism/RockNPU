@@ -146,6 +146,7 @@ dependencies = [
  "protobuf",
  "rocket-runtime",
  "rocknpu-conv",
+ "rocknpu-ir",
  "rocknpu-onnx",
  "rocknpu-ops",
 ]
@@ -157,6 +158,13 @@ dependencies = [
  "half",
  "rocket-runtime",
  "rocknpu-regcmd",
+]
+
+[[package]]
+name = "rocknpu-ir"
+version = "0.1.0"
+dependencies = [
+ "half",
 ]
 
 [[package]]
@@ -176,6 +184,7 @@ dependencies = [
  "half",
  "onnx-protobuf",
  "rocknpu-conv",
+ "rocknpu-ir",
  "rocknpu-ops",
  "rocknpu-tensor",
 ]
