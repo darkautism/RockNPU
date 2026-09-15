@@ -908,3 +908,46 @@ cargo build --release -p rocket-smoke --bin int8_decode_ksplit
 ```
 
 The exact production-pool gate for K5632/N2048 passed against every CPU int32 result and measured `4.231 ms` single-worker versus `1.676 ms` with three-way K-split (`2.52x`). The standalone topology prototype measured `1.713 ms` in the same run. This is modestly faster than the corresponding three-way N-split because each K-split worker executes one full-K task rather than six sequential 1024/512-wide tasks. These observations are characterization only; production includes K-split candidates only for shapes that otherwise require multiple K tasks and measures them against N-split candidates at runtime. With host overhead now reduced to tens of microseconds, submit/kernel efficiency is the dominant remaining performance target.
+
+### Experimental native W4A4 M=1 decode
+
+The repository also contains a native signed-int4 M=1 register-command/executor path. The source-derived baseline register template is isolated in `crates/rocknpu-regcmd/src/int4/ork_isc.rs` under ork-driver's ISC notice; RockNPU's geometry patching, nibble packing, Rocket BO ownership/submission, resident cache, grouped execution, and multicore pool are Rust/MIT code around that isolated template.
+
+Build and run the primitive gates:
+
+```sh
+cargo build --release -p rocket-smoke \
+  --bin int4_decode_m1 \
+  --bin int4_decode_grouped \
+  --bin int4_decode_multicore
+
+./target/release/int4_decode_m1
+./target/release/int4_decode_grouped
+./target/release/int4_decode_multicore 3
+```
+
+The single-program executor accepts signed int4 codes in `i8` storage, nibble-packs A/B into the validated RK3588 layout, and exposes the native dense `int16[N]` accumulator surface. Static weights are prepared once and retained in Rocket BOs. The grouped gate verifies independent K-group partials exactly against CPU dot products. On the current RK3588, the TinyLlama FFN geometry produced:
+
+```text
+W4A4 GROUPED PASS K=2048 N=5632 G=512 resident_mb=5.50
+W4A4 MULTICORE PASS M=1 K=2048 N=5632 ... single_ms=2.080 multicore_ms=0.970 speedup=2.15x
+```
+
+No int16 saturation was observed in the model experiments. For full-K (`G=2048`) W4A4 with normalized Hadamard rotation, the real-model first-shape tuner measured approximately:
+
+```text
+ROCKNPU W4A4 tune K=2048 N=5632 candidates=[1, 2, 3] medians_us=[2081.301, 1250.648, 858.653] selected_workers=3
+```
+
+GGML W4A4 is deliberately opt-in. Both variables are required for routing away from W8A8:
+
+```sh
+ROCKNPU_W4A4=1
+ROCKNPU_W4A4_SCOPE=ffn   # or attn / proj2048 / kv / explicit all
+```
+
+`ROCKNPU_W4A4_GROUP=<N>` controls K-group quantization, `ROCKNPU_W4A4_HADAMARD=1` applies an orthonormal FWHT to activations and weight rows before quantization, and `ROCKNPU_W4A4_TRACE=1` prints tuner/saturation/cache diagnostics. `ROCKNPU_W4A4=1` without a scope intentionally does not change routing.
+
+This path has **hardware correctness but not model-level equivalence**. Prompt `The capital of` with greedy `-n 3` can still produce the W8A8 continuation `" the United States"`, but the longer `-n 16` gate diverges. Default W8A8 continued with `" the United States of America, Washington D.C. Is the most populous"`; FFN full-K Hadamard W4A4 instead continued `" the United States, located in the state of Virginia.\n\n2. New"`, and G=512 Hadamard also diverged later. A Q/O-only W4 experiment diverged as well. Since all of these runs reported zero saturation, the remaining difference is quantization error rather than an int16-overflow or Rocket execution failure.
+
+Whole-model speed is also not yet materially better: same-setting dynamic-backend `llama-bench -p 0 -n 8 -r 3 -t 8 -ngl 0` measured `5.09 ± 0.13 tok/s` for the FFN W4 experiment and `5.02 ± 0.17 tok/s` for default W8A8. Treat that difference as noise. W4A4 is therefore kept as an explicit research path for half-width resident weights, native-int4 kernel work, and future quantization-quality experiments; W8A8 remains the supported default decode route.

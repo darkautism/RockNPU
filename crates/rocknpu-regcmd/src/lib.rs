@@ -11,6 +11,7 @@ pub const FP16_REGCMD_COUNT: usize = 126;
 
 mod conv;
 mod general;
+mod int4;
 mod int8;
 mod planner;
 pub use conv::{Fp16Conv2dDesc, encode_fp16_conv2d};
@@ -18,6 +19,7 @@ pub use general::{
     Fp16MatmulDesc, encode_fp16_matmul, encode_fp16_matmul_accumulate,
     encode_fp16_matmul_fp32_output,
 };
+pub use int4::{INT4_REGCMD_COUNT, Int4DecodeDesc, Int4EncodeError, encode_int4_decode_m1};
 pub use int8::{
     INT8_REGCMD_COUNT, Int8DecodeDesc, Int8EncodeError, encode_int8_decode_m1,
     weight_i8_fullk_index,

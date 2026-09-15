@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace {
 
@@ -14,6 +15,7 @@ struct rocknpu_backend_context {
     size_t q4_k_mul_mat_calls = 0;
     size_t q6_k_mul_mat_calls = 0;
     size_t f16_mul_mat_calls = 0;
+    size_t w4a4_m1_mul_mat_calls = 0;
     size_t w8a8_m1_mul_mat_calls = 0;
 };
 
@@ -23,6 +25,37 @@ bool rocknpu_trace_enabled() {
         return value != nullptr && value[0] != '\0' && value[0] != '0';
     }();
     return enabled;
+}
+
+bool rocknpu_w4a4_enabled() {
+    const char * value = std::getenv("ROCKNPU_W4A4");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+bool rocknpu_w4a4_shape_enabled(size_t k, size_t n) {
+    if (!rocknpu_w4a4_enabled()) {
+        return false;
+    }
+    const char * scope = std::getenv("ROCKNPU_W4A4_SCOPE");
+    if (scope == nullptr || scope[0] == '\0') {
+        return false;
+    }
+    if (std::strcmp(scope, "all") == 0) {
+        return true;
+    }
+    if (std::strcmp(scope, "ffn") == 0) {
+        return k == 2048 && n == 5632;
+    }
+    if (std::strcmp(scope, "attn") == 0) {
+        return k == 2048 && (n == 2048 || n == 256);
+    }
+    if (std::strcmp(scope, "proj2048") == 0) {
+        return k == 2048 && n == 2048;
+    }
+    if (std::strcmp(scope, "kv") == 0) {
+        return k == 2048 && n == 256;
+    }
+    return false;
 }
 
 const char * rocknpu_device_name(ggml_backend_dev_t) {
@@ -99,10 +132,11 @@ void rocknpu_backend_free(ggml_backend_t backend) {
     auto * context = static_cast<rocknpu_backend_context *>(backend->context);
     if (rocknpu_trace_enabled()) {
         std::fprintf(stderr,
-            "ROCKNPU GGML TRACE summary q4_K_mul_mat=%zu q6_K_mul_mat=%zu f16_mul_mat=%zu w8a8_m1_mul_mat=%zu\n",
+            "ROCKNPU GGML TRACE summary q4_K_mul_mat=%zu q6_K_mul_mat=%zu f16_mul_mat=%zu w4a4_m1_mul_mat=%zu w8a8_m1_mul_mat=%zu\n",
             context->q4_k_mul_mat_calls,
             context->q6_k_mul_mat_calls,
             context->f16_mul_mat_calls,
+            context->w4a4_m1_mul_mat_calls,
             context->w8a8_m1_mul_mat_calls);
         rocknpu_decode_cache_stats cache = {};
         if (rocknpu_context_decode_cache_stats(context->runtime, &cache) == ROCKNPU_STATUS_OK) {
@@ -159,7 +193,11 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                 } else {
                     context->f16_mul_mat_calls++;
                 }
-                if (m == 1 && (weights->type == GGML_TYPE_Q4_K || weights->type == GGML_TYPE_Q6_K)) {
+                const bool w4a4_m1 = m == 1 && weights->type == GGML_TYPE_Q4_K &&
+                    k <= 10752 && n % 64 == 0 && n <= 8192 && rocknpu_w4a4_shape_enabled(k, n);
+                if (w4a4_m1) {
+                    context->w4a4_m1_mul_mat_calls++;
+                } else if (m == 1 && (weights->type == GGML_TYPE_Q4_K || weights->type == GGML_TYPE_Q6_K)) {
                     context->w8a8_m1_mul_mat_calls++;
                 }
                 if (rocknpu_trace_enabled()) {
@@ -170,7 +208,7 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                         m,
                         k,
                         n,
-                        m == 1 ? "w8a8_m1" : "fp16_bridge");
+                        m == 1 ? (w4a4_m1 ? "w4a4_m1" : "w8a8_m1") : "fp16_bridge");
                 }
                 int status;
                 if (weights->type == GGML_TYPE_Q4_K) {

@@ -48,7 +48,30 @@ quantized decode / M == 1:
   N % 32 == 0, N <= 8192
 ```
 
-Q4_K and Q6_K blocks are forwarded unchanged across the C++ adapter boundary and decoded in Rust by `rocknpu-capi`. For `M >= 4`, they are converted to the existing FP16 weight contract and executed by `Fp16MatmulExecutor`. For supported `M == 1`, Rust performs symmetric W8A8 conversion (per-tensor activation scale, per-output-channel weight scales), runs `Int8DecodeExecutor` through Rocket, and rescales the int32 result to F32. Decode weights are lazily converted once per backend context and retained as native 32x32-packed Rocket BOs; subsequent calls reuse the resident weight and only stage the activation/regcmd/output scratch. `ROCKNPU_GGML_TRACE=1` reports cache entries, resident bytes, hits/misses, and hit/miss timing.
+Q4_K and Q6_K blocks are forwarded unchanged across the C++ adapter boundary and decoded in Rust by `rocknpu-capi`. For `M >= 4`, they are converted to the existing FP16 weight contract and executed by `Fp16MatmulExecutor`. For supported `M == 1`, the **default** path performs symmetric W8A8 conversion (per-tensor activation scale, per-output-channel weight scales), runs `Int8DecodeExecutor` through Rocket, and rescales the int32 result to F32. Decode weights are lazily converted once per backend context and retained as native 32x32-packed Rocket BOs; subsequent calls reuse the resident weight and only stage the activation/regcmd/output scratch. `ROCKNPU_GGML_TRACE=1` reports cache entries, resident bytes, hits/misses, and hit/miss timing.
+
+### Experimental native W4A4 decode
+
+Q4_K `M == 1` can optionally use RockNPU's native signed-W4A4 RK3588 path. This is a research/characterization path, **not a drop-in quality-equivalent replacement for W8A8**. Enable it only with an explicit scope; `ROCKNPU_W4A4=1` without `ROCKNPU_W4A4_SCOPE` leaves the default W8A8 route in place.
+
+A representative FFN experiment is:
+
+```sh
+ROCKNPU_W4A4=1 \
+ROCKNPU_W4A4_SCOPE=ffn \
+ROCKNPU_W4A4_GROUP=2048 \
+ROCKNPU_W4A4_HADAMARD=1 \
+ROCKNPU_W4A4_TRACE=1 \
+GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" \
+  /build/llama.cpp-reference/build-dl/bin/llama-completion \
+  -fit off -ngl 0 \
+  -m artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf \
+  -no-cnv -p "The capital of" -n 3 --temp 0 --no-warmup
+```
+
+`ROCKNPU_W4A4_GROUP` chooses the K quantization group size; when it equals K, RockNPU's persistent W4 pool measures 1/2/3-worker N-splits and caches only the winner. `ROCKNPU_W4A4_HADAMARD=1` applies the same orthonormal FWHT to activation and each static weight row before symmetric int4 quantization. `ROCKNPU_W4A4_SCOPE` accepts `ffn`, `attn`, `proj2048`, `kv`, or explicit `all`.
+
+On the validated RK3588, `K=2048,N=5632` native W4A4 is exact against the integer CPU oracle and three-way N-split measured about `2.08 -> 0.97 ms`; the real TinyLlama FFN tuner measured approximately `[2081,1251,859] us` for 1/2/3 workers and selected three. No saturation was observed. The short `-n 3` TinyLlama gate can match W8A8, but a 16-token deterministic continuation diverges, and Q/O-only W4A4 also diverges over the longer gate. Same-setting `llama-bench tg8` results (`5.09 ± 0.13 tok/s` W4 FFN vs `5.02 ± 0.17 tok/s` default W8A8) are within board/run noise. Consequently the W4 path is shipped only to make native int4 hardware work reproducible and available for further quantization research; it carries no whole-model speed or token-identity claim.
 
 Everything else is rejected by `supports_op` rather than silently falling back inside the adapter.
 

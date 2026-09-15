@@ -14,9 +14,19 @@ use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
+mod int4_decode;
+mod int4_decode_pool;
 mod int8_decode;
 mod int8_decode_pool;
 mod prepacked;
+pub use int4_decode::{
+    Int4DecodeError, Int4DecodeExecutor, Int4DecodeOutput, Int4DecodeStats,
+    Int4GroupedPreparedWeights, Int4PreparedWeightStats, Int4PreparedWeights,
+};
+pub use int4_decode_pool::{
+    Int4DecodePool, Int4DecodePoolError, Int4DecodePoolOutput, Int4DecodePoolPreparedStats,
+    Int4DecodePoolPreparedWeights, Int4DecodePoolStats,
+};
 pub use int8_decode::{
     Int8DecodeError, Int8DecodeExecutor, Int8DecodeOutput, Int8DecodeStats,
     Int8PreparedWeightStats, Int8PreparedWeights,

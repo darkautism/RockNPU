@@ -88,6 +88,8 @@ pub struct Int8DecodeStats {
     /// the one-time resident weight preparation so old benchmark semantics stay
     /// comparable; `execute_prepared` excludes weight preparation.
     pub pack_ns: u128,
+    pub submit_ns: u128,
+    pub wait_ns: u128,
     pub submit_wait_ns: u128,
     pub host_accum_ns: u128,
     pub total_ns: u128,
@@ -289,14 +291,18 @@ impl<'a> Int8DecodeExecutor<'a> {
         regcmd.fini()?;
         let pack_ns = pack_start.elapsed().as_nanos();
 
+        let submit_wait_start = Instant::now();
         let submit_start = Instant::now();
         self.device.submit(
             &tasks,
             &[input.handle(), weights.bo.handle(), regcmd.handle()],
             &[partials.handle()],
         )?;
+        let submit_ns = submit_start.elapsed().as_nanos();
+        let wait_start = Instant::now();
         partials.prep_relative(WAIT_NS)?;
-        let submit_wait_ns = submit_start.elapsed().as_nanos();
+        let wait_ns = wait_start.elapsed().as_nanos();
+        let submit_wait_ns = submit_wait_start.elapsed().as_nanos();
 
         let accum_start = Instant::now();
         let mut values = vec![0i32; n];
@@ -316,6 +322,8 @@ impl<'a> Int8DecodeExecutor<'a> {
                 k_slices: slices,
                 npu_tasks: tasks.len(),
                 pack_ns,
+                submit_ns,
+                wait_ns,
                 submit_wait_ns,
                 host_accum_ns,
                 total_ns: total_start.elapsed().as_nanos(),

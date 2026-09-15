@@ -340,6 +340,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .saturating_add(stats.host_accum_ns);
             (
                 stats.pack_ns as f64 / 1.0e6,
+                stats.submit_ns as f64 / 1.0e6,
+                stats.wait_ns as f64 / 1.0e6,
                 stats.submit_wait_ns as f64 / 1.0e6,
                 stats.host_accum_ns as f64 / 1.0e6,
                 stats.total_ns.saturating_sub(accounted) as f64 / 1.0e6,
