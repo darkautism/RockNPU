@@ -53,29 +53,51 @@ impl RocketDevice {
         })
     }
     pub fn submit(&self, tasks: &[uapi::Task], inputs: &[u32], outputs: &[u32]) -> io::Result<()> {
+        self.submit_with_flags(tasks, inputs, outputs, 0)
+    }
+
+    /// Submit one Rocket job with explicit per-job flags.
+    ///
+    /// `JOB_BATCHED` is deliberately rejected unless the running driver exposes
+    /// the batched-submit capability. A self-chained regcmd stream executed by a
+    /// stock per-task kernel can stall the NPU, so this must fail closed.
+    pub fn submit_with_flags(
+        &self,
+        tasks: &[uapi::Task],
+        inputs: &[u32],
+        outputs: &[u32],
+        flags: u32,
+    ) -> io::Result<()> {
         if tasks.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Rocket job requires at least one task",
             ));
         }
-        let job =
-            uapi::Job {
-                tasks: tasks.as_ptr() as usize as u64,
-                in_bo_handles: inputs.as_ptr() as usize as u64,
-                out_bo_handles: outputs.as_ptr() as usize as u64,
-                task_count: tasks
-                    .len()
-                    .try_into()
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many tasks"))?,
-                task_struct_size: core::mem::size_of::<uapi::Task>() as u32,
-                in_bo_handle_count: inputs.len().try_into().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "too many input BOs")
-                })?,
-                out_bo_handle_count: outputs.len().try_into().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "too many output BOs")
-                })?,
-            };
+        if flags & uapi::JOB_BATCHED != 0 && !self.batched_submit_supported() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Rocket JOB_BATCHED requires a driver exposing rocket_batch_submit",
+            ));
+        }
+        let job = uapi::Job {
+            tasks: tasks.as_ptr() as usize as u64,
+            in_bo_handles: inputs.as_ptr() as usize as u64,
+            out_bo_handles: outputs.as_ptr() as usize as u64,
+            task_count: tasks
+                .len()
+                .try_into()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many tasks"))?,
+            task_struct_size: core::mem::size_of::<uapi::Task>() as u32,
+            in_bo_handle_count: inputs.len().try_into().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "too many input BOs")
+            })?,
+            out_bo_handle_count: outputs.len().try_into().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "too many output BOs")
+            })?,
+            flags,
+            reserved: 0,
+        };
         let submit = uapi::Submit {
             jobs: (&job as *const uapi::Job) as usize as u64,
             job_count: 1,
@@ -83,6 +105,16 @@ impl RocketDevice {
             reserved: 0,
         };
         uapi::submit(self.fd(), &submit)
+    }
+
+    /// Conservative capability probe for the out-of-tree Rocket batched-submit
+    /// extension. Presence of this module parameter proves the driver knows the
+    /// flag; value 0 is the driver's explicit kill switch.
+    pub fn batched_submit_supported(&self) -> bool {
+        std::fs::read_to_string("/sys/module/rocket/parameters/rocket_batch_submit")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .is_some_and(|v| v != 0)
     }
 }
 

@@ -70,7 +70,14 @@ pub struct Job {
     pub task_struct_size: u32,
     pub in_bo_handle_count: u32,
     pub out_bo_handle_count: u32,
+    /// Optional trailing job flags. Kernels predating this field copy only the
+    /// v1 prefix; kernels implementing interface >= 1.1 interpret bit 0 as the
+    /// self-chained, single-kick contract.
+    pub flags: u32,
+    pub reserved: u32,
 }
+
+pub const JOB_BATCHED: u32 = 1 << 0;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Submit {
