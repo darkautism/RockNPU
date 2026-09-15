@@ -271,6 +271,82 @@ The normal Rust runtime path uses the Rocket UAPI directly. Some **validation-on
 
 RockNPU is currently a **developer preview**, so the supported user interface is still the Rust workspace and hardware validation binaries rather than a polished `rocknpu` CLI.
 
+### Configure RockNPU as a llama.cpp / GGML backend
+
+RockNPU can be loaded by **stock, unmodified llama.cpp** as an out-of-tree GGML dynamic backend. You do not need to patch llama.cpp or maintain a RockNPU-specific fork.
+
+There are three steps:
+
+```text
+build llama.cpp with dynamic backends enabled
+        |
+        v
+build libggml-rocknpu.so against that GGML source tree
+        |
+        v
+set GGML_BACKEND_PATH before starting llama.cpp
+```
+
+Assume:
+
+```sh
+export ROCKNPU_DIR=/path/to/RockNPU
+export LLAMA_CPP_DIR=/path/to/llama.cpp
+```
+
+First build llama.cpp with GGML dynamic backend loading enabled:
+
+```sh
+cmake -S "$LLAMA_CPP_DIR" \
+  -B "$LLAMA_CPP_DIR/build-rocknpu" \
+  -DGGML_BACKEND_DL=ON
+cmake --build "$LLAMA_CPP_DIR/build-rocknpu" -j
+```
+
+Then build the RockNPU GGML plugin from the RockNPU repository:
+
+```sh
+cd "$ROCKNPU_DIR"
+cmake -S adapters/ggml-rocknpu \
+  -B target/ggml-rocknpu \
+  -DGGML_SOURCE_DIR="$LLAMA_CPP_DIR/ggml"
+cmake --build target/ggml-rocknpu -j
+```
+
+Point stock llama.cpp at the resulting shared library:
+
+```sh
+export GGML_BACKEND_PATH="$ROCKNPU_DIR/target/ggml-rocknpu/libggml-rocknpu.so"
+```
+
+Verify that llama.cpp can discover the NPU backend:
+
+```sh
+"$LLAMA_CPP_DIR/build-rocknpu/bin/llama-cli" --list-devices
+```
+
+On a usable RK3588/Rocket host, the device list should include:
+
+```text
+ROCKNPU0: RockNPU RK3588
+```
+
+After that, start llama.cpp normally with `GGML_BACKEND_PATH` still set. For example:
+
+```sh
+GGML_BACKEND_PATH="$GGML_BACKEND_PATH" \
+  "$LLAMA_CPP_DIR/build-rocknpu/bin/llama-completion" \
+  -fit off -ngl 0 \
+  -m /path/to/model.gguf \
+  -p "The capital of" -n 1 --temp 0 --no-warmup
+```
+
+You do **not** need to modify llama.cpp source or pass a RockNPU-specific `--device` workaround. The GGML scheduler discovers `ROCKNPU0` through the plugin and sends supported operations to it; unsupported operations remain available to the other registered backends rather than being silently emulated inside the RockNPU adapter.
+
+The currently validated GGML slice is deliberately narrow: contiguous `GGML_OP_MUL_MAT` with F16 or Q4_K weights and F32 activations. Real TinyLlama Q4_K_M prefill is hardware-proven. M=1 decode and additional GGML operators are still active work, so this is not yet an all-NPU llama.cpp execution path.
+
+For exact backend ABI constraints, correctness tests and the pinned llama.cpp validation revision, see [`adapters/ggml-rocknpu/README.md`](adapters/ggml-rocknpu/README.md) and [`docs/repro.md`](docs/repro.md).
+
 ### Basic real-hardware smoke test
 
 With a working `/dev/accel/accel0`:
