@@ -1027,7 +1027,7 @@ where
     let Some(total_n) = key.first.n.checked_add(key.second.n) else {
         return STATUS_INVALID_ARGUMENT;
     };
-    if total_n > 8192 {
+    if total_n > 16384 {
         return STATUS_INVALID_ARGUMENT;
     }
     let Some((activations_i8, activation_scale)) = quantize_symmetric(activations_k_f32) else {
@@ -1076,15 +1076,33 @@ where
                 };
                 (choice, prepared)
             } else {
-                let (choice, prepared) = match tune_decode_workers(
-                    decode_pool,
-                    Arc::clone(&weights),
-                    Arc::clone(&activation),
-                    key.first.k,
-                    total_n,
-                ) {
-                    Ok(result) => result,
-                    Err(()) => return STATUS_EXECUTION_ERROR,
+                let (choice, prepared) = if total_n > 8192 {
+                    let choice = DecodeChoice {
+                        split: Int8DecodeSplit::N,
+                        workers: decode_pool.workers().min(3),
+                    };
+                    let prepared = match decode_pool.prepare_weights_with_split(
+                        Arc::clone(&weights),
+                        key.first.k,
+                        total_n,
+                        choice.workers,
+                        choice.split,
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(_) => return STATUS_EXECUTION_ERROR,
+                    };
+                    (choice, prepared)
+                } else {
+                    match tune_decode_workers(
+                        decode_pool,
+                        Arc::clone(&weights),
+                        Arc::clone(&activation),
+                        key.first.k,
+                        total_n,
+                    ) {
+                        Ok(result) => result,
+                        Err(()) => return STATUS_EXECUTION_ERROR,
+                    }
                 };
                 decode_worker_cache.insert(shape, choice);
                 (choice, prepared)
