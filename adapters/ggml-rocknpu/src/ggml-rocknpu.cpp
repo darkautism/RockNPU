@@ -17,32 +17,7 @@ struct rocknpu_backend_context {
     size_t f16_mul_mat_calls = 0;
     size_t w4a4_m1_mul_mat_calls = 0;
     size_t w8a8_m1_mul_mat_calls = 0;
-    size_t vk_pair_calls = 0;
 };
-
-bool rocknpu_vk_pair_enabled() {
-    static const bool enabled = [] {
-        const char * value = std::getenv("ROCKNPU_VK_PAIR");
-        return value == nullptr || value[0] == '\0' || value[0] != '0';
-    }();
-    return enabled;
-}
-
-bool rocknpu_quant_kind(const ggml_tensor * weights, uint32_t * kind) {
-    if (weights->type == GGML_TYPE_Q4_K) {
-        *kind = 4;
-        return true;
-    }
-    if (weights->type == GGML_TYPE_Q6_K) {
-        *kind = 6;
-        return true;
-    }
-    return false;
-}
-
-bool rocknpu_weight_name_contains(const ggml_tensor * weights, const char * needle) {
-    return weights != nullptr && std::strstr(weights->name, needle) != nullptr;
-}
 
 bool rocknpu_trace_enabled() {
     static const bool enabled = [] {
@@ -157,13 +132,12 @@ void rocknpu_backend_free(ggml_backend_t backend) {
     auto * context = static_cast<rocknpu_backend_context *>(backend->context);
     if (rocknpu_trace_enabled()) {
         std::fprintf(stderr,
-            "ROCKNPU GGML TRACE summary q4_K_mul_mat=%zu q6_K_mul_mat=%zu f16_mul_mat=%zu w4a4_m1_mul_mat=%zu w8a8_m1_mul_mat=%zu vk_pair_calls=%zu\n",
+            "ROCKNPU GGML TRACE summary q4_K_mul_mat=%zu q6_K_mul_mat=%zu f16_mul_mat=%zu w4a4_m1_mul_mat=%zu w8a8_m1_mul_mat=%zu\n",
             context->q4_k_mul_mat_calls,
             context->q6_k_mul_mat_calls,
             context->f16_mul_mat_calls,
             context->w4a4_m1_mul_mat_calls,
-            context->w8a8_m1_mul_mat_calls,
-            context->vk_pair_calls);
+            context->w8a8_m1_mul_mat_calls);
         rocknpu_decode_cache_stats cache = {};
         if (rocknpu_context_decode_cache_stats(context->runtime, &cache) == ROCKNPU_STATUS_OK) {
             const double hit_ms = static_cast<double>(cache.hit_ns) / 1.0e6;
@@ -192,6 +166,7 @@ void rocknpu_backend_free(ggml_backend_t backend) {
 
 enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     auto * context = static_cast<rocknpu_backend_context *>(backend->context);
+
     for (int i = 0; i < graph->n_nodes; ++i) {
         ggml_tensor * node = graph->nodes[i];
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
@@ -202,57 +177,6 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
             case GGML_OP_MUL_MAT: {
                 if (!rocknpu_mul_mat_supported(node)) {
                     return GGML_STATUS_FAILED;
-                }
-                if (rocknpu_vk_pair_enabled() && i + 2 < graph->n_nodes) {
-                    ggml_tensor * second = graph->nodes[i + 2];
-                    if (second != nullptr && second->op == GGML_OP_MUL_MAT && rocknpu_mul_mat_supported(second)) {
-                        const ggml_tensor * first_weights = node->src[0];
-                        const ggml_tensor * second_weights = second->src[0];
-                        const ggml_tensor * first_activations = node->src[1];
-                        const ggml_tensor * second_activations = second->src[1];
-                        uint32_t first_kind = 0;
-                        uint32_t second_kind = 0;
-                        const bool vk_pair =
-                            rocknpu_weight_name_contains(first_weights, ".attn_v.weight") &&
-                            rocknpu_weight_name_contains(second_weights, ".attn_k.weight") &&
-                            first_activations == second_activations &&
-                            first_activations->ne[1] == 1 &&
-                            first_weights->ne[0] == second_weights->ne[0] &&
-                            first_weights->ne[1] == 256 && second_weights->ne[1] == 256 &&
-                            rocknpu_quant_kind(first_weights, &first_kind) &&
-                            rocknpu_quant_kind(second_weights, &second_kind);
-                        if (vk_pair) {
-                            const size_t k_pair = static_cast<size_t>(first_weights->ne[0]);
-                            const int status = rocknpu_matmul_q_pair_f32_f32_m1(
-                                context->runtime,
-                                static_cast<const uint8_t *>(first_weights->data),
-                                ggml_nbytes(first_weights),
-                                first_kind,
-                                256,
-                                static_cast<const uint8_t *>(second_weights->data),
-                                ggml_nbytes(second_weights),
-                                second_kind,
-                                256,
-                                static_cast<const float *>(first_activations->data),
-                                static_cast<float *>(node->data),
-                                static_cast<float *>(second->data),
-                                k_pair);
-                            if (status != ROCKNPU_STATUS_OK) {
-                                return GGML_STATUS_FAILED;
-                            }
-                            context->vk_pair_calls++;
-                            context->w8a8_m1_mul_mat_calls += 2;
-                            if (first_weights->type == GGML_TYPE_Q4_K) context->q4_k_mul_mat_calls++; else context->q6_k_mul_mat_calls++;
-                            if (second_weights->type == GGML_TYPE_Q4_K) context->q4_k_mul_mat_calls++; else context->q6_k_mul_mat_calls++;
-                            if (rocknpu_trace_enabled()) {
-                                std::fprintf(stderr,
-                                    "ROCKNPU GGML TRACE vk_pair first=%s second=%s K=%zu N=256+256 kinds=%u/%u\n",
-                                    first_weights->name, second_weights->name, k_pair, first_kind, second_kind);
-                            }
-                            i += 2;
-                            break;
-                        }
-                    }
                 }
                 const ggml_tensor * weights = node->src[0];
                 const ggml_tensor * activations = node->src[1];
@@ -369,7 +293,7 @@ ggml_backend_t rocknpu_device_init(ggml_backend_dev_t dev, const char *) {
         return nullptr;
     }
 
-    auto * context = new rocknpu_backend_context { runtime, 0, 0, 0, 0, 0 };
+    auto * context = new rocknpu_backend_context { runtime, 0, 0, 0, 0 };
     return new ggml_backend {
         /* .guid    = */ rocknpu_backend_guid(),
         /* .iface   = */ rocknpu_backend_iface,

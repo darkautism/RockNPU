@@ -31,6 +31,7 @@ Purpose: stop future agents from re-running already-decided RockNPU/RK3588 exper
 | Stock llama.cpp dynamic loading is sufficient. No llama.cpp fork/patch/upstream PR is required for the backend. `GGML_BACKEND_PATH + GGML_BACKEND_DL=ON` is the intended integration. | C5 | X |
 | Adding narrow `GGML_OP_GLU/SWIGLU` support causes stock llama.cpp to naturally group decode FFN into one RockNPU graph: `gate MM -> up MM -> SWIGLU -> down MM`, observed as `graph_compute nodes=4`. No scheduler fork required. | C5 | X |
 | Temporary C++ F32 SWIGLU implementation was **only a scheduler/correctness probe**, not the target production implementation. `-n2` remained `The capital of the United`; 23 M=1 SWIGLU calls hit RockNPU. | C5 | X |
+| V/K pair fusion had strong local microbench gain (~1.90x for that pair) but whole hot token regressed. A/B: fused `209.9 ms` vs unfused `206.6 ms`; fused `200.4 ms` vs unfused `196.3 ms`. Do not restore as a perf feature from local numbers alone. | C4 | R |
 | Two-op task chaining saves little because Rocket submit is already cheap: V/K ~1.10x, gate/up ~1.03x. Chaining merely to remove one submit is not a major lever. | C4 | R |
 | Rocket submit ioctl measured ~`0.006–0.008 ms`; BO/fence completion ~`1.397–1.416 ms`. Host submit overhead is not the main decode bottleneck. | C4 | R |
 | Copying ork's NONBLOCK/doorbell idea is low value on current Rocket path: RockNPU submit is already effectively enqueue-then-wait. Attack NPU work/dataflow, not ioctl microseconds. | C4 | R |
@@ -69,6 +70,7 @@ Uncommitted research files at that point:
 - `crates/rocknpu-matmul/src/int8_decode.rs` — experimental instrumentation/changes from decode investigations.
 - `crates/rocket-smoke/src/bin/int8_decode_multicore.rs` — instrumentation/benchmark edits.
 - `crates/rocket-smoke/src/bin/int8_decode_chain.rs` — task-chain experiment.
+- `crates/rocket-smoke/src/bin/int8_decode_fused_pair.rs` — V/K pair-fusion experiment; local win but whole-token regression.
 
 Before committing any of these, separate durable instrumentation/probes from rejected production optimizations.
 

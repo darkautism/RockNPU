@@ -36,12 +36,6 @@ struct DecodeWeightKey {
     kind: DecodeWeightKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct DecodePairKey {
-    first: DecodeWeightKey,
-    second: DecodeWeightKey,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DecodeChoice {
     split: Int8DecodeSplit,
@@ -75,7 +69,6 @@ pub struct RockNpuContext {
     decode_pool: Int8DecodePool,
     decode_worker_cache: HashMap<(usize, usize), DecodeChoice>,
     decode_weights: HashMap<DecodeWeightKey, CachedW8A8Weight>,
-    decode_pair_weights: HashMap<DecodePairKey, CachedW8A8Weight>,
     decode_w4a4_weights: HashMap<DecodeWeightKey, CachedW4A4Weight>,
     decode_grouped_w4a4_weights: HashMap<(DecodeWeightKey, usize, bool), CachedGroupedW4A4Weight>,
     decode_pool_w4a4_weights: HashMap<(DecodeWeightKey, bool), CachedPoolW4A4Weight>,
@@ -1002,131 +995,6 @@ where
     STATUS_OK
 }
 
-fn execute_cached_w8a8_pair_m1<F>(
-    context: &mut RockNpuContext,
-    key: DecodePairKey,
-    activations_k_f32: &[f32],
-    output_first_f32: &mut [f32],
-    output_second_f32: &mut [f32],
-    prepare: F,
-) -> i32
-where
-    F: FnOnce() -> Option<(Vec<i8>, Vec<f32>)>,
-{
-    let call_start = Instant::now();
-    if key.first.k != key.second.k
-        || activations_k_f32.len() != key.first.k
-        || output_first_f32.len() != key.first.n
-        || output_second_f32.len() != key.second.n
-        || !key.first.k.is_multiple_of(512)
-        || !key.first.n.is_multiple_of(32)
-        || !key.second.n.is_multiple_of(32)
-    {
-        return STATUS_INVALID_ARGUMENT;
-    }
-    let Some(total_n) = key.first.n.checked_add(key.second.n) else {
-        return STATUS_INVALID_ARGUMENT;
-    };
-    if total_n > 8192 {
-        return STATUS_INVALID_ARGUMENT;
-    }
-    let Some((activations_i8, activation_scale)) = quantize_symmetric(activations_k_f32) else {
-        return STATUS_INVALID_ARGUMENT;
-    };
-    let activation: Arc<[i8]> = Arc::from(activations_i8);
-
-    let RockNpuContext {
-        device: _,
-        decode_pool,
-        decode_worker_cache,
-        decode_pair_weights,
-        decode_cache_hits,
-        decode_cache_misses,
-        decode_cache_hit_ns,
-        decode_cache_miss_ns,
-        decode_worker_calls,
-        decode_ksplit_calls,
-        ..
-    } = context;
-
-    let (cached, cache_hit) = match decode_pair_weights.entry(key) {
-        Entry::Occupied(entry) => {
-            *decode_cache_hits = decode_cache_hits.saturating_add(1);
-            (entry.into_mut(), true)
-        }
-        Entry::Vacant(entry) => {
-            let Some((weights_i8, scales)) = prepare() else {
-                return STATUS_INVALID_ARGUMENT;
-            };
-            if weights_i8.len() != total_n.saturating_mul(key.first.k) || scales.len() != total_n {
-                return STATUS_INVALID_ARGUMENT;
-            }
-            let weights: Arc<[i8]> = Arc::from(weights_i8);
-            let shape = (key.first.k, total_n);
-            let (choice, prepared) = if let Some(&choice) = decode_worker_cache.get(&shape) {
-                let prepared = match decode_pool.prepare_weights_with_split(
-                    Arc::clone(&weights),
-                    key.first.k,
-                    total_n,
-                    choice.workers,
-                    choice.split,
-                ) {
-                    Ok(prepared) => prepared,
-                    Err(_) => return STATUS_EXECUTION_ERROR,
-                };
-                (choice, prepared)
-            } else {
-                let (choice, prepared) = match tune_decode_workers(
-                    decode_pool,
-                    Arc::clone(&weights),
-                    Arc::clone(&activation),
-                    key.first.k,
-                    total_n,
-                ) {
-                    Ok(result) => result,
-                    Err(()) => return STATUS_EXECUTION_ERROR,
-                };
-                decode_worker_cache.insert(shape, choice);
-                (choice, prepared)
-            };
-            *decode_cache_misses = decode_cache_misses.saturating_add(1);
-            (
-                entry.insert(CachedW8A8Weight {
-                    prepared,
-                    scales,
-                    choice,
-                }),
-                false,
-            )
-        }
-    };
-
-    let result = match decode_pool.execute_prepared(Arc::clone(&activation), &cached.prepared) {
-        Ok(result) => result,
-        Err(_) => return STATUS_EXECUTION_ERROR,
-    };
-    if let Some(calls) = decode_worker_calls.get_mut(cached.choice.workers.saturating_sub(1)) {
-        *calls = calls.saturating_add(1);
-    }
-    if cached.choice.split == Int8DecodeSplit::K {
-        *decode_ksplit_calls = decode_ksplit_calls.saturating_add(1);
-    }
-    for i in 0..key.first.n {
-        output_first_f32[i] = result.values[i] as f32 * activation_scale * cached.scales[i];
-    }
-    for i in 0..key.second.n {
-        let j = key.first.n + i;
-        output_second_f32[i] = result.values[j] as f32 * activation_scale * cached.scales[j];
-    }
-    let elapsed_ns = u64::try_from(call_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    if cache_hit {
-        *decode_cache_hit_ns = decode_cache_hit_ns.saturating_add(elapsed_ns);
-    } else {
-        *decode_cache_miss_ns = decode_cache_miss_ns.saturating_add(elapsed_ns);
-    }
-    STATUS_OK
-}
-
 /// Return the number of RockNPU devices currently usable by the runtime.
 ///
 /// The initial RK3588 backend exposes one default Rocket device at
@@ -1151,7 +1019,6 @@ pub extern "C" fn rocknpu_context_create() -> *mut RockNpuContext {
             decode_pool,
             decode_worker_cache: HashMap::new(),
             decode_weights: HashMap::new(),
-            decode_pair_weights: HashMap::new(),
             decode_w4a4_weights: HashMap::new(),
             decode_grouped_w4a4_weights: HashMap::new(),
             decode_pool_w4a4_weights: HashMap::new(),
@@ -1188,13 +1055,9 @@ pub unsafe extern "C" fn rocknpu_context_decode_cache_stats(
     // SAFETY: both pointers were checked above and are required by the C ABI to
     // remain valid for this synchronous call.
     let context = unsafe { &*context };
-    let w8_resident_bytes = context
-        .decode_weights
-        .values()
-        .chain(context.decode_pair_weights.values())
-        .fold(0usize, |acc, cached| {
-            acc.saturating_add(cached.prepared.stats().resident_bytes)
-        });
+    let w8_resident_bytes = context.decode_weights.values().fold(0usize, |acc, cached| {
+        acc.saturating_add(cached.prepared.stats().resident_bytes)
+    });
     let w4_resident_bytes = context
         .decode_w4a4_weights
         .values()
@@ -1221,7 +1084,6 @@ pub unsafe extern "C" fn rocknpu_context_decode_cache_stats(
             entries: context
                 .decode_weights
                 .len()
-                .saturating_add(context.decode_pair_weights.len())
                 .saturating_add(context.decode_w4a4_weights.len())
                 .saturating_add(context.decode_grouped_w4a4_weights.len())
                 .saturating_add(context.decode_pool_w4a4_weights.len()),
@@ -1345,100 +1207,6 @@ pub unsafe extern "C" fn rocknpu_matmul_f16_f32_f32(
     };
     output.copy_from_slice(&result.values);
     STATUS_OK
-}
-
-/// Execute two M=1 quantized projections that share one activation by
-/// concatenating their W8 rows along N and issuing one prepared NPU matmul.
-/// `kind` is 4 for Q4_K and 6 for Q6_K. Outputs preserve the same per-row
-/// W8 dequantization semantics as independent calls.
-///
-/// # Safety
-/// All pointers must satisfy their documented byte/element lengths for the
-/// duration of this synchronous call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rocknpu_matmul_q_pair_f32_f32_m1(
-    context: *mut RockNpuContext,
-    first_weights: *const u8,
-    first_bytes: usize,
-    first_kind: u32,
-    first_n: usize,
-    second_weights: *const u8,
-    second_bytes: usize,
-    second_kind: u32,
-    second_n: usize,
-    activations_k_f32: *const f32,
-    first_output_f32: *mut f32,
-    second_output_f32: *mut f32,
-    k: usize,
-) -> i32 {
-    if context.is_null()
-        || first_weights.is_null()
-        || second_weights.is_null()
-        || activations_k_f32.is_null()
-        || first_output_f32.is_null()
-        || second_output_f32.is_null()
-        || k == 0
-        || first_n == 0
-        || second_n == 0
-    {
-        return STATUS_INVALID_ARGUMENT;
-    }
-    let first_kind = match first_kind {
-        4 => DecodeWeightKind::Q4K,
-        6 => DecodeWeightKind::Q6K,
-        _ => return STATUS_INVALID_ARGUMENT,
-    };
-    let second_kind = match second_kind {
-        4 => DecodeWeightKind::Q4K,
-        6 => DecodeWeightKind::Q6K,
-        _ => return STATUS_INVALID_ARGUMENT,
-    };
-    let (first, second, activations, first_output, second_output, context) = unsafe {
-        (
-            slice::from_raw_parts(first_weights, first_bytes),
-            slice::from_raw_parts(second_weights, second_bytes),
-            slice::from_raw_parts(activations_k_f32, k),
-            slice::from_raw_parts_mut(first_output_f32, first_n),
-            slice::from_raw_parts_mut(second_output_f32, second_n),
-            &mut *context,
-        )
-    };
-    let key = DecodePairKey {
-        first: DecodeWeightKey {
-            address: first.as_ptr() as usize,
-            bytes: first.len(),
-            k,
-            n: first_n,
-            kind: first_kind,
-        },
-        second: DecodeWeightKey {
-            address: second.as_ptr() as usize,
-            bytes: second.len(),
-            k,
-            n: second_n,
-            kind: second_kind,
-        },
-    };
-    execute_cached_w8a8_pair_m1(
-        context,
-        key,
-        activations,
-        first_output,
-        second_output,
-        || {
-            let (mut weights, mut scales) = match first_kind {
-                DecodeWeightKind::Q4K => prepare_q4_k_w8a8(first, k, first_n)?,
-                DecodeWeightKind::Q6K => prepare_q6_k_w8a8(first, k, first_n)?,
-            };
-            let (second_weights, second_scales) = match second_kind {
-                DecodeWeightKind::Q4K => prepare_q4_k_w8a8(second, k, second_n)?,
-                DecodeWeightKind::Q6K => prepare_q6_k_w8a8(second, k, second_n)?,
-            };
-            weights.extend_from_slice(&second_weights);
-            scales.extend_from_slice(&second_scales);
-            Some((weights, scales))
-        },
-    )
 }
 
 /// Execute C[M,N] = A[M,K] x B[N,K]^T with GGML-compatible Q4_K weights.
