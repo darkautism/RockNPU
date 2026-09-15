@@ -1537,6 +1537,237 @@ pub unsafe extern "C" fn rocknpu_matmul_f16_f32_f32(
 /// All pointers must satisfy their documented byte/element lengths for the
 /// duration of this synchronous call.
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn rocknpu_matmul_w8a8_f32_f32_m1(
+    context: *mut RockNpuContext,
+    weights_nk_i8: *const i8,
+    weight_scales_n_f32: *const f32,
+    activations_k_f32: *const f32,
+    output_n_f32: *mut f32,
+    k: usize,
+    n: usize,
+) -> i32 {
+    if context.is_null()
+        || weights_nk_i8.is_null()
+        || weight_scales_n_f32.is_null()
+        || activations_k_f32.is_null()
+        || output_n_f32.is_null()
+        || k == 0
+        || n == 0
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let Some(weight_len) = k.checked_mul(n) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let (weights, scales, activations, output, context) = unsafe {
+        (
+            slice::from_raw_parts(weights_nk_i8, weight_len),
+            slice::from_raw_parts(weight_scales_n_f32, n),
+            slice::from_raw_parts(activations_k_f32, k),
+            slice::from_raw_parts_mut(output_n_f32, n),
+            &mut *context,
+        )
+    };
+    if scales.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let key = DecodeWeightKey {
+        address: weights.as_ptr() as usize,
+        bytes: weight_len,
+        k,
+        n,
+        kind: DecodeWeightKind::Q4K,
+    };
+    execute_cached_w8a8_m1(context, key, activations, output, || {
+        Some((weights.to_vec(), scales.to_vec()))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rocknpu_matmul_w8a8_pair_f32_f32_m1(
+    context: *mut RockNpuContext,
+    first_weights_nk_i8: *const i8,
+    first_scales_n_f32: *const f32,
+    first_n: usize,
+    second_weights_nk_i8: *const i8,
+    second_scales_n_f32: *const f32,
+    second_n: usize,
+    activations_k_f32: *const f32,
+    first_output_f32: *mut f32,
+    second_output_f32: *mut f32,
+    k: usize,
+) -> i32 {
+    if context.is_null()
+        || first_weights_nk_i8.is_null()
+        || first_scales_n_f32.is_null()
+        || second_weights_nk_i8.is_null()
+        || second_scales_n_f32.is_null()
+        || activations_k_f32.is_null()
+        || first_output_f32.is_null()
+        || second_output_f32.is_null()
+        || k == 0
+        || first_n == 0
+        || second_n == 0
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let Some(first_len) = k.checked_mul(first_n) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let Some(second_len) = k.checked_mul(second_n) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let (first_w, first_s, second_w, second_s, a, out1, out2, context) = unsafe {
+        (
+            slice::from_raw_parts(first_weights_nk_i8, first_len),
+            slice::from_raw_parts(first_scales_n_f32, first_n),
+            slice::from_raw_parts(second_weights_nk_i8, second_len),
+            slice::from_raw_parts(second_scales_n_f32, second_n),
+            slice::from_raw_parts(activations_k_f32, k),
+            slice::from_raw_parts_mut(first_output_f32, first_n),
+            slice::from_raw_parts_mut(second_output_f32, second_n),
+            &mut *context,
+        )
+    };
+    if first_s
+        .iter()
+        .chain(second_s)
+        .any(|v| !v.is_finite() || *v <= 0.0)
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let key = DecodePairKey {
+        first: DecodeWeightKey {
+            address: first_w.as_ptr() as usize,
+            bytes: first_len,
+            k,
+            n: first_n,
+            kind: DecodeWeightKind::Q4K,
+        },
+        second: DecodeWeightKey {
+            address: second_w.as_ptr() as usize,
+            bytes: second_len,
+            k,
+            n: second_n,
+            kind: DecodeWeightKind::Q4K,
+        },
+    };
+    execute_cached_w8a8_pair_m1(context, key, a, out1, out2, || {
+        let mut w = Vec::with_capacity(first_len + second_len);
+        w.extend_from_slice(first_w);
+        w.extend_from_slice(second_w);
+        let mut sc = Vec::with_capacity(first_n + second_n);
+        sc.extend_from_slice(first_s);
+        sc.extend_from_slice(second_s);
+        Some((w, sc))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rocknpu_matmul_w8a8_triple_f32_f32_m1(
+    context: *mut RockNpuContext,
+    first_weights_nk_i8: *const i8,
+    first_scales_n_f32: *const f32,
+    first_n: usize,
+    second_weights_nk_i8: *const i8,
+    second_scales_n_f32: *const f32,
+    second_n: usize,
+    third_weights_nk_i8: *const i8,
+    third_scales_n_f32: *const f32,
+    third_n: usize,
+    activations_k_f32: *const f32,
+    first_output_f32: *mut f32,
+    second_output_f32: *mut f32,
+    third_output_f32: *mut f32,
+    k: usize,
+) -> i32 {
+    if context.is_null()
+        || first_weights_nk_i8.is_null()
+        || first_scales_n_f32.is_null()
+        || second_weights_nk_i8.is_null()
+        || second_scales_n_f32.is_null()
+        || third_weights_nk_i8.is_null()
+        || third_scales_n_f32.is_null()
+        || activations_k_f32.is_null()
+        || first_output_f32.is_null()
+        || second_output_f32.is_null()
+        || third_output_f32.is_null()
+        || k == 0
+        || first_n == 0
+        || second_n == 0
+        || third_n == 0
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let Some(first_len) = k.checked_mul(first_n) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let Some(second_len) = k.checked_mul(second_n) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let Some(third_len) = k.checked_mul(third_n) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let (w1, s1, w2, s2, w3, s3, a, o1, o2, o3, context) = unsafe {
+        (
+            slice::from_raw_parts(first_weights_nk_i8, first_len),
+            slice::from_raw_parts(first_scales_n_f32, first_n),
+            slice::from_raw_parts(second_weights_nk_i8, second_len),
+            slice::from_raw_parts(second_scales_n_f32, second_n),
+            slice::from_raw_parts(third_weights_nk_i8, third_len),
+            slice::from_raw_parts(third_scales_n_f32, third_n),
+            slice::from_raw_parts(activations_k_f32, k),
+            slice::from_raw_parts_mut(first_output_f32, first_n),
+            slice::from_raw_parts_mut(second_output_f32, second_n),
+            slice::from_raw_parts_mut(third_output_f32, third_n),
+            &mut *context,
+        )
+    };
+    if s1
+        .iter()
+        .chain(s2)
+        .chain(s3)
+        .any(|v| !v.is_finite() || *v <= 0.0)
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let key = DecodeTripleKey {
+        first: DecodeWeightKey {
+            address: w1.as_ptr() as usize,
+            bytes: first_len,
+            k,
+            n: first_n,
+            kind: DecodeWeightKind::Q4K,
+        },
+        second: DecodeWeightKey {
+            address: w2.as_ptr() as usize,
+            bytes: second_len,
+            k,
+            n: second_n,
+            kind: DecodeWeightKind::Q4K,
+        },
+        third: DecodeWeightKey {
+            address: w3.as_ptr() as usize,
+            bytes: third_len,
+            k,
+            n: third_n,
+            kind: DecodeWeightKind::Q4K,
+        },
+    };
+    execute_cached_w8a8_triple_m1(context, key, a, o1, o2, o3, || {
+        let mut w = Vec::with_capacity(first_len + second_len + third_len);
+        w.extend_from_slice(w1);
+        w.extend_from_slice(w2);
+        w.extend_from_slice(w3);
+        let mut sc = Vec::with_capacity(first_n + second_n + third_n);
+        sc.extend_from_slice(s1);
+        sc.extend_from_slice(s2);
+        sc.extend_from_slice(s3);
+        Some((w, sc))
+    })
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rocknpu_matmul_q_pair_f32_f32_m1(
     context: *mut RockNpuContext,
     first_weights: *const u8,

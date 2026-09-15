@@ -7,6 +7,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
+#include <fstream>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -29,6 +34,15 @@ struct rocknpu_qkv_layer_state {
     float k_output[256] = {};
 };
 
+struct rocknpu_w8_tensor {
+    bool attempted = false;
+    bool valid = false;
+    size_t k = 0;
+    size_t n = 0;
+    std::vector<int8_t> weights;
+    std::vector<float> scales;
+};
+
 struct rocknpu_backend_context {
     rocknpu_context * runtime;
     size_t q4_k_mul_mat_calls = 0;
@@ -40,8 +54,51 @@ struct rocknpu_backend_context {
     size_t ffn_pair_calls = 0;
     size_t qkv_triple_calls = 0;
     size_t qkv_stash_hits = 0;
+    size_t native_w8_calls = 0;
+    std::unordered_map<std::string, rocknpu_w8_tensor> w8_sidecar;
     rocknpu_qkv_layer_state qkv[ROCKNPU_QKV_MAX_LAYERS] = {};
 };
+
+bool rocknpu_trace_enabled();
+
+bool rocknpu_read_exact(const std::string & path, void * dst, size_t bytes) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file || static_cast<size_t>(file.tellg()) != bytes) return false;
+    file.seekg(0, std::ios::beg);
+    file.read(static_cast<char *>(dst), static_cast<std::streamsize>(bytes));
+    return file.good() || static_cast<size_t>(file.gcount()) == bytes;
+}
+
+rocknpu_w8_tensor * rocknpu_w8_sidecar_get(
+    rocknpu_backend_context * context, const char * name, size_t k, size_t n) {
+    const char * dir = std::getenv("ROCKNPU_W8_SIDECAR_DIR");
+    if (dir == nullptr || dir[0] == '\0' || name == nullptr || name[0] == '\0') return nullptr;
+    auto & tensor = context->w8_sidecar[std::string(name)];
+    if (!tensor.attempted) {
+        tensor.attempted = true;
+        tensor.k = k;
+        tensor.n = n;
+        const size_t weight_count = k * n;
+        tensor.weights.resize(weight_count);
+        tensor.scales.resize(n);
+        const std::string base = std::string(dir) + "/" + name;
+        if (rocknpu_read_exact(base + ".w8", tensor.weights.data(), weight_count) &&
+            rocknpu_read_exact(base + ".scale.f32", tensor.scales.data(), n * sizeof(float))) {
+            tensor.valid = true;
+            for (float scale : tensor.scales) {
+                if (!std::isfinite(scale) || scale <= 0.0f) { tensor.valid = false; break; }
+            }
+        }
+        if (!tensor.valid) {
+            tensor.weights.clear();
+            tensor.scales.clear();
+        } else if (rocknpu_trace_enabled()) {
+            std::fprintf(stderr, "ROCKNPU GGML TRACE native_w8_loaded weight=%s K=%zu N=%zu\n", name, k, n);
+        }
+    }
+    if (!tensor.valid || tensor.k != k || tensor.n != n) return nullptr;
+    return &tensor;
+}
 
 bool rocknpu_env_enabled(const char * name) {
     const char * value = std::getenv(name);
@@ -486,7 +543,13 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                         m == 1 ? (w4a4_m1 ? "w4a4_m1" : "w8a8_m1") : "fp16_bridge");
                 }
                 int status;
-                if (weights->type == GGML_TYPE_Q4_K) {
+                rocknpu_w8_tensor * native_w8 = m == 1 ? rocknpu_w8_sidecar_get(context, weights->name, k, n) : nullptr;
+                if (native_w8 != nullptr) {
+                    status = rocknpu_matmul_w8a8_f32_f32_m1(
+                        context->runtime, native_w8->weights.data(), native_w8->scales.data(),
+                        static_cast<const float *>(activations->data), static_cast<float *>(node->data), k, n);
+                    if (status == ROCKNPU_STATUS_OK) context->native_w8_calls++;
+                } else if (weights->type == GGML_TYPE_Q4_K) {
                     status = rocknpu_matmul_q4_k_f32_f32(
                         context->runtime,
                         static_cast<const uint8_t *>(weights->data),
