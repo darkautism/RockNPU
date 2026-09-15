@@ -345,7 +345,7 @@ GGML_BACKEND_PATH="$GGML_BACKEND_PATH" \
 
 You do **not** need to modify llama.cpp source or pass a RockNPU-specific `--device` workaround. The GGML scheduler discovers `ROCKNPU0` through the plugin and sends supported operations to it; unsupported operations remain available to the other registered backends rather than being silently emulated inside the RockNPU adapter.
 
-The currently validated GGML slice is deliberately narrow: contiguous `GGML_OP_MUL_MAT` with F16, Q4_K, or Q6_K weights and F32 activations. Real TinyLlama Q4_K_M prefill and autoregressive decode are hardware-proven. The `M=4` prefill projections use the FP16 correctness bridge; quantized Q4_K/Q6_K `M=1` projections with `K % 512 == 0`, `N % 32 == 0`, and `N <= 8192` use the W8A8/INT8 decode path through upstream Rocket. Static decode weights are lazily dequantized/requantized once, packed into Rocket-resident INT8 BOs, and then reused by later tokens. With prompt `The capital of` and greedy `-n 3`, stock CPU and RockNPU both produce `" the United States"`. The traced run builds 154 resident projection entries (924 MiB), then reports 154 misses and 157 hits across 311 `M=1` calls. Direct C-ABI timing measured `132.921 ms` average on cache misses versus `2.573 ms` on hits, about a `51.7x` reduction in per-projection hot-path cost. The `N=32000` output head remains on CPU by design; decode is functional and much faster after warmup, but still not competitive with optimized llama.cpp CPU decode yet.
+The currently validated GGML slice is deliberately narrow: contiguous `GGML_OP_MUL_MAT` with F16, Q4_K, or Q6_K weights and F32 activations. Real TinyLlama Q4_K_M prefill and autoregressive decode are hardware-proven. The `M=4` prefill projections use the FP16 correctness bridge; quantized Q4_K/Q6_K `M=1` projections with `K % 512 == 0`, `N % 32 == 0`, and `N <= 8192` use the W8A8/INT8 decode path through upstream Rocket. Static decode weights are lazily dequantized/requantized once, N-split into worker-local Rocket-resident INT8 BOs, and reused by later tokens. Worker count is not hard-coded from a benchmark table: the first occurrence of each `(K,N)` shape warms and interleaves 1/2/3-worker candidates, takes median latency, prefers fewer workers unless a larger pool improves latency by at least 5%, caches that decision, and releases losing resident candidates. With prompt `The capital of` and greedy `-n 3`, stock CPU and RockNPU both produce `" the United States"`. The final traced run builds 154 resident projection entries (924 MiB), reports 154 misses and 157 hits across 311 `M=1` calls, tunes four shapes, and records `hit_avg_ms=1.485` with `worker_calls=[0,221,90]`. This cuts the previous single-fd resident hot-call average (`2.573 ms`) by about 42%, or `1.73x`. The `N=32000` output head remains on CPU by design; decode is substantially improved but still not competitive with optimized llama.cpp CPU decode yet.
 
 For exact backend ABI constraints, correctness tests and the pinned llama.cpp validation revision, see [`adapters/ggml-rocknpu/README.md`](adapters/ggml-rocknpu/README.md) and [`docs/repro.md`](docs/repro.md).
 
@@ -369,9 +369,14 @@ cargo run --release -p rocket-smoke --bin int8_decode_m1 -- 2048 5632
 
 # TinyLlama FFN-down: K=5632 split into 1024/512 partials, then exact host int32 accumulation
 cargo run --release -p rocket-smoke --bin int8_decode_widek
+
+# Persistent N-split characterization; optional third argument selects 1..3 workers
+cargo run --release -p rocket-smoke --bin int8_decode_multicore -- 2048 5632 3
+cargo run --release -p rocket-smoke --bin int8_decode_multicore -- 2048 2048 2
+cargo run --release -p rocket-smoke --bin int8_decode_multicore -- 5632 2048 3
 ```
 
-All four gates bit-match their CPU int32 references on the verified RK3588 host. `int8_decode_m1` now also prepares the static weight BO once and exact-checks both first use and reuse. The same prepared primitive backs quantized stock GGML `M=1` execution; see the resident-cache TinyLlama `-n 3` gate in [`docs/repro.md`](docs/repro.md).
+The single-worker gates bit-match their CPU int32 references on the verified RK3588 host, and `int8_decode_multicore` exact-checks the gathered N slices against the same int32 oracle. Isolated characterization measured up to `2.40x` for `K=2048,N=5632` and `2.33x` for `K=5632,N=2048`; smaller shapes can prefer fewer workers, which is why production measures and caches worker count instead of baking these observations into policy. The same prepared/pool primitives back quantized stock GGML `M=1` execution; see the adaptive resident-cache TinyLlama `-n 3` gate in [`docs/repro.md`](docs/repro.md).
 
 ### Real pretrained model gates
 

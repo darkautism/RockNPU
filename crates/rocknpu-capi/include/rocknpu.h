@@ -17,6 +17,10 @@ typedef struct rocknpu_decode_cache_stats {
     size_t resident_bytes;
     uint64_t hit_ns;
     uint64_t miss_ns;
+    size_t tuned_shapes;
+    size_t worker1_calls;
+    size_t worker2_calls;
+    size_t worker3_calls;
 } rocknpu_decode_cache_stats;
 
 enum rocknpu_status {

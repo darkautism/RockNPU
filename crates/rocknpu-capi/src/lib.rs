@@ -4,11 +4,12 @@ use bytemuck::pod_read_unaligned;
 use half::f16;
 use llama_gguf::tensor::quant::{BlockQ4K, BlockQ6K, dequantize_q4_k, dequantize_q6_k};
 use rocket_runtime::RocketDevice;
-use rocknpu_matmul::{Fp16MatmulExecutor, Int8DecodeExecutor, Int8PreparedWeights};
+use rocknpu_matmul::{Fp16MatmulExecutor, Int8DecodePool, Int8DecodePoolPreparedWeights};
 use std::collections::{HashMap, hash_map::Entry};
 use std::mem::size_of;
 use std::ptr;
 use std::slice;
+use std::sync::Arc;
 use std::time::Instant;
 
 const STATUS_OK: i32 = 0;
@@ -31,17 +32,21 @@ struct DecodeWeightKey {
 }
 
 struct CachedW8A8Weight {
-    prepared: Int8PreparedWeights,
+    prepared: Int8DecodePoolPreparedWeights,
     scales: Vec<f32>,
+    workers: usize,
 }
 
 pub struct RockNpuContext {
     device: RocketDevice,
+    decode_pool: Int8DecodePool,
+    decode_worker_cache: HashMap<(usize, usize), usize>,
     decode_weights: HashMap<DecodeWeightKey, CachedW8A8Weight>,
     decode_cache_hits: usize,
     decode_cache_misses: usize,
     decode_cache_hit_ns: u64,
     decode_cache_miss_ns: u64,
+    decode_worker_calls: [usize; 3],
 }
 
 #[repr(C)]
@@ -53,6 +58,10 @@ pub struct RockNpuDecodeCacheStats {
     pub resident_bytes: usize,
     pub hit_ns: u64,
     pub miss_ns: u64,
+    pub tuned_shapes: usize,
+    pub worker1_calls: usize,
+    pub worker2_calls: usize,
+    pub worker3_calls: usize,
 }
 
 fn quantize_symmetric(values: &[f32]) -> Option<(Vec<i8>, f32)> {
@@ -135,6 +144,112 @@ fn prepare_q6_k_w8a8(weight_bytes: &[u8], k: usize, n: usize) -> Option<(Vec<i8>
     (weights.len() == n.checked_mul(k)? && scales.len() == n).then_some((weights, scales))
 }
 
+fn decode_worker_candidates(pool: &Int8DecodePool, n: usize) -> Result<Vec<usize>, ()> {
+    let mut candidates = vec![1usize];
+    let mut last_effective = 1usize;
+    for requested in 2..=pool.workers() {
+        let effective = pool.effective_workers_for_n(n, requested).map_err(|_| ())?;
+        if effective > last_effective {
+            candidates.push(requested);
+            last_effective = effective;
+        }
+    }
+    Ok(candidates)
+}
+
+fn select_decode_worker_index(medians: &[u128]) -> Option<usize> {
+    const REQUIRED_IMPROVEMENT_PERCENT: u128 = 5;
+    let (&first, rest) = medians.split_first()?;
+    let mut selected_index = 0usize;
+    let mut selected_median = first;
+    for (offset, &candidate_median) in rest.iter().enumerate() {
+        let candidate_index = offset + 1;
+        let candidate_scaled = candidate_median.saturating_mul(100);
+        let required_scaled = selected_median.saturating_mul(100 - REQUIRED_IMPROVEMENT_PERCENT);
+        if candidate_scaled <= required_scaled {
+            selected_index = candidate_index;
+            selected_median = candidate_median;
+        }
+    }
+    Some(selected_index)
+}
+
+fn tune_decode_workers(
+    pool: &mut Int8DecodePool,
+    weights: Arc<[i8]>,
+    activation: Arc<[i8]>,
+    k: usize,
+    n: usize,
+) -> Result<(usize, Int8DecodePoolPreparedWeights), ()> {
+    let candidates = decode_worker_candidates(pool, n)?;
+    let mut prepared = Vec::with_capacity(candidates.len());
+    for &workers in &candidates {
+        match pool.prepare_weights(Arc::clone(&weights), k, n, workers) {
+            Ok(handle) => prepared.push((workers, handle)),
+            Err(_) => {
+                for (_, handle) in prepared {
+                    let _ = pool.release_prepared(&handle);
+                }
+                return Err(());
+            }
+        }
+    }
+
+    let tuning = (|| -> Result<usize, ()> {
+        for (_, handle) in &prepared {
+            let _ = pool
+                .execute_prepared(Arc::clone(&activation), handle)
+                .map_err(|_| ())?;
+        }
+        let mut samples: Vec<Vec<u128>> = prepared.iter().map(|_| Vec::with_capacity(3)).collect();
+        for round in 0..3 {
+            if round % 2 == 0 {
+                for (index, (_, handle)) in prepared.iter().enumerate() {
+                    let start = Instant::now();
+                    let _ = pool
+                        .execute_prepared(Arc::clone(&activation), handle)
+                        .map_err(|_| ())?;
+                    samples[index].push(start.elapsed().as_nanos());
+                }
+            } else {
+                for (index, (_, handle)) in prepared.iter().enumerate().rev() {
+                    let start = Instant::now();
+                    let _ = pool
+                        .execute_prepared(Arc::clone(&activation), handle)
+                        .map_err(|_| ())?;
+                    samples[index].push(start.elapsed().as_nanos());
+                }
+            }
+        }
+        let mut medians = Vec::with_capacity(samples.len());
+        for values in &mut samples {
+            values.sort_unstable();
+            medians.push(values[values.len() / 2]);
+        }
+        select_decode_worker_index(&medians).ok_or(())
+    })();
+
+    let best_index = match tuning {
+        Ok(index) => index,
+        Err(()) => {
+            for (_, handle) in prepared {
+                let _ = pool.release_prepared(&handle);
+            }
+            return Err(());
+        }
+    };
+
+    let mut winner = None;
+    for (index, (workers, handle)) in prepared.into_iter().enumerate() {
+        if index == best_index {
+            winner = Some((workers, handle));
+        } else if pool.release_prepared(&handle).is_err() {
+            return Err(());
+        }
+    }
+    winner.ok_or(())
+}
+
 fn execute_cached_w8a8_m1<F>(
     context: &mut RockNpuContext,
     key: DecodeWeightKey,
@@ -157,41 +272,75 @@ where
     let Some((activations_i8, activation_scale)) = quantize_symmetric(activations_k_f32) else {
         return STATUS_INVALID_ARGUMENT;
     };
+    let activation: Arc<[i8]> = Arc::from(activations_i8);
 
     let RockNpuContext {
-        device,
+        device: _,
+        decode_pool,
+        decode_worker_cache,
         decode_weights,
         decode_cache_hits,
         decode_cache_misses,
         decode_cache_hit_ns,
         decode_cache_miss_ns,
+        decode_worker_calls,
     } = context;
-    let executor = match Int8DecodeExecutor::new(device) {
-        Ok(executor) => executor,
-        Err(_) => return STATUS_EXECUTION_ERROR,
-    };
+
     let (cached, cache_hit) = match decode_weights.entry(key) {
-        Entry::Vacant(entry) => {
-            let Some((weights_i8, scales)) = prepare() else {
-                return STATUS_INVALID_ARGUMENT;
-            };
-            let prepared = match executor.prepare_weights(&weights_i8, key.k, key.n) {
-                Ok(prepared) => prepared,
-                Err(_) => return STATUS_EXECUTION_ERROR,
-            };
-            *decode_cache_misses = decode_cache_misses.saturating_add(1);
-            (entry.insert(CachedW8A8Weight { prepared, scales }), false)
-        }
         Entry::Occupied(entry) => {
             *decode_cache_hits = decode_cache_hits.saturating_add(1);
             (entry.into_mut(), true)
         }
+        Entry::Vacant(entry) => {
+            let Some((weights_i8, scales)) = prepare() else {
+                return STATUS_INVALID_ARGUMENT;
+            };
+            let weights: Arc<[i8]> = Arc::from(weights_i8);
+            let shape = (key.k, key.n);
+            let (workers, prepared) = if let Some(&workers) = decode_worker_cache.get(&shape) {
+                let prepared = match decode_pool.prepare_weights(
+                    Arc::clone(&weights),
+                    key.k,
+                    key.n,
+                    workers,
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(_) => return STATUS_EXECUTION_ERROR,
+                };
+                (workers, prepared)
+            } else {
+                let (workers, prepared) = match tune_decode_workers(
+                    decode_pool,
+                    Arc::clone(&weights),
+                    Arc::clone(&activation),
+                    key.k,
+                    key.n,
+                ) {
+                    Ok(result) => result,
+                    Err(()) => return STATUS_EXECUTION_ERROR,
+                };
+                decode_worker_cache.insert(shape, workers);
+                (workers, prepared)
+            };
+            *decode_cache_misses = decode_cache_misses.saturating_add(1);
+            (
+                entry.insert(CachedW8A8Weight {
+                    prepared,
+                    scales,
+                    workers,
+                }),
+                false,
+            )
+        }
     };
 
-    let result = match executor.execute_prepared(&activations_i8, &cached.prepared) {
+    let result = match decode_pool.execute_prepared(Arc::clone(&activation), &cached.prepared) {
         Ok(result) => result,
         Err(_) => return STATUS_EXECUTION_ERROR,
     };
+    if let Some(calls) = decode_worker_calls.get_mut(cached.workers.saturating_sub(1)) {
+        *calls = calls.saturating_add(1);
+    }
     for ((dst, &acc), &weight_scale) in output_n_f32
         .iter_mut()
         .zip(&result.values)
@@ -220,16 +369,19 @@ pub extern "C" fn rocknpu_device_count() -> usize {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rocknpu_context_create() -> *mut RockNpuContext {
-    match RocketDevice::open() {
-        Ok(device) => Box::into_raw(Box::new(RockNpuContext {
+    match (RocketDevice::open(), Int8DecodePool::new(3)) {
+        (Ok(device), Ok(decode_pool)) => Box::into_raw(Box::new(RockNpuContext {
             device,
+            decode_pool,
+            decode_worker_cache: HashMap::new(),
             decode_weights: HashMap::new(),
             decode_cache_hits: 0,
             decode_cache_misses: 0,
             decode_cache_hit_ns: 0,
             decode_cache_miss_ns: 0,
+            decode_worker_calls: [0; 3],
         })),
-        Err(_) => ptr::null_mut(),
+        _ => ptr::null_mut(),
     }
 }
 
@@ -261,6 +413,10 @@ pub unsafe extern "C" fn rocknpu_context_decode_cache_stats(
             resident_bytes,
             hit_ns: context.decode_cache_hit_ns,
             miss_ns: context.decode_cache_miss_ns,
+            tuned_shapes: context.decode_worker_cache.len(),
+            worker1_calls: context.decode_worker_calls[0],
+            worker2_calls: context.decode_worker_calls[1],
+            worker3_calls: context.decode_worker_calls[2],
         };
     }
     STATUS_OK
@@ -588,6 +744,26 @@ mod tests {
     #[test]
     fn q6_k_block_size_matches_ggml_abi() {
         assert_eq!(size_of::<BlockQ6K>(), 210);
+    }
+
+    #[test]
+    fn decode_worker_selector_ignores_noise_level_gain() {
+        assert_eq!(select_decode_worker_index(&[450, 446, 447]), Some(0));
+    }
+
+    #[test]
+    fn decode_worker_selector_accepts_material_two_worker_gain() {
+        assert_eq!(select_decode_worker_index(&[1598, 985, 1200]), Some(1));
+    }
+
+    #[test]
+    fn decode_worker_selector_accepts_material_three_worker_gain() {
+        assert_eq!(select_decode_worker_index(&[3960, 2220, 1647]), Some(2));
+    }
+
+    #[test]
+    fn decode_worker_selector_requires_nonempty_samples() {
+        assert_eq!(select_decode_worker_index(&[]), None);
     }
 
     #[test]

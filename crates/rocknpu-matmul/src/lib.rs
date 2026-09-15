@@ -15,10 +15,15 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 mod int8_decode;
+mod int8_decode_pool;
 mod prepacked;
 pub use int8_decode::{
     Int8DecodeError, Int8DecodeExecutor, Int8DecodeOutput, Int8DecodeStats,
     Int8PreparedWeightStats, Int8PreparedWeights,
+};
+pub use int8_decode_pool::{
+    Int8DecodePool, Int8DecodePoolError, Int8DecodePoolOutput, Int8DecodePoolPreparedStats,
+    Int8DecodePoolPreparedWeights, Int8DecodePoolStats,
 };
 pub use prepacked::{Fp16PrepackedWeights, PrepackedWeightStats};
 

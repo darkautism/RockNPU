@@ -843,10 +843,10 @@ ROCKNPU GGML TRACE mul_mat weight=blk.21.ffn_down.weight type=q4_K M=1 K=5632 N=
 ROCKNPU GGML TRACE mul_mat weight=blk.0.attn_q.weight type=q4_K M=1 K=2048 N=2048 path=w8a8_m1
 ...
 ROCKNPU GGML TRACE summary q4_K_mul_mat=402 q6_K_mul_mat=60 f16_mul_mat=0 w8a8_m1_mul_mat=311
-ROCKNPU GGML TRACE decode_cache hits=157 misses=154 entries=154 resident_mb=924.00 hit_ms=403.93 hit_avg_ms=2.573 miss_ms=20469.88 miss_avg_ms=132.921
+ROCKNPU GGML TRACE decode_cache hits=157 misses=154 entries=154 resident_mb=924.00 hit_ms=233.20 hit_avg_ms=1.485 miss_ms=12358.77 miss_avg_ms=80.252 tuned_shapes=4 worker_calls=[0,221,90]
 ```
 
-The cache contains exactly the 154 transformer-block projection weights (`22 layers x 7`). Across the `-n 3` run it records 154 misses while the cache is populated and 157 hits as already prepared weights are reused. Direct timing at the C ABI boundary gives `132.921 ms` average per miss versus `2.573 ms` average per hit, a `51.7x` hot-path reduction. The 157 hit calls total `403.93 ms`; 154 full-token projection calls at the same measured average are about `396 ms` before the remaining CPU-side model work. This is still slower than the separately measured optimized llama.cpp CPU decode baseline (~49.4 ms/token), so the next target is multi-core N-split / submit consolidation rather than more host packing work. `output.weight` remains on CPU because N=32000 exceeds the W8A8 N<=8192 envelope.
+The cache contains exactly the 154 transformer-block projection weights (`22 layers x 7`). Across the `-n 3` run it records 154 misses while the cache is populated and 157 hits as already prepared weights are reused. Production decode now owns a persistent three-fd worker pool. The first occurrence of each `(K,N)` geometry prepares effective 1/2/3-worker candidates, warms each once, measures three forward/reverse-interleaved samples, takes medians, and only accepts a larger worker count when it is at least 5% faster than the currently selected smaller count. The winner is cached by shape and loser BOs are released; there is no hard-coded TinyLlama worker table. The final run tuned four shapes and recorded `worker_calls=[0,221,90]`. Cache-hit time fell from the prior single-fd resident `2.573 ms` average to `1.485 ms` (`1.73x`, about 42% less latency); 157 hits total `233.20 ms`, and 154 projection calls at that measured average are about `229 ms` before remaining CPU-side model work. This is still slower than the separately measured optimized llama.cpp CPU decode baseline (~49.4 ms/token), so the next target is kernel/submit efficiency and broader operation coverage. `output.weight` remains on CPU because N=32000 exceeds the W8A8 N<=8192 envelope.
 
 ### W8A8 M=1 decode through upstream Rocket
 
@@ -886,4 +886,16 @@ Observed gate:
 INT8 WIDE-K DECODE PASS M=1 K=5632 N=2048 slices=6 outputs=2048 submit_wait_us=4121.8 host_accum_us=32.1
 ```
 
-The prepared-weight hardware gate exact-checks both the first execution and a second reuse of the same Rocket-resident BO. Representative observations: K=2048,N=5632 prepares once in about `134.7 ms`, then per-call host staging is about `0.02 ms` and NPU submit/wait about `3.9-4.1 ms`; K=5632,N=2048 prepares once in about `89.4 ms`, then staging is about `0.07 ms` and NPU submit/wait about `4.4 ms`. GGML now uses this prepared path automatically. Cached regcmds, multi-core N-column splitting, and submit consolidation remain the major performance work.
+The prepared-weight hardware gate exact-checks both the first execution and a second reuse of the same Rocket-resident BO. Representative observations: K=2048,N=5632 prepares once in about `134.7 ms`, then per-call host staging is about `0.02 ms` and NPU submit/wait about `3.9-4.1 ms`; K=5632,N=2048 prepares once in about `89.4 ms`, then staging is about `0.07 ms` and NPU submit/wait about `4.4 ms`. GGML uses this prepared path automatically.
+
+The persistent multicore characterization gate is:
+
+```sh
+cargo build --release -p rocket-smoke --bin int8_decode_multicore
+./target/release/int8_decode_multicore 2048 5632 3
+./target/release/int8_decode_multicore 2048 2048 2
+./target/release/int8_decode_multicore 2048 256 2
+./target/release/int8_decode_multicore 5632 2048 3
+```
+
+It gives each worker an independent Rocket fd/IOMMU domain, stores only that worker's aligned N slice of the resident weight, gathers int32 slices in original order, and exact-compares against the CPU dot-product oracle. Representative medians were `3.960 -> 1.647 ms` (`2.40x`) for K2048/N5632 with three workers, `1.598 -> 0.985 ms` (`1.62x`) for K2048/N2048 with two, approximately no material gain for K2048/N256, and `4.055 -> 1.738 ms` (`2.33x`) for K5632/N2048 with three. These are characterization results, not a fixed routing table; the production GGML path performs its own shape-level tuning and cache described above. Cached regcmds and submit/kernel efficiency remain major performance work.
