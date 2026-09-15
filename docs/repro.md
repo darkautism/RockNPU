@@ -842,4 +842,44 @@ ROCKNPU GGML TRACE mul_mat weight=blk.0.attn_v.weight type=q6_K M=4 K=2048 N=256
 ROCKNPU GGML TRACE summary q4_K_mul_mat=131 q6_K_mul_mat=20 f16_mul_mat=0
 ```
 
-This is all 151 block-projection MatMuls that stock llama.cpp presents with the NPU-eligible `M=4` shape in this gate. Output pruning reduces the final layer's `ffn_gate`, `ffn_up`, and `ffn_down` plus `output.weight` to `M=1`; those remain on CPU/another scheduler backend. This establishes real Q4_K/Q6_K TinyLlama prefill through stock GGML into RockNPU on RK3588 without claiming M=1 NPU decode or broader GGML operator/layout coverage.
+This is all 151 block-projection MatMuls that stock llama.cpp presents with the NPU-eligible `M=4` shape in this gate. Output pruning reduces the final layer's `ffn_gate`, `ffn_up`, and `ffn_down` plus `output.weight` to `M=1`; those remain on CPU/another scheduler backend in the current GGML adapter. This establishes real Q4_K/Q6_K TinyLlama prefill through stock GGML into RockNPU on RK3588 without claiming GGML M=1 decode or broader operator/layout coverage.
+
+### W8A8 M=1 decode through upstream Rocket
+
+RockNPU now carries an ISC-attributed Rust port of ork-driver's RK3588 INT8/W8A8 full-K register-command template, shape patching, and 32x32 weight layout. The reference source is pinned in `docs/licenses/ork-driver-ISC.txt`. Only the hardware-programming knowledge is reused: BO allocation, IOVA ownership, task submission, synchronization, and timeout/reset remain the project-owned Rust implementation over `/dev/accel/accel0`.
+
+Build the two hardware gates:
+
+```sh
+cargo build --release -p rocket-smoke --bin int8_decode_m1 --bin int8_decode_widek
+```
+
+The single-submit M=1 gate accepts the current validated full-K envelope (`K % 512 == 0`, `K <= 4096`, `N % 32 == 0`, `N <= 8192`) and exact-compares every int32 output against a CPU dot-product oracle. TinyLlama projection shapes validated on the RK3588 host are:
+
+```sh
+./target/release/int8_decode_m1 2048 256
+./target/release/int8_decode_m1 2048 2048
+./target/release/int8_decode_m1 2048 5632
+```
+
+Observed exact gates:
+
+```text
+INT8 DECODE PASS M=1 K=2048 N=256  outputs=256  regcmd_count=112 submit_wait_us=660.9
+INT8 DECODE PASS M=1 K=2048 N=2048 outputs=2048 regcmd_count=112 submit_wait_us=1575.6
+INT8 DECODE PASS M=1 K=2048 N=5632 outputs=5632 regcmd_count=112 submit_wait_us=3905.9
+```
+
+TinyLlama's FFN-down projection has `K=5632`, beyond the verified single-submit schedule. Following ork-driver's wide-K decode strategy, `int8_decode_widek` splits K into five 1024-wide slices plus one 512-wide tail, executes six NPU int32 partials through Rocket, then host-accumulates them exactly:
+
+```sh
+./target/release/int8_decode_widek
+```
+
+Observed gate:
+
+```text
+INT8 WIDE-K DECODE PASS M=1 K=5632 N=2048 slices=6 outputs=2048 submit_wait_us=4121.8 host_accum_us=32.1
+```
+
+These timings are first correctness measurements, not optimized throughput claims. Resident/precomputed regcmds, multi-core N-column splitting, quantization/scales, and the GGML M=1 routing layer are not yet included in these gates.

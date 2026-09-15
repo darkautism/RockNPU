@@ -343,7 +343,7 @@ GGML_BACKEND_PATH="$GGML_BACKEND_PATH" \
 
 You do **not** need to modify llama.cpp source or pass a RockNPU-specific `--device` workaround. The GGML scheduler discovers `ROCKNPU0` through the plugin and sends supported operations to it; unsupported operations remain available to the other registered backends rather than being silently emulated inside the RockNPU adapter.
 
-The currently validated GGML slice is deliberately narrow: contiguous `GGML_OP_MUL_MAT` with F16, Q4_K, or Q6_K weights and F32 activations. Real TinyLlama Q4_K_M prefill is hardware-proven: all 151 block-projection MatMuls that stock llama.cpp presents with the current NPU-eligible `M=4` shape execute through RockNPU. Stock llama.cpp prunes the final layer's three FFN projections and the output head to `M=1`; those remain on CPU because the current RK3588 MatMul path does not correctly support M=1. This is therefore not yet an all-NPU llama.cpp execution path.
+The currently validated GGML slice is deliberately narrow: contiguous `GGML_OP_MUL_MAT` with F16, Q4_K, or Q6_K weights and F32 activations. Real TinyLlama Q4_K_M prefill is hardware-proven: all 151 block-projection MatMuls that stock llama.cpp presents with the current NPU-eligible `M=4` shape execute through RockNPU. Stock llama.cpp prunes the final layer's three FFN projections and the output head to `M=1`; those still remain on CPU in the GGML adapter. The older generic FP16 RK3588 MatMul geometry is not correct for M=1, but RockNPU now has a separate hardware-proven W8A8/INT8 M=1 primitive derived from the ISC-licensed ork-driver implementation and submitted through upstream Rocket. Wiring that primitive into quantized GGML decode is the next integration step; this is not yet an all-NPU llama.cpp execution path.
 
 For exact backend ABI constraints, correctness tests and the pinned llama.cpp validation revision, see [`adapters/ggml-rocknpu/README.md`](adapters/ggml-rocknpu/README.md) and [`docs/repro.md`](docs/repro.md).
 
@@ -356,6 +356,20 @@ cargo run --release -p rocket-smoke
 ```
 
 This exercises the project-owned Rust Rocket UAPI/runtime/register-command path on the real NPU and compares results with CPU references.
+
+The W8A8 M=1 decode gates use the ISC-licensed ork-driver register-command/layout work while keeping allocation and submission on RockNPU's Rust + upstream Rocket path:
+
+```sh
+# TinyLlama-sized M=1 projection geometries
+cargo run --release -p rocket-smoke --bin int8_decode_m1 -- 2048 256
+cargo run --release -p rocket-smoke --bin int8_decode_m1 -- 2048 2048
+cargo run --release -p rocket-smoke --bin int8_decode_m1 -- 2048 5632
+
+# TinyLlama FFN-down: K=5632 split into 1024/512 partials, then exact host int32 accumulation
+cargo run --release -p rocket-smoke --bin int8_decode_widek
+```
+
+All four gates bit-match their CPU int32 references on the verified RK3588 host. This proves a correct logical M=1 NPU path through Rocket; it does not yet mean stock llama.cpp routes its decode graph through this primitive.
 
 ### Real pretrained model gates
 
@@ -385,6 +399,7 @@ The project has already demonstrated, on real RK3588 hardware:
 
 - direct Rocket buffer allocation/mapping/submission/synchronization from Rust;
 - FP16 MatMul/Gemm register-command generation;
+- W8A8/INT8 M=1 decode MatMul through Rocket, including TinyLlama-sized `K=2048` projections and `K=5632` K-split/host-accumulation;
 - FP32-output MatMul mode for higher-accuracy accumulation;
 - MatMul M/N/K tiling and CPU/NPU K-accumulation policies;
 - FP16 Conv2D register-command generation;
