@@ -31,7 +31,11 @@ Purpose: stop future agents from re-running already-decided RockNPU/RK3588 exper
 | Stock llama.cpp dynamic loading is sufficient. No llama.cpp fork/patch/upstream PR is required for the backend. `GGML_BACKEND_PATH + GGML_BACKEND_DL=ON` is the intended integration. | C5 | X |
 | Adding narrow `GGML_OP_GLU/SWIGLU` support causes stock llama.cpp to naturally group decode FFN into one RockNPU graph: `gate MM -> up MM -> SWIGLU -> down MM`, observed as `graph_compute nodes=4`. No scheduler fork required. | C5 | X |
 | Temporary C++ F32 SWIGLU implementation was **only a scheduler/correctness probe**, not the target production implementation. `-n2` remained `The capital of the United`; 23 M=1 SWIGLU calls hit RockNPU. | C5 | X |
-| V/K concat-N pair fusion is bit-exact and ~1.79x faster locally, but two-machine long-window whole-token gains were only `+1.78%` and `+0.80%`; treat as noise-level and keep out of production unless a future protocol shows a clearly larger stable gain. | C4 | R |
+| V/K concat-N pair fusion is bit-exact. Stock local K=2048, N=256+256 measured `0.866 ms` separate vs `0.334 ms` fused 2-worker (`2.59x`; fused 3-worker `0.604 ms`). The old separate-process whole-token `+1.78%/+0.80%` verdict is superseded by same-process ABBA: experimental board `1.052582x`, stock board `1.029613x`, with all three ABBA blocks positive on both. Keep it in the combination pool; stock evidence is positive but sub-5% and decays in later blocks, so do not make a standalone production claim yet. | C4 | T |
+| Gate/up concat-N pair is bit-exact and preserves the same W8A8 per-channel projection math. Stock local K=2048, N=5632+5632 measured `2.955 -> 2.843 ms` (~4%). Stock same-process ABBA measured `1.018275x`; all three blocks were positive, but blocks 2/3 were only ~`1.0063x/1.0081x`. Combination-only for now, not a standalone production win. | C4 | T |
+| V/K + gate/up together stack positively rather than canceling in the current measurements: same-process ABBA `both` measured `1.037348x` on the experimental board and `1.045015x` on the stock board; all three blocks were positive on both. The gains are not additive, but the stock result is the strongest production-kernel evidence for retaining both pair optimizations as a combination candidate. | C4 | T |
+| Small whole-token deltas must not be judged by adjacent independent llama-bench processes. The board showed order-dependent swings from roughly `-11%` to `+7.8%` without thermal throttling. For <5% claims use one process/context/backend, warm both variants, ABBA interleave, >=12 reps, and inspect block direction as well as aggregate median. | C5 | X |
+| Same-input activation quantization reuse is real in the current W8 path, but after `both` pairing the remaining safe duplicate is mainly Q vs the V/K pair: one extra K=2048 F32->I8 quantization per transformer layer. A Release-equivalent host microbench measured ~`14.1–14.5 us` for K=2048 and ~`15.6 us` for K=5632; conservatively charging `15.8 us` gives <`0.2%` whole-token upper bound for 22 saved K=2048 quantizations/token at current TinyLlama latency. Do not add pointer/generation activation-cache complexity now; revisit only if decode latency falls enough for this host work to become material. | C4 | R |
 | Two-op task chaining saves little because Rocket submit is already cheap: V/K ~1.10x, gate/up ~1.03x. Chaining merely to remove one submit is not a major lever. | C4 | R |
 | Rocket submit ioctl measured ~`0.006–0.008 ms`; BO/fence completion ~`1.397–1.416 ms`. Host submit overhead is not the main decode bottleneck. | C4 | R |
 | Copying ork's NONBLOCK/doorbell idea is low value on current Rocket path: RockNPU submit is already effectively enqueue-then-wait. Attack NPU work/dataflow, not ioctl microseconds. | C4 | R |
@@ -58,7 +62,21 @@ Purpose: stop future agents from re-running already-decided RockNPU/RK3588 exper
 | `ROCKNPU_GGML_TRACE=1` is the required first diagnostic for claims about routing. Verify weight name, type, M/K/N, chosen path, cache hit/miss, graph node grouping before changing kernels. | C5 | X |
 | Do not judge a reference binary only by exit code. Old reference M=1 test printed FAILED/mismatches while returning 0. Inspect correctness text/data. | C5 | X |
 
-## 2. Current dirty/research state
+## 2. 2026-09-15 same-process pair ABBA evidence
+
+All whole-token rows below used llama.cpp `391fac16460f15233a7740550d858ac96df3419d`, TinyLlama-1.1B-Chat-v1.0-Q4_K_M, `tg32`, `r=12`, one model/context/backend process, warm baseline+candidate, and `B,A,A,B` interleave. The GGML plugin build artifacts on both boards contain `-O3 -DNDEBUG -fPIC`. `B` is pair(s) disabled; `A` is the named candidate.
+
+The first board is exploration-only because its loaded module exposes experimental Rocket parameters (`rocket_batch_submit=Y`, `rocket_force_core0=N`). The second board lacks those parameters and is the stock production-kernel validator.
+
+- Experimental V/K: baseline samples `[6355285676, 6563720148, 6443800844, 6391513469, 6438364227, 6526746411]`; candidate `[6218370374, 6111478134, 6328047050, 6125652262, 6112986243, 6093505280]`; medians `6441082535 -> 6119319252 ns`; speedup `1.052582x`; block speedups `1.0478x, 1.0306x, 1.0621x`.
+- Stock FFN pair: baseline `[6938423457, 6590359038, 6639709940, 6620918158, 6726314187, 6667731585]`; candidate `[6396010572, 6452092152, 6656396191, 6521481652, 6547130946, 6739062416]`; medians `6653720762 -> 6534306299 ns`; speedup `1.018275x`; block speedups `1.0530x, 1.0063x, 1.0081x`.
+- Stock V/K pair: baseline `[6551763654, 6502699026, 6550185944, 6499084060, 6379214169, 6432363366]`; candidate `[6113958276, 6296337698, 6331495429, 6269001866, 6357148750, 6332921532]`; medians `6500891543 -> 6313916563 ns`; speedup `1.029613x`; block speedups `1.0519x, 1.0356x, 1.0096x`.
+- Experimental BOTH: baseline `[6343612563, 6252070036, 6202569324, 6263966119, 6191903499, 6258387101]`; candidate `[6128375958, 6026424712, 6053667633, 5887300198, 6027502704, 6032537273]`; medians `6255228568 -> 6030019988 ns`; speedup `1.037348x`; block speedups `1.0363x, 1.0440x, 1.0324x`.
+- Stock BOTH: baseline `[7107273605, 6670265913, 6863762311, 6912329792, 6766908576, 6666913087]`; candidate `[6408075269, 6700032956, 6654328583, 6443878125, 6599636630, 6430685882]`; medians `6815335443 -> 6521757377 ns`; speedup `1.045015x`; block speedups `1.0511x, 1.0518x, 1.0310x`.
+
+The pair implementations remain opt-in experimental/runtime-toggle paths. These measurements justify retaining them and testing them as a bundle; they do not justify changing main/default behavior yet.
+
+## 3. Current dirty/research state
 
 Committed baseline when this log was created:
 
@@ -73,7 +91,7 @@ Uncommitted research files at that point:
 
 Before committing any of these, separate durable instrumentation/probes from rejected production optimizations.
 
-## 3. Decision rule for future agents
+## 4. Decision rule for future agents
 
 1. If an item is `X`, do not rerun the same idea with renamed code. Require contradictory current-HW evidence.
 2. If an item is `R`, only reopen after a material change (kernel/UAPI/regcmd model/quantization/dataflow), and state what changed.
