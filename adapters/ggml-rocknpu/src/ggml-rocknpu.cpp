@@ -19,6 +19,7 @@ struct rocknpu_qkv_weight_ref {
 };
 
 struct rocknpu_qkv_layer_state {
+    rocknpu_qkv_weight_ref q;
     rocknpu_qkv_weight_ref v;
     rocknpu_qkv_weight_ref k;
     size_t stable_observations = 0;
@@ -267,7 +268,16 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                         q_weights->ne[0] == 2048 && q_weights->ne[1] == 2048 &&
                         rocknpu_quant_kind(q_weights, &q_kind)) {
                         auto & state = context->qkv[q_layer];
-                        if (state.stable_observations >= 2 && state.v.data != nullptr && state.k.data != nullptr) {
+                        const rocknpu_qkv_weight_ref current_q {
+                            static_cast<const uint8_t *>(q_weights->data), ggml_nbytes(q_weights), q_kind
+                        };
+                        const bool same_q =
+                            state.q.data == current_q.data && state.q.bytes == current_q.bytes && state.q.kind == current_q.kind;
+                        if (!same_q) {
+                            state.q = current_q;
+                            state.stable_observations = 0;
+                            state.pending = false;
+                        } else if (state.stable_observations >= 2 && state.v.data != nullptr && state.k.data != nullptr) {
                             state.pending = false;
                             const int status = rocknpu_matmul_q_triple_f32_f32_m1(
                                 context->runtime,

@@ -1199,6 +1199,8 @@ where
         device: _,
         decode_pool,
         decode_worker_cache,
+        decode_weights,
+        decode_pair_weights,
         decode_triple_weights,
         decode_cache_hits,
         decode_cache_misses,
@@ -1282,6 +1284,18 @@ where
         let j = key.first.n + key.second.n + i;
         output_third_f32[i] = result.values[j] as f32 * activation_scale * cached.scales[j];
     }
+
+    // Once the combined Q/V/K resident entry has executed successfully, the
+    // old standalone-Q and V/K-pair prepared weights are redundant. Removing
+    // them keeps the production steady-state resident footprint near the
+    // pre-triple baseline. If QKV is later disabled at runtime, the existing
+    // lazy cache path will rebuild those fallback entries on demand.
+    decode_weights.remove(&key.first);
+    decode_pair_weights.remove(&DecodePairKey {
+        first: key.second,
+        second: key.third,
+    });
+
     let elapsed_ns = u64::try_from(call_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     if cache_hit {
         *decode_cache_hit_ns = decode_cache_hit_ns.saturating_add(elapsed_ns);
