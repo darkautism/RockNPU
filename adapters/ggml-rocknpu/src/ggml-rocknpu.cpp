@@ -65,7 +65,7 @@ bool rocknpu_ffn_pair_enabled() {
 }
 
 bool rocknpu_qkv_triple_enabled() {
-    return rocknpu_env_enabled("ROCKNPU_QKV_TRIPLE");
+    return rocknpu_env_enabled_default("ROCKNPU_QKV_TRIPLE", true);
 }
 
 bool rocknpu_quant_kind(const ggml_tensor * weights, uint32_t * kind) {

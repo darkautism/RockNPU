@@ -171,3 +171,27 @@ preserve the independent per-row W8A8 scales and are enabled by default after
 same-process ABBA validation on a stock RK3588. Set `ROCKNPU_VK_PAIR=0` or
 `ROCKNPU_FFN_PAIR=0` only to disable the corresponding path for A/B debugging
 or regression isolation.
+
+
+### Cross-partition Q/V/K projection fusion
+
+TinyLlama-style M=1 attention Q, V, and K projections share the same K=2048
+activation, but stock GGML schedules Q and V/K in separate backend graph partitions.
+RockNPU therefore cannot fuse them with ordinary same-graph look-ahead. Instead the
+backend records stable per-layer V/K model-weight identities. After two matching
+observations, the earlier Q partition issues one concat-N W8A8 projection with
+N=2048+256+256=2560, writes Q directly, and stashes the 256-wide V and K results
+until their later partition. The later V/K partition verifies the activation identity
+and copies the precomputed results instead of issuing another NPU projection. The
+per-row W8 scales are unchanged, so this is bit-exact with the existing W8A8
+projection semantics.
+
+This path is enabled by default after same-process ABBA validation on both the
+exploration RK3588 and a stock-Rocket RK3588. Set `ROCKNPU_QKV_TRIPLE=0` to
+disable it for regression isolation. A Q-weight identity change resets the per-layer
+registry before reuse, preventing stale V/K state when a backend context sees a new
+model. After the combined resident entry executes successfully, RockNPU evicts the
+superseded standalone-Q and V/K-pair prepared weights; TinyLlama steady-state
+resident decode-cache usage therefore remains about 924 MiB rather than growing by
+roughly 110 MiB. Unsupported names or geometries simply continue through the normal
+Q plus V/K-pair paths.
