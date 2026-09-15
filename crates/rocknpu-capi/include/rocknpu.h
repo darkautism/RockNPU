@@ -62,6 +62,26 @@ int rocknpu_matmul_q_pair_f32_f32_m1(
     float * second_output_f32,
     size_t k);
 
+int rocknpu_matmul_q_triple_f32_f32_m1(
+    rocknpu_context * context,
+    const uint8_t * first_weights,
+    size_t first_bytes,
+    uint32_t first_kind,
+    size_t first_n,
+    const uint8_t * second_weights,
+    size_t second_bytes,
+    uint32_t second_kind,
+    size_t second_n,
+    const uint8_t * third_weights,
+    size_t third_bytes,
+    uint32_t third_kind,
+    size_t third_n,
+    const float * activations_k_f32,
+    float * first_output_f32,
+    float * second_output_f32,
+    float * third_output_f32,
+    size_t k);
+
 int rocknpu_matmul_q4_k_f32_f32(
     rocknpu_context * context,
     const uint8_t * weights_nk_q4_k,

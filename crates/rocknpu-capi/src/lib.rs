@@ -42,6 +42,13 @@ struct DecodePairKey {
     second: DecodeWeightKey,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DecodeTripleKey {
+    first: DecodeWeightKey,
+    second: DecodeWeightKey,
+    third: DecodeWeightKey,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DecodeChoice {
     split: Int8DecodeSplit,
@@ -76,6 +83,7 @@ pub struct RockNpuContext {
     decode_worker_cache: HashMap<(usize, usize), DecodeChoice>,
     decode_weights: HashMap<DecodeWeightKey, CachedW8A8Weight>,
     decode_pair_weights: HashMap<DecodePairKey, CachedW8A8Weight>,
+    decode_triple_weights: HashMap<DecodeTripleKey, CachedW8A8Weight>,
     decode_w4a4_weights: HashMap<DecodeWeightKey, CachedW4A4Weight>,
     decode_grouped_w4a4_weights: HashMap<(DecodeWeightKey, usize, bool), CachedGroupedW4A4Weight>,
     decode_pool_w4a4_weights: HashMap<(DecodeWeightKey, bool), CachedPoolW4A4Weight>,
@@ -1145,6 +1153,144 @@ where
     STATUS_OK
 }
 
+fn execute_cached_w8a8_triple_m1<F>(
+    context: &mut RockNpuContext,
+    key: DecodeTripleKey,
+    activations_k_f32: &[f32],
+    output_first_f32: &mut [f32],
+    output_second_f32: &mut [f32],
+    output_third_f32: &mut [f32],
+    prepare: F,
+) -> i32
+where
+    F: FnOnce() -> Option<(Vec<i8>, Vec<f32>)>,
+{
+    let call_start = Instant::now();
+    if key.first.k != key.second.k
+        || key.first.k != key.third.k
+        || activations_k_f32.len() != key.first.k
+        || output_first_f32.len() != key.first.n
+        || output_second_f32.len() != key.second.n
+        || output_third_f32.len() != key.third.n
+        || !key.first.k.is_multiple_of(512)
+        || !key.first.n.is_multiple_of(32)
+        || !key.second.n.is_multiple_of(32)
+        || !key.third.n.is_multiple_of(32)
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let Some(total_n) = key
+        .first
+        .n
+        .checked_add(key.second.n)
+        .and_then(|n| n.checked_add(key.third.n))
+    else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    if total_n > 16384 {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let Some((activations_i8, activation_scale)) = quantize_symmetric(activations_k_f32) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let activation: Arc<[i8]> = Arc::from(activations_i8);
+
+    let RockNpuContext {
+        device: _,
+        decode_pool,
+        decode_worker_cache,
+        decode_triple_weights,
+        decode_cache_hits,
+        decode_cache_misses,
+        decode_cache_hit_ns,
+        decode_cache_miss_ns,
+        decode_worker_calls,
+        decode_ksplit_calls,
+        ..
+    } = context;
+
+    let (cached, cache_hit) = match decode_triple_weights.entry(key) {
+        Entry::Occupied(entry) => {
+            *decode_cache_hits = decode_cache_hits.saturating_add(1);
+            (entry.into_mut(), true)
+        }
+        Entry::Vacant(entry) => {
+            let Some((weights_i8, scales)) = prepare() else {
+                return STATUS_INVALID_ARGUMENT;
+            };
+            if weights_i8.len() != total_n.saturating_mul(key.first.k) || scales.len() != total_n {
+                return STATUS_INVALID_ARGUMENT;
+            }
+            let weights: Arc<[i8]> = Arc::from(weights_i8);
+            let shape = (key.first.k, total_n);
+            let (choice, prepared) = if let Some(&choice) = decode_worker_cache.get(&shape) {
+                let prepared = match decode_pool.prepare_weights_with_split(
+                    Arc::clone(&weights),
+                    key.first.k,
+                    total_n,
+                    choice.workers,
+                    choice.split,
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(_) => return STATUS_EXECUTION_ERROR,
+                };
+                (choice, prepared)
+            } else {
+                let (choice, prepared) = match tune_decode_workers(
+                    decode_pool,
+                    Arc::clone(&weights),
+                    Arc::clone(&activation),
+                    key.first.k,
+                    total_n,
+                ) {
+                    Ok(result) => result,
+                    Err(()) => return STATUS_EXECUTION_ERROR,
+                };
+                decode_worker_cache.insert(shape, choice);
+                (choice, prepared)
+            };
+            *decode_cache_misses = decode_cache_misses.saturating_add(1);
+            (
+                entry.insert(CachedW8A8Weight {
+                    prepared,
+                    scales,
+                    choice,
+                }),
+                false,
+            )
+        }
+    };
+
+    let result = match decode_pool.execute_prepared(Arc::clone(&activation), &cached.prepared) {
+        Ok(result) => result,
+        Err(_) => return STATUS_EXECUTION_ERROR,
+    };
+    if let Some(calls) = decode_worker_calls.get_mut(cached.choice.workers.saturating_sub(1)) {
+        *calls = calls.saturating_add(1);
+    }
+    if cached.choice.split == Int8DecodeSplit::K {
+        *decode_ksplit_calls = decode_ksplit_calls.saturating_add(1);
+    }
+    for i in 0..key.first.n {
+        output_first_f32[i] = result.values[i] as f32 * activation_scale * cached.scales[i];
+    }
+    for i in 0..key.second.n {
+        let j = key.first.n + i;
+        output_second_f32[i] = result.values[j] as f32 * activation_scale * cached.scales[j];
+    }
+    for i in 0..key.third.n {
+        let j = key.first.n + key.second.n + i;
+        output_third_f32[i] = result.values[j] as f32 * activation_scale * cached.scales[j];
+    }
+    let elapsed_ns = u64::try_from(call_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    if cache_hit {
+        *decode_cache_hit_ns = decode_cache_hit_ns.saturating_add(elapsed_ns);
+    } else {
+        *decode_cache_miss_ns = decode_cache_miss_ns.saturating_add(elapsed_ns);
+    }
+    STATUS_OK
+}
+
 /// Return the number of RockNPU devices currently usable by the runtime.
 ///
 /// The initial RK3588 backend exposes one default Rocket device at
@@ -1170,6 +1316,7 @@ pub extern "C" fn rocknpu_context_create() -> *mut RockNpuContext {
             decode_worker_cache: HashMap::new(),
             decode_weights: HashMap::new(),
             decode_pair_weights: HashMap::new(),
+            decode_triple_weights: HashMap::new(),
             decode_w4a4_weights: HashMap::new(),
             decode_grouped_w4a4_weights: HashMap::new(),
             decode_pool_w4a4_weights: HashMap::new(),
@@ -1210,6 +1357,7 @@ pub unsafe extern "C" fn rocknpu_context_decode_cache_stats(
         .decode_weights
         .values()
         .chain(context.decode_pair_weights.values())
+        .chain(context.decode_triple_weights.values())
         .fold(0usize, |acc, cached| {
             acc.saturating_add(cached.prepared.stats().resident_bytes)
         });
@@ -1240,6 +1388,7 @@ pub unsafe extern "C" fn rocknpu_context_decode_cache_stats(
                 .decode_weights
                 .len()
                 .saturating_add(context.decode_pair_weights.len())
+                .saturating_add(context.decode_triple_weights.len())
                 .saturating_add(context.decode_w4a4_weights.len())
                 .saturating_add(context.decode_grouped_w4a4_weights.len())
                 .saturating_add(context.decode_pool_w4a4_weights.len()),
@@ -1454,6 +1603,112 @@ pub unsafe extern "C" fn rocknpu_matmul_q_pair_f32_f32_m1(
             };
             weights.extend_from_slice(&second_weights);
             scales.extend_from_slice(&second_scales);
+            Some((weights, scales))
+        },
+    )
+}
+
+/// Execute three M=1 quantized projections that share one activation by
+/// concatenating their W8 rows along N and issuing one prepared NPU matmul.
+/// Kinds are 4 for Q4_K and 6 for Q6_K. Outputs preserve the same per-row
+/// W8 dequantization semantics as independent calls.
+///
+/// # Safety
+/// All pointers must satisfy their documented byte/element lengths for the
+/// duration of this synchronous call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rocknpu_matmul_q_triple_f32_f32_m1(
+    context: *mut RockNpuContext,
+    first_weights: *const u8,
+    first_bytes: usize,
+    first_kind: u32,
+    first_n: usize,
+    second_weights: *const u8,
+    second_bytes: usize,
+    second_kind: u32,
+    second_n: usize,
+    third_weights: *const u8,
+    third_bytes: usize,
+    third_kind: u32,
+    third_n: usize,
+    activations_k_f32: *const f32,
+    first_output_f32: *mut f32,
+    second_output_f32: *mut f32,
+    third_output_f32: *mut f32,
+    k: usize,
+) -> i32 {
+    if context.is_null()
+        || first_weights.is_null()
+        || second_weights.is_null()
+        || third_weights.is_null()
+        || activations_k_f32.is_null()
+        || first_output_f32.is_null()
+        || second_output_f32.is_null()
+        || third_output_f32.is_null()
+        || k == 0
+        || first_n == 0
+        || second_n == 0
+        || third_n == 0
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let decode_kind = |kind| match kind {
+        4 => Some(DecodeWeightKind::Q4K),
+        6 => Some(DecodeWeightKind::Q6K),
+        _ => None,
+    };
+    let Some(first_kind) = decode_kind(first_kind) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let Some(second_kind) = decode_kind(second_kind) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let Some(third_kind) = decode_kind(third_kind) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let (first, second, third, activations, first_output, second_output, third_output, context) = unsafe {
+        (
+            slice::from_raw_parts(first_weights, first_bytes),
+            slice::from_raw_parts(second_weights, second_bytes),
+            slice::from_raw_parts(third_weights, third_bytes),
+            slice::from_raw_parts(activations_k_f32, k),
+            slice::from_raw_parts_mut(first_output_f32, first_n),
+            slice::from_raw_parts_mut(second_output_f32, second_n),
+            slice::from_raw_parts_mut(third_output_f32, third_n),
+            &mut *context,
+        )
+    };
+    let weight_key = |bytes: &[u8], n, kind| DecodeWeightKey {
+        address: bytes.as_ptr() as usize,
+        bytes: bytes.len(),
+        k,
+        n,
+        kind,
+    };
+    let key = DecodeTripleKey {
+        first: weight_key(first, first_n, first_kind),
+        second: weight_key(second, second_n, second_kind),
+        third: weight_key(third, third_n, third_kind),
+    };
+    execute_cached_w8a8_triple_m1(
+        context,
+        key,
+        activations,
+        first_output,
+        second_output,
+        third_output,
+        || {
+            let prepare_one = |bytes: &[u8], kind, n| match kind {
+                DecodeWeightKind::Q4K => prepare_q4_k_w8a8(bytes, k, n),
+                DecodeWeightKind::Q6K => prepare_q6_k_w8a8(bytes, k, n),
+            };
+            let (mut weights, mut scales) = prepare_one(first, first_kind, first_n)?;
+            let (second_weights, second_scales) = prepare_one(second, second_kind, second_n)?;
+            let (third_weights, third_scales) = prepare_one(third, third_kind, third_n)?;
+            weights.extend_from_slice(&second_weights);
+            weights.extend_from_slice(&third_weights);
+            scales.extend_from_slice(&second_scales);
+            scales.extend_from_slice(&third_scales);
             Some((weights, scales))
         },
     )

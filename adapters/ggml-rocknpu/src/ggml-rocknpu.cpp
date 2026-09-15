@@ -10,6 +10,24 @@
 
 namespace {
 
+constexpr size_t ROCKNPU_QKV_MAX_LAYERS = 256;
+
+struct rocknpu_qkv_weight_ref {
+    const uint8_t * data = nullptr;
+    size_t bytes = 0;
+    uint32_t kind = 0;
+};
+
+struct rocknpu_qkv_layer_state {
+    rocknpu_qkv_weight_ref v;
+    rocknpu_qkv_weight_ref k;
+    size_t stable_observations = 0;
+    const float * activation = nullptr;
+    bool pending = false;
+    float v_output[256] = {};
+    float k_output[256] = {};
+};
+
 struct rocknpu_backend_context {
     rocknpu_context * runtime;
     size_t q4_k_mul_mat_calls = 0;
@@ -19,6 +37,9 @@ struct rocknpu_backend_context {
     size_t w8a8_m1_mul_mat_calls = 0;
     size_t vk_pair_calls = 0;
     size_t ffn_pair_calls = 0;
+    size_t qkv_triple_calls = 0;
+    size_t qkv_stash_hits = 0;
+    rocknpu_qkv_layer_state qkv[ROCKNPU_QKV_MAX_LAYERS] = {};
 };
 
 bool rocknpu_env_enabled(const char * name) {
@@ -42,6 +63,10 @@ bool rocknpu_ffn_pair_enabled() {
     return rocknpu_env_enabled_default("ROCKNPU_FFN_PAIR", true);
 }
 
+bool rocknpu_qkv_triple_enabled() {
+    return rocknpu_env_enabled("ROCKNPU_QKV_TRIPLE");
+}
+
 bool rocknpu_quant_kind(const ggml_tensor * weights, uint32_t * kind) {
     if (weights->type == GGML_TYPE_Q4_K) {
         *kind = 4;
@@ -56,6 +81,18 @@ bool rocknpu_quant_kind(const ggml_tensor * weights, uint32_t * kind) {
 
 bool rocknpu_weight_name_contains(const ggml_tensor * weights, const char * needle) {
     return weights != nullptr && std::strstr(weights->name, needle) != nullptr;
+}
+
+bool rocknpu_attention_layer(const ggml_tensor * weights, const char * needle, size_t * layer) {
+    if (!rocknpu_weight_name_contains(weights, needle)) {
+        return false;
+    }
+    size_t parsed = 0;
+    if (std::sscanf(weights->name, "blk.%zu.", &parsed) != 1 || parsed >= ROCKNPU_QKV_MAX_LAYERS) {
+        return false;
+    }
+    *layer = parsed;
+    return true;
 }
 
 bool rocknpu_trace_enabled() {
@@ -171,14 +208,16 @@ void rocknpu_backend_free(ggml_backend_t backend) {
     auto * context = static_cast<rocknpu_backend_context *>(backend->context);
     if (rocknpu_trace_enabled()) {
         std::fprintf(stderr,
-            "ROCKNPU GGML TRACE summary q4_K_mul_mat=%zu q6_K_mul_mat=%zu f16_mul_mat=%zu w4a4_m1_mul_mat=%zu w8a8_m1_mul_mat=%zu vk_pair_calls=%zu ffn_pair_calls=%zu\n",
+            "ROCKNPU GGML TRACE summary q4_K_mul_mat=%zu q6_K_mul_mat=%zu f16_mul_mat=%zu w4a4_m1_mul_mat=%zu w8a8_m1_mul_mat=%zu vk_pair_calls=%zu ffn_pair_calls=%zu qkv_triple_calls=%zu qkv_stash_hits=%zu\n",
             context->q4_k_mul_mat_calls,
             context->q6_k_mul_mat_calls,
             context->f16_mul_mat_calls,
             context->w4a4_m1_mul_mat_calls,
             context->w8a8_m1_mul_mat_calls,
             context->vk_pair_calls,
-            context->ffn_pair_calls);
+            context->ffn_pair_calls,
+            context->qkv_triple_calls,
+            context->qkv_stash_hits);
         rocknpu_decode_cache_stats cache = {};
         if (rocknpu_context_decode_cache_stats(context->runtime, &cache) == ROCKNPU_STATUS_OK) {
             const double hit_ms = static_cast<double>(cache.hit_ns) / 1.0e6;
@@ -217,6 +256,55 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
             case GGML_OP_MUL_MAT: {
                 if (!rocknpu_mul_mat_supported(node)) {
                     return GGML_STATUS_FAILED;
+                }
+                if (rocknpu_qkv_triple_enabled()) {
+                    const ggml_tensor * q_weights = node->src[0];
+                    const ggml_tensor * q_activations = node->src[1];
+                    size_t q_layer = 0;
+                    uint32_t q_kind = 0;
+                    if (rocknpu_attention_layer(q_weights, ".attn_q.weight", &q_layer) &&
+                        q_activations->ne[1] == 1 &&
+                        q_weights->ne[0] == 2048 && q_weights->ne[1] == 2048 &&
+                        rocknpu_quant_kind(q_weights, &q_kind)) {
+                        auto & state = context->qkv[q_layer];
+                        if (state.stable_observations >= 2 && state.v.data != nullptr && state.k.data != nullptr) {
+                            state.pending = false;
+                            const int status = rocknpu_matmul_q_triple_f32_f32_m1(
+                                context->runtime,
+                                static_cast<const uint8_t *>(q_weights->data),
+                                ggml_nbytes(q_weights),
+                                q_kind,
+                                2048,
+                                state.v.data,
+                                state.v.bytes,
+                                state.v.kind,
+                                256,
+                                state.k.data,
+                                state.k.bytes,
+                                state.k.kind,
+                                256,
+                                static_cast<const float *>(q_activations->data),
+                                static_cast<float *>(node->data),
+                                state.v_output,
+                                state.k_output,
+                                2048);
+                            if (status == ROCKNPU_STATUS_OK) {
+                                state.activation = static_cast<const float *>(q_activations->data);
+                                state.pending = true;
+                                context->qkv_triple_calls++;
+                                context->w8a8_m1_mul_mat_calls += 3;
+                                if (q_weights->type == GGML_TYPE_Q4_K) context->q4_k_mul_mat_calls++; else context->q6_k_mul_mat_calls++;
+                                if (state.v.kind == 4) context->q4_k_mul_mat_calls++; else context->q6_k_mul_mat_calls++;
+                                if (state.k.kind == 4) context->q4_k_mul_mat_calls++; else context->q6_k_mul_mat_calls++;
+                                if (rocknpu_trace_enabled()) {
+                                    std::fprintf(stderr,
+                                        "ROCKNPU GGML TRACE qkv_triple layer=%zu K=2048 N=2048+256+256 kinds=%u/%u/%u\n",
+                                        q_layer, q_kind, state.v.kind, state.k.kind);
+                                }
+                                break;
+                            }
+                        }
+                    }
                 }
                 if (rocknpu_ffn_pair_enabled() && i + 1 < graph->n_nodes) {
                     ggml_tensor * second = graph->nodes[i + 1];
@@ -288,6 +376,41 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                             rocknpu_quant_kind(first_weights, &first_kind) &&
                             rocknpu_quant_kind(second_weights, &second_kind);
                         if (vk_pair) {
+                            size_t vk_layer = 0;
+                            rocknpu_qkv_layer_state * qkv_state = nullptr;
+                            if (rocknpu_attention_layer(first_weights, ".attn_v.weight", &vk_layer)) {
+                                qkv_state = &context->qkv[vk_layer];
+                                const rocknpu_qkv_weight_ref current_v {
+                                    static_cast<const uint8_t *>(first_weights->data), ggml_nbytes(first_weights), first_kind
+                                };
+                                const rocknpu_qkv_weight_ref current_k {
+                                    static_cast<const uint8_t *>(second_weights->data), ggml_nbytes(second_weights), second_kind
+                                };
+                                const bool same_refs =
+                                    qkv_state->v.data == current_v.data && qkv_state->v.bytes == current_v.bytes && qkv_state->v.kind == current_v.kind &&
+                                    qkv_state->k.data == current_k.data && qkv_state->k.bytes == current_k.bytes && qkv_state->k.kind == current_k.kind;
+                                qkv_state->v = current_v;
+                                qkv_state->k = current_k;
+                                qkv_state->stable_observations = same_refs ? qkv_state->stable_observations + 1 : 1;
+                                if (rocknpu_qkv_triple_enabled() && qkv_state->pending) {
+                                    const bool activation_matches =
+                                        qkv_state->activation == static_cast<const float *>(first_activations->data);
+                                    if (activation_matches) {
+                                        std::memcpy(node->data, qkv_state->v_output, sizeof(qkv_state->v_output));
+                                        std::memcpy(second->data, qkv_state->k_output, sizeof(qkv_state->k_output));
+                                        qkv_state->pending = false;
+                                        context->qkv_stash_hits++;
+                                        if (rocknpu_trace_enabled()) {
+                                            std::fprintf(stderr,
+                                                "ROCKNPU GGML TRACE qkv_stash layer=%zu first=%s second=%s\n",
+                                                vk_layer, first_weights->name, second_weights->name);
+                                        }
+                                        i += 2;
+                                        break;
+                                    }
+                                    qkv_state->pending = false;
+                                }
+                            }
                             const size_t k_pair = static_cast<size_t>(first_weights->ne[0]);
                             const int status = rocknpu_matmul_q_pair_f32_f32_m1(
                                 context->runtime,
@@ -435,7 +558,8 @@ ggml_backend_t rocknpu_device_init(ggml_backend_dev_t dev, const char *) {
         return nullptr;
     }
 
-    auto * context = new rocknpu_backend_context { runtime, 0, 0, 0, 0, 0 };
+    auto * context = new rocknpu_backend_context {};
+    context->runtime = runtime;
     return new ggml_backend {
         /* .guid    = */ rocknpu_backend_guid(),
         /* .iface   = */ rocknpu_backend_iface,
