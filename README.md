@@ -2,6 +2,8 @@
 
 **Open-source Rust userspace runtime and compiler for Rockchip NPUs on mainline Linux.**
 
+> **You may also like:** [`ork-driver`](https://github.com/oRKLLM/ork-driver) — a clean-room userspace matmul library for Rockchip NPUs and one of the most advanced open research projects around RK35xx regcmd, quantized matmul, decode layouts, and multi-core execution.
+
 RockNPU is building the missing open userspace layer between standard machine-learning models and the Rockchip NPU exposed by Linux `drivers/accel/rocket`.
 
 The goal is simple:
@@ -603,4 +605,16 @@ RockNPU is designed around the upstream Linux Rocket kernel boundary:
 - Linux Rocket documentation: https://docs.kernel.org/accel/rocket/index.html
 - Linux accelerator subsystem: https://docs.kernel.org/accel/index.html
 
-The project also uses pinned public references during hardware research and validation. Their role and licensing boundaries are documented in `docs/architecture.md`; validation/reference code is not silently copied into the production Rust path.
+The project also uses pinned public references during hardware research and validation. Where production code is directly derived from third-party implementation work, the boundary and attribution are kept explicit rather than hidden inside the Rust rewrite.
+
+## Thanks
+
+Special thanks to [`ork-driver`](https://github.com/oRKLLM/ork-driver) and the oRKLLM project for their pioneering open research on Rockchip NPUs. Their work on RK35xx register-command synthesis, INT8/W8A8 and INT4 execution, decode-oriented layouts, resident weights, and multi-core scheduling provided RockNPU with major inspiration and practical hardware knowledge.
+
+RockNPU takes a different kernel/runtime path — Rust userspace over upstream Linux `drivers/accel/rocket` — but the public research done by ork-driver has materially accelerated this project.
+
+## License
+
+RockNPU original code is licensed under the [MIT License](LICENSE).
+
+RockNPU keeps the ISC boundary deliberately narrow: `crates/rocknpu-regcmd/src/int8/ork_isc.rs` contains the directly source-derived baseline regcmd template from ISC-licensed [`ork-driver`](https://github.com/oRKLLM/ork-driver). That private file carries the original ISC notice; the surrounding Rust encoder/API and the `rocknpu-regcmd` crate remain MIT. A copy of the upstream notice is also preserved in [`docs/licenses/ork-driver-ISC.txt`](docs/licenses/ork-driver-ISC.txt).
