@@ -25,6 +25,100 @@ RockNPU does **not** depend on Rockchip's proprietary `librknnrt.so`, `librkllmr
 
 > **Status: developer preview.** Real pretrained models already run on real RK3588 hardware, but operator coverage and the high-level end-user CLI/API are still under active development.
 
+
+## RK3588 performance setup: 700 MHz NPU benchmark mode
+
+The current mainline RK3588 `rocket` driver leaves the shared NPU compute clock at the Device Tree boot rate of **200 MHz** and does not expose an NPU devfreq control. On RK3588 this is a severe benchmark limiter: a workload can be functionally correct while running far below the silicon's normal performance range.
+
+For controlled performance work, RockNPU currently uses the public experimental Rocket devfreq reference at commit `ed52a89afa8e68fedf636c8e891bd8fc47e82d26`. This is a **temporary runtime module swap for benchmarking**, not a production dependency. Rebooting restores the packaged module unless you explicitly install a boot service.
+
+### Safety / scope
+
+- Stop all NPU clients before unloading `rocket` (`sudo fuser -v /dev/accel/accel0` should show no users).
+- The instructions below keep the NPU rail at its existing **800 mV** and cap the NPU at the already validated **700 MHz** point.
+- Do **not** request more than 700 MHz at 800 mV. The experimental driver refuses rates above 700 MHz unless the NPU rail is at least 850 mV.
+- Do **not** change the RK3588 NPU clock with `/dev/mem` or raw CRU writes. The NPU power domains must return to the 200 MHz safe rate around power-domain transitions; the devfreq driver handles that guard.
+- The debugfs `clk_summary` SCMI entry may remain stale. Use the devfreq `cur_freq` / `target_freq` values and workload measurements to verify the requested clock.
+
+### One-time source checkout
+
+```sh
+git clone https://github.com/sky-rk3588/rk3588-npu-gpu.git /build/rk3588-npu-gpu-dvfs
+git -C /build/rk3588-npu-gpu-dvfs checkout ed52a89afa8e68fedf636c8e891bd8fc47e82d26
+```
+
+### Build and switch to the devfreq Rocket module
+
+Build against the **running** kernel, then swap the module while no NPU client is active:
+
+```sh
+make -C /lib/modules/$(uname -r)/build \
+  M=/build/rk3588-npu-gpu-dvfs/npu/driver modules
+
+sudo fuser -v /dev/accel/accel0
+sudo rmmod rocket
+sudo insmod /build/rk3588-npu-gpu-dvfs/npu/driver/rocket.ko
+```
+
+Verify the NPU devfreq device exists:
+
+```sh
+DEV=/sys/class/devfreq/fdab0000.npu
+cat "$DEV/available_frequencies"
+cat "$DEV/governor"
+cat "$DEV/cur_freq"
+```
+
+### Set the validated 700 MHz point
+
+The module defaults to the `userspace` governor. Keep a 700 MHz ceiling and request 700 MHz explicitly:
+
+```sh
+DEV=/sys/class/devfreq/fdab0000.npu
+echo 700000000 | sudo tee "$DEV/max_freq"
+echo 700000000 | sudo tee "$DEV/userspace/set_freq"
+
+cat "$DEV/cur_freq"
+cat "$DEV/target_freq"
+cat "$DEV/max_freq"
+```
+
+Expected values are `700000000` for `cur_freq`, `target_freq`, and `max_freq` while the module is active.
+
+For repeatable RK3588 decode measurements, also lock the CPU policies to performance. Use the four Cortex-A76 cores for llama.cpp decode; using all eight cores adds A55 barrier/contention overhead on this platform.
+
+```sh
+for p in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do
+  echo performance | sudo tee "$p"
+done
+
+cat /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq  # 1.8 GHz A55 cluster
+cat /sys/devices/system/cpu/cpufreq/policy4/scaling_cur_freq  # 2.4 GHz A76
+cat /sys/devices/system/cpu/cpufreq/policy6/scaling_cur_freq  # 2.4 GHz A76
+```
+
+The validated test host runs LPDDR4X at 2112 MHz. If your kernel exposes a DMC devfreq device, make sure it is not parked at a low rate before quoting performance numbers.
+
+Use four big cores for decode benchmarks, for example:
+
+```sh
+taskset -c 4-7 llama-bench ... -t 4
+```
+
+### Restore the packaged stock Rocket
+
+Before unloading the experimental module, request the safe 200 MHz rate and stop all NPU clients:
+
+```sh
+DEV=/sys/class/devfreq/fdab0000.npu
+echo 200000000 | sudo tee "$DEV/userspace/set_freq"
+sudo fuser -v /dev/accel/accel0
+sudo rmmod rocket
+sudo modprobe rocket
+```
+
+After restoring stock Rocket, `/sys/class/devfreq/fdab0000.npu` is expected to disappear and the NPU returns to the mainline 200 MHz-class configuration.
+
 ## Why RockNPU?
 
 An RK3588 board contains a capable NPU, but the traditional software path is controlled by a vendor-specific userspace stack:
