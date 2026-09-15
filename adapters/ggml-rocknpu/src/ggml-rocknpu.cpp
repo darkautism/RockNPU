@@ -27,13 +27,11 @@ bool rocknpu_env_enabled(const char * name) {
 }
 
 bool rocknpu_vk_pair_enabled() {
-    static const bool enabled = rocknpu_env_enabled("ROCKNPU_VK_PAIR");
-    return enabled;
+    return rocknpu_env_enabled("ROCKNPU_VK_PAIR");
 }
 
 bool rocknpu_ffn_pair_enabled() {
-    static const bool enabled = rocknpu_env_enabled("ROCKNPU_FFN_PAIR");
-    return enabled;
+    return rocknpu_env_enabled("ROCKNPU_FFN_PAIR");
 }
 
 bool rocknpu_quant_kind(const ggml_tensor * weights, uint32_t * kind) {
