@@ -161,9 +161,13 @@ ROCKNPU GGML TRACE decode_cache hits=157 misses=154 entries=154 resident_mb=924.
 
 The cache contains all 154 (`22 x 7`) transformer-block projection weights. The three final-layer FFN projections first appear as M=1 during output-pruned prefill; the first autoregressive step finishes populating the cache, and the next step reuses it. Each distinct `(K,N)` decode geometry tunes effective 1/2/3-worker N-splits using warmed, forward/reverse-interleaved median samples; shapes whose K would otherwise require multiple sequential tasks also tune 2/3-worker K-splits. The selector requires at least a 5% measured improvement before accepting the next candidate, then caches both split topology and worker count and releases losing resident candidates. Two identical final runs made the same choice distribution, `worker_calls=[0,88,223]` with `ksplit_calls=45`; cache-hit averages were `1.411 ms` and `1.314 ms`, both below the previous N-split-only `1.485 ms`. The output head has `N=32000` and remains on CPU because the current W8A8 path caps N at 8192. Batching, permutations, F16 M=1, and additional GGML ops remain unsupported. Real timing decomposition shows submit/wait dominates representative worker calls (>90%), so the next performance work is kernel/submit efficiency rather than host packing, scratch allocation, or a fixed routing table.
 
-### V/K pair projection
+### Shared-activation projection pairs
 
 For M=1 decode, adjacent attention V/K projections with the same activation and
 K=2048,N=256 are concatenated along N and issued as one N=512 W8A8 projection.
-This path is enabled by default and preserves the independent per-row scales of
-Q4_K/Q6_K inputs. Set `ROCKNPU_VK_PAIR=0` only to disable it for A/B debugging.
+Adjacent FFN gate/up projections with K=2048,N=5632 are likewise concatenated
+into one N=11264 projection using the validated three-worker N-split. Both paths
+preserve the independent per-row W8A8 scales and are enabled by default after
+same-process ABBA validation on a stock RK3588. Set `ROCKNPU_VK_PAIR=0` or
+`ROCKNPU_FFN_PAIR=0` only to disable the corresponding path for A/B debugging
+or regression isolation.

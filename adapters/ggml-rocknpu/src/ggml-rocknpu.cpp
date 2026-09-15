@@ -26,12 +26,20 @@ bool rocknpu_env_enabled(const char * name) {
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+bool rocknpu_env_enabled_default(const char * name, bool default_value) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+    return value[0] != '0';
+}
+
 bool rocknpu_vk_pair_enabled() {
-    return rocknpu_env_enabled("ROCKNPU_VK_PAIR");
+    return rocknpu_env_enabled_default("ROCKNPU_VK_PAIR", true);
 }
 
 bool rocknpu_ffn_pair_enabled() {
-    return rocknpu_env_enabled("ROCKNPU_FFN_PAIR");
+    return rocknpu_env_enabled_default("ROCKNPU_FFN_PAIR", true);
 }
 
 bool rocknpu_quant_kind(const ggml_tensor * weights, uint32_t * kind) {
