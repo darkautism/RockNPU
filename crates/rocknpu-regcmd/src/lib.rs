@@ -15,7 +15,10 @@ mod general;
 mod int4;
 mod int8;
 mod planner;
-pub use chain::{ChainError, encoded_amount as chain_encoded_amount, link_to_next as chain_link_to_next, padded_words as chain_padded_words, seal_last as chain_seal_last};
+pub use chain::{
+    ChainError, encoded_amount as chain_encoded_amount, link_to_next as chain_link_to_next,
+    padded_words as chain_padded_words, seal_last as chain_seal_last,
+};
 pub use conv::{Fp16Conv2dDesc, encode_fp16_conv2d};
 pub use general::{
     Fp16MatmulDesc, encode_fp16_matmul, encode_fp16_matmul_accumulate,

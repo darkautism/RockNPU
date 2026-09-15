@@ -23,11 +23,21 @@ impl core::fmt::Display for ChainError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::AddressAbove32Bit(v) => {
-                write!(f, "PC-chain IOVA 0x{v:x} exceeds the 32-bit PC address field")
+                write!(
+                    f,
+                    "PC-chain IOVA 0x{v:x} exceeds the 32-bit PC address field"
+                )
             }
-            Self::ProgramTooShort => write!(f, "regcmd is too short to contain the four-op trailer"),
-            Self::EmptySuccessor => write!(f, "PC-chain successor must contain at least one regcmd word"),
-            Self::UnexpectedTrailer => write!(f, "regcmd does not have RockNPU's expected PC trailer"),
+            Self::ProgramTooShort => {
+                write!(f, "regcmd is too short to contain the four-op trailer")
+            }
+            Self::EmptySuccessor => write!(
+                f,
+                "PC-chain successor must contain at least one regcmd word"
+            ),
+            Self::UnexpectedTrailer => {
+                write!(f, "regcmd does not have RockNPU's expected PC trailer")
+            }
         }
     }
 }
@@ -50,7 +60,10 @@ pub const fn padded_words(regcmd_words: usize) -> usize {
 }
 
 fn trailer(ops: &[u64]) -> Result<usize, ChainError> {
-    let base = ops.len().checked_sub(4).ok_or(ChainError::ProgramTooShort)?;
+    let base = ops
+        .len()
+        .checked_sub(4)
+        .ok_or(ChainError::ProgramTooShort)?;
     let empty = ops[base];
     let amount = ops[base + 1];
     if (empty >> 48) as u16 != OP_NONE
@@ -85,7 +98,10 @@ pub fn link_to_next(
 
 /// Restore the terminal program's first trailer slot to OP_NONE.
 pub fn seal_last(ops: &mut [u64]) -> Result<(), ChainError> {
-    let base = ops.len().checked_sub(4).ok_or(ChainError::ProgramTooShort)?;
+    let base = ops
+        .len()
+        .checked_sub(4)
+        .ok_or(ChainError::ProgramTooShort)?;
     let amount = ops[base + 1];
     if (amount >> 48) as u16 != OP_REG_PC || amount as u16 != PC_REGISTER_AMOUNTS {
         return Err(ChainError::UnexpectedTrailer);

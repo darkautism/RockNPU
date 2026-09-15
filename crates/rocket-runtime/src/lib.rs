@@ -86,22 +86,23 @@ impl RocketDevice {
                 "Rocket JOB_BATCHED requires a driver exposing rocket_batch_submit",
             ));
         }
-        let job = uapi::Job {
-            tasks: tasks.as_ptr() as usize as u64,
-            in_bo_handles: inputs.as_ptr() as usize as u64,
-            out_bo_handles: outputs.as_ptr() as usize as u64,
-            task_count: tasks
-                .len()
-                .try_into()
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many tasks"))?,
-            task_struct_size: core::mem::size_of::<uapi::Task>() as u32,
-            in_bo_handle_count: inputs.len().try_into().map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "too many input BOs")
-            })?,
-            out_bo_handle_count: outputs.len().try_into().map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "too many output BOs")
-            })?,
-        };
+        let job =
+            uapi::Job {
+                tasks: tasks.as_ptr() as usize as u64,
+                in_bo_handles: inputs.as_ptr() as usize as u64,
+                out_bo_handles: outputs.as_ptr() as usize as u64,
+                task_count: tasks
+                    .len()
+                    .try_into()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many tasks"))?,
+                task_struct_size: core::mem::size_of::<uapi::Task>() as u32,
+                in_bo_handle_count: inputs.len().try_into().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "too many input BOs")
+                })?,
+                out_bo_handle_count: outputs.len().try_into().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "too many output BOs")
+                })?,
+            };
         if flags == 0 {
             let submit = uapi::Submit {
                 jobs: (&job as *const uapi::Job) as usize as u64,
