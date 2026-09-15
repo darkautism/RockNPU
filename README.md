@@ -343,7 +343,7 @@ GGML_BACKEND_PATH="$GGML_BACKEND_PATH" \
 
 You do **not** need to modify llama.cpp source or pass a RockNPU-specific `--device` workaround. The GGML scheduler discovers `ROCKNPU0` through the plugin and sends supported operations to it; unsupported operations remain available to the other registered backends rather than being silently emulated inside the RockNPU adapter.
 
-The currently validated GGML slice is deliberately narrow: contiguous `GGML_OP_MUL_MAT` with F16 or Q4_K weights and F32 activations. Real TinyLlama Q4_K_M prefill is hardware-proven. M=1 decode and additional GGML operators are still active work, so this is not yet an all-NPU llama.cpp execution path.
+The currently validated GGML slice is deliberately narrow: contiguous `GGML_OP_MUL_MAT` with F16, Q4_K, or Q6_K weights and F32 activations. Real TinyLlama Q4_K_M prefill is hardware-proven: all 151 block-projection MatMuls that stock llama.cpp presents with the current NPU-eligible `M=4` shape execute through RockNPU. Stock llama.cpp prunes the final layer's three FFN projections and the output head to `M=1`; those remain on CPU because the current RK3588 MatMul path does not correctly support M=1. This is therefore not yet an all-NPU llama.cpp execution path.
 
 For exact backend ABI constraints, correctness tests and the pinned llama.cpp validation revision, see [`adapters/ggml-rocknpu/README.md`](adapters/ggml-rocknpu/README.md) and [`docs/repro.md`](docs/repro.md).
 
@@ -522,7 +522,7 @@ Detailed architecture and hardware findings are in [`docs/architecture.md`](docs
 
 The project goal/non-goals are in [`docs/goal.md`](docs/goal.md).
 
-An out-of-tree GGML adapter now proves the external backend boundary without modifying llama.cpp: stock llama.cpp dynamically loads `libggml-rocknpu.so`, discovers the real Rocket-backed `ROCKNPU0` device through `rocknpu-capi`, and stock `test-backend-ops` validates aligned F16 and Q4_K/F32 `MUL_MAT` against its independent CPU reference. A real TinyLlama Q4_K_M prefill through stock llama.cpp executes 131 Q4_K MatMuls at the RockNPU `graph_compute` boundary and matches the stock CPU greedy next token for the validated four-token prompt. GGML ABI details remain confined to `adapters/ggml-rocknpu`; see its README and `docs/repro.md` for the exact gates.
+An out-of-tree GGML adapter now proves the external backend boundary without modifying llama.cpp: stock llama.cpp dynamically loads `libggml-rocknpu.so`, discovers the real Rocket-backed `ROCKNPU0` device through `rocknpu-capi`, and stock `test-backend-ops` validates aligned F16, Q4_K, and Q6_K/F32 `MUL_MAT` against its independent CPU reference. A real TinyLlama Q4_K_M prefill through stock llama.cpp executes all 151 NPU-eligible block projection MatMuls at the RockNPU `graph_compute` boundary (131 Q4_K + 20 Q6_K) and matches the stock CPU greedy next token for the validated four-token prompt. GGML ABI details remain confined to `adapters/ggml-rocknpu`; see its README and `docs/repro.md` for the exact gates.
 
 ## Correctness policy
 

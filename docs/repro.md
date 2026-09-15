@@ -786,7 +786,7 @@ Backend ROCKNPU: OK
 
 The test data and CPU reference are owned by stock llama.cpp. The RockNPU path is `GGML -> libggml-rocknpu.so -> rocknpu-capi -> Fp16MatmulExecutor -> RocketDevice -> RK3588 NPU`.
 
-### Q4_K and real TinyLlama through stock GGML
+### Q4_K / Q6_K and real TinyLlama through stock GGML
 
 For ordinary `GGML_BACKEND_PATH` auto-loading, configure the same unmodified llama.cpp source with its dynamic-backend option enabled:
 
@@ -810,7 +810,17 @@ GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" \
 
 Accepted result: `6/6 tests passed`, `Backend ROCKNPU: OK`. M=1/non-multiple-of-4 rows, batched/permuted layouts, and F16 activations are explicitly not supported.
 
-The Q4_K bridge forwards raw 144-byte GGML Q4_K blocks into Rust, dequantizes there, converts to RockNPU's existing FP16 weight contract, then runs the real Rocket/NPU MatMul. It is correctness-first and does not claim native quantized-kernel performance.
+Run the stock Q6_K oracle:
+
+```sh
+GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" \
+  /build/llama.cpp-reference/build-dl/bin/test-backend-ops \
+  test -b ROCKNPU0 -o MUL_MAT -p q6_K
+```
+
+Accepted result: `3/3 tests passed`, `Backend ROCKNPU: OK`.
+
+The Q4_K/Q6_K bridge forwards raw GGML quantized blocks into Rust, dequantizes there, converts to RockNPU's existing FP16 weight contract, then runs the real Rocket/NPU MatMul. It is correctness-first and does not claim native quantized-kernel performance.
 
 For a real-model gate, first run stock CPU with the four-token prompt `The capital of`; greedy generation produces `" the"`. Then run:
 
@@ -823,14 +833,13 @@ GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" \
   -no-cnv -p "The capital of" -n 1 --temp 0 --no-warmup --verbose-prompt
 ```
 
-The RockNPU run produces the same `" the"` continuation. Opt-in execution tracing at the actual backend boundary reports 131 Q4_K MatMuls for the four-token prefill, including:
+The RockNPU run produces the same `" the"` continuation. Opt-in execution tracing at the actual backend boundary reports 131 Q4_K plus 20 Q6_K MatMuls:
 
 ```text
-q4_K M=4 K=2048 N=2048
-q4_K M=4 K=2048 N=256
-q4_K M=4 K=2048 N=5632
-q4_K M=4 K=5632 N=2048
-summary q4_K_mul_mat=131 f16_mul_mat=0
+ROCKNPU GGML TRACE mul_mat weight=blk.0.attn_q.weight type=q4_K M=4 K=2048 N=2048
+ROCKNPU GGML TRACE mul_mat weight=blk.0.attn_v.weight type=q6_K M=4 K=2048 N=256
+...
+ROCKNPU GGML TRACE summary q4_K_mul_mat=131 q6_K_mul_mat=20 f16_mul_mat=0
 ```
 
-This establishes real TinyLlama prefill through stock GGML into RockNPU on RK3588. It does not establish M=1 NPU decode: the current GGML backend still rejects M=1, so decode remains on another scheduler backend. Q6_K and broader GGML operator/layout coverage also remain future work.
+This is all 151 block-projection MatMuls that stock llama.cpp presents with the NPU-eligible `M=4` shape in this gate. Output pruning reduces the final layer's `ffn_gate`, `ffn_up`, and `ffn_down` plus `output.weight` to `M=1`; those remain on CPU/another scheduler backend. This establishes real Q4_K/Q6_K TinyLlama prefill through stock GGML into RockNPU on RK3588 without claiming M=1 NPU decode or broader GGML operator/layout coverage.

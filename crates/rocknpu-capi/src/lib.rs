@@ -2,7 +2,7 @@
 
 use bytemuck::pod_read_unaligned;
 use half::f16;
-use llama_gguf::tensor::quant::{BlockQ4K, dequantize_q4_k};
+use llama_gguf::tensor::quant::{BlockQ4K, BlockQ6K, dequantize_q4_k, dequantize_q6_k};
 use rocket_runtime::RocketDevice;
 use rocknpu_matmul::Fp16MatmulExecutor;
 use std::mem::size_of;
@@ -224,6 +224,101 @@ pub unsafe extern "C" fn rocknpu_matmul_q4_k_f32_f32(
     STATUS_OK
 }
 
+/// Execute C[M,N] = A[M,K] x B[N,K]^T with GGML-compatible Q6_K weights.
+///
+/// Like the Q4_K bridge, Q6_K is decoded in Rust into the existing FP16
+/// executor contract. The external GGML adapter only forwards raw block bytes.
+///
+/// # Safety
+///
+/// `context` must point to a live RockNPU context. `weights_nk_q6_k` must
+/// reference exactly `weights_bytes` readable bytes encoding N contiguous rows
+/// of K Q6_K values. Activation/output pointers must provide `M*K` readable and
+/// `M*N` writable f32 elements respectively for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rocknpu_matmul_q6_k_f32_f32(
+    context: *mut RockNpuContext,
+    weights_nk_q6_k: *const u8,
+    weights_bytes: usize,
+    activations_mk_f32: *const f32,
+    output_mn_f32: *mut f32,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> i32 {
+    const Q6_K_VALUES_PER_BLOCK: usize = 256;
+
+    if context.is_null()
+        || weights_nk_q6_k.is_null()
+        || activations_mk_f32.is_null()
+        || output_mn_f32.is_null()
+        || m == 0
+        || k == 0
+        || n == 0
+        || !k.is_multiple_of(Q6_K_VALUES_PER_BLOCK)
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    let Some(a_len) = m.checked_mul(k) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let Some(weight_values) = n.checked_mul(k) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let Some(out_len) = m.checked_mul(n) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let blocks_per_row = k / Q6_K_VALUES_PER_BLOCK;
+    let Some(block_count) = n.checked_mul(blocks_per_row) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let Some(expected_weight_bytes) = block_count.checked_mul(size_of::<BlockQ6K>()) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    if weights_bytes != expected_weight_bytes {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    // SAFETY: pointer/null/size contracts are validated above. The caller owns
+    // the buffers for the duration of this synchronous call.
+    let (weight_bytes, activations, output, context) = unsafe {
+        (
+            slice::from_raw_parts(weights_nk_q6_k, weights_bytes),
+            slice::from_raw_parts(activations_mk_f32, a_len),
+            slice::from_raw_parts_mut(output_mn_f32, out_len),
+            &mut *context,
+        )
+    };
+
+    let mut weights = Vec::with_capacity(weight_values);
+    let mut decoded = [0.0f32; Q6_K_VALUES_PER_BLOCK];
+    for bytes in weight_bytes.chunks_exact(size_of::<BlockQ6K>()) {
+        let block: BlockQ6K = pod_read_unaligned(bytes);
+        dequantize_q6_k(&block, &mut decoded);
+        weights.extend(decoded.iter().copied().map(f16::from_f32));
+    }
+    if weights.len() != weight_values {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let activations = activations
+        .iter()
+        .copied()
+        .map(f16::from_f32)
+        .collect::<Vec<_>>();
+
+    let mut executor = match Fp16MatmulExecutor::new(&context.device) {
+        Ok(executor) => executor,
+        Err(_) => return STATUS_EXECUTION_ERROR,
+    };
+    let result = match executor.execute_f32(&activations, &weights, m, k, n) {
+        Ok(result) => result,
+        Err(_) => return STATUS_EXECUTION_ERROR,
+    };
+    output.copy_from_slice(&result.values);
+    STATUS_OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +326,11 @@ mod tests {
     #[test]
     fn q4_k_block_size_matches_ggml_abi() {
         assert_eq!(size_of::<BlockQ4K>(), 144);
+    }
+
+    #[test]
+    fn q6_k_block_size_matches_ggml_abi() {
+        assert_eq!(size_of::<BlockQ6K>(), 210);
     }
 
     #[test]
