@@ -1,8 +1,25 @@
 use rocket_runtime::RocketDevice;
-use rocknpu_matmul::Int8DecodeExecutor;
+use rocknpu_matmul::{Int8DecodeExecutor, Int8DecodeOutput};
 
 const DEFAULT_K: usize = 2048;
 const DEFAULT_N: usize = 2048;
+
+fn verify(
+    label: &str,
+    result: &Int8DecodeOutput,
+    reference: &[i32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut mismatches = Vec::new();
+    for (col, (&expected, &actual)) in reference.iter().zip(&result.values).enumerate() {
+        if actual != expected && mismatches.len() < 10 {
+            mismatches.push((col, expected, actual));
+        }
+    }
+    if !mismatches.is_empty() {
+        return Err(format!("{label} mismatch examples: {mismatches:?}").into());
+    }
+    Ok(())
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -27,26 +44,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reference[col] = sum;
     }
 
-    // Deliberately judge the first execution: production GGML decode cannot rely
-    // on an invisible warm-up submission.
-    let result = executor.execute(&a, &b, k, n)?;
-    let mut mismatches = Vec::new();
-    for (col, (&expected, &actual)) in reference.iter().zip(&result.values).enumerate() {
-        if actual != expected && mismatches.len() < 10 {
-            mismatches.push((col, expected, actual));
-        }
-    }
-    if !mismatches.is_empty() {
-        return Err(format!("INT8 M=1 K={k} N={n} mismatch examples: {mismatches:?}").into());
-    }
+    let prepared = executor.prepare_weights(&b, k, n)?;
+    let prepare = prepared.stats();
+
+    // Judge both the first use and a second reuse of the exact same resident
+    // BO. Production decode must not rely on a hidden warm-up/repack cycle.
+    let first = executor.execute_prepared(&a, &prepared)?;
+    verify("first prepared execution", &first, &reference)?;
+    let reused = executor.execute_prepared(&a, &prepared)?;
+    verify("reused prepared execution", &reused, &reference)?;
 
     println!(
-        "INT8 DECODE PASS M=1 K={k} N={n} outputs={n} tasks={} slices={} pack_us={:.1} submit_wait_us={:.1} host_accum_us={:.1}",
-        result.stats.npu_tasks,
-        result.stats.k_slices,
-        result.stats.pack_ns as f64 / 1e3,
-        result.stats.submit_wait_ns as f64 / 1e3,
-        result.stats.host_accum_ns as f64 / 1e3,
+        "INT8 PREPARED DECODE PASS M=1 K={k} N={n} outputs={n} resident_mb={:.2} prepare_us={:.1} first_pack_us={:.1} first_npu_us={:.1} reuse_pack_us={:.1} reuse_npu_us={:.1}",
+        prepare.resident_bytes as f64 / (1024.0 * 1024.0),
+        prepare.pack_ns as f64 / 1e3,
+        first.stats.pack_ns as f64 / 1e3,
+        first.stats.submit_wait_ns as f64 / 1e3,
+        reused.stats.pack_ns as f64 / 1e3,
+        reused.stats.submit_wait_ns as f64 / 1e3,
     );
     Ok(())
 }

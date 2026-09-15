@@ -16,7 +16,10 @@ use std::time::Instant;
 
 mod int8_decode;
 mod prepacked;
-pub use int8_decode::{Int8DecodeError, Int8DecodeExecutor, Int8DecodeOutput, Int8DecodeStats};
+pub use int8_decode::{
+    Int8DecodeError, Int8DecodeExecutor, Int8DecodeOutput, Int8DecodeStats,
+    Int8PreparedWeightStats, Int8PreparedWeights,
+};
 pub use prepacked::{Fp16PrepackedWeights, PrepackedWeightStats};
 
 const WAIT_NS: i64 = 2_000_000_000;

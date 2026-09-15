@@ -4,17 +4,55 @@ use bytemuck::pod_read_unaligned;
 use half::f16;
 use llama_gguf::tensor::quant::{BlockQ4K, BlockQ6K, dequantize_q4_k, dequantize_q6_k};
 use rocket_runtime::RocketDevice;
-use rocknpu_matmul::{Fp16MatmulExecutor, Int8DecodeExecutor};
+use rocknpu_matmul::{Fp16MatmulExecutor, Int8DecodeExecutor, Int8PreparedWeights};
+use std::collections::{HashMap, hash_map::Entry};
 use std::mem::size_of;
 use std::ptr;
 use std::slice;
+use std::time::Instant;
 
 const STATUS_OK: i32 = 0;
 const STATUS_INVALID_ARGUMENT: i32 = -1;
 const STATUS_EXECUTION_ERROR: i32 = -3;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum DecodeWeightKind {
+    Q4K,
+    Q6K,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DecodeWeightKey {
+    address: usize,
+    bytes: usize,
+    k: usize,
+    n: usize,
+    kind: DecodeWeightKind,
+}
+
+struct CachedW8A8Weight {
+    prepared: Int8PreparedWeights,
+    scales: Vec<f32>,
+}
+
 pub struct RockNpuContext {
     device: RocketDevice,
+    decode_weights: HashMap<DecodeWeightKey, CachedW8A8Weight>,
+    decode_cache_hits: usize,
+    decode_cache_misses: usize,
+    decode_cache_hit_ns: u64,
+    decode_cache_miss_ns: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RockNpuDecodeCacheStats {
+    pub hits: usize,
+    pub misses: usize,
+    pub entries: usize,
+    pub resident_bytes: usize,
+    pub hit_ns: u64,
+    pub miss_ns: u64,
 }
 
 fn quantize_symmetric(values: &[f32]) -> Option<(Vec<i8>, f32)> {
@@ -36,51 +74,136 @@ fn quantize_symmetric(values: &[f32]) -> Option<(Vec<i8>, f32)> {
     Some((quantized, scale))
 }
 
-fn execute_w8a8_m1(
-    context: &RockNpuContext,
-    weights_nk_f32: &[f32],
+fn append_quantized_symmetric(values: &[f32], dst: &mut Vec<i8>) -> Option<f32> {
+    let mut max_abs = 0.0f32;
+    for &value in values {
+        if !value.is_finite() {
+            return None;
+        }
+        max_abs = max_abs.max(value.abs());
+    }
+    let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
+    dst.extend(
+        values
+            .iter()
+            .map(|&value| (value / scale).round().clamp(-127.0, 127.0) as i8),
+    );
+    Some(scale)
+}
+
+fn prepare_q4_k_w8a8(weight_bytes: &[u8], k: usize, n: usize) -> Option<(Vec<i8>, Vec<f32>)> {
+    const VALUES: usize = 256;
+    let row_bytes = (k / VALUES).checked_mul(size_of::<BlockQ4K>())?;
+    if weight_bytes.len() != n.checked_mul(row_bytes)? {
+        return None;
+    }
+    let mut weights = Vec::with_capacity(n.checked_mul(k)?);
+    let mut scales = Vec::with_capacity(n);
+    let mut row = Vec::with_capacity(k);
+    let mut decoded = [0.0f32; VALUES];
+    for encoded_row in weight_bytes.chunks_exact(row_bytes) {
+        row.clear();
+        for bytes in encoded_row.chunks_exact(size_of::<BlockQ4K>()) {
+            let block: BlockQ4K = pod_read_unaligned(bytes);
+            dequantize_q4_k(&block, &mut decoded);
+            row.extend_from_slice(&decoded);
+        }
+        scales.push(append_quantized_symmetric(&row, &mut weights)?);
+    }
+    (weights.len() == n.checked_mul(k)? && scales.len() == n).then_some((weights, scales))
+}
+
+fn prepare_q6_k_w8a8(weight_bytes: &[u8], k: usize, n: usize) -> Option<(Vec<i8>, Vec<f32>)> {
+    const VALUES: usize = 256;
+    let row_bytes = (k / VALUES).checked_mul(size_of::<BlockQ6K>())?;
+    if weight_bytes.len() != n.checked_mul(row_bytes)? {
+        return None;
+    }
+    let mut weights = Vec::with_capacity(n.checked_mul(k)?);
+    let mut scales = Vec::with_capacity(n);
+    let mut row = Vec::with_capacity(k);
+    let mut decoded = [0.0f32; VALUES];
+    for encoded_row in weight_bytes.chunks_exact(row_bytes) {
+        row.clear();
+        for bytes in encoded_row.chunks_exact(size_of::<BlockQ6K>()) {
+            let block: BlockQ6K = pod_read_unaligned(bytes);
+            dequantize_q6_k(&block, &mut decoded);
+            row.extend_from_slice(&decoded);
+        }
+        scales.push(append_quantized_symmetric(&row, &mut weights)?);
+    }
+    (weights.len() == n.checked_mul(k)? && scales.len() == n).then_some((weights, scales))
+}
+
+fn execute_cached_w8a8_m1<F>(
+    context: &mut RockNpuContext,
+    key: DecodeWeightKey,
     activations_k_f32: &[f32],
     output_n_f32: &mut [f32],
-    k: usize,
-    n: usize,
-) -> i32 {
-    if weights_nk_f32.len() != n.saturating_mul(k)
-        || activations_k_f32.len() != k
-        || output_n_f32.len() != n
-        || !k.is_multiple_of(512)
-        || !n.is_multiple_of(32)
-        || n > 8192
+    prepare: F,
+) -> i32
+where
+    F: FnOnce() -> Option<(Vec<i8>, Vec<f32>)>,
+{
+    let call_start = Instant::now();
+    if activations_k_f32.len() != key.k
+        || output_n_f32.len() != key.n
+        || !key.k.is_multiple_of(512)
+        || !key.n.is_multiple_of(32)
+        || key.n > 8192
     {
         return STATUS_INVALID_ARGUMENT;
     }
-
     let Some((activations_i8, activation_scale)) = quantize_symmetric(activations_k_f32) else {
         return STATUS_INVALID_ARGUMENT;
     };
-    let mut weights_i8 = Vec::with_capacity(weights_nk_f32.len());
-    let mut weight_scales = Vec::with_capacity(n);
-    for row in weights_nk_f32.chunks_exact(k) {
-        let Some((quantized, scale)) = quantize_symmetric(row) else {
-            return STATUS_INVALID_ARGUMENT;
-        };
-        weights_i8.extend_from_slice(&quantized);
-        weight_scales.push(scale);
-    }
 
-    let executor = match Int8DecodeExecutor::new(&context.device) {
+    let RockNpuContext {
+        device,
+        decode_weights,
+        decode_cache_hits,
+        decode_cache_misses,
+        decode_cache_hit_ns,
+        decode_cache_miss_ns,
+    } = context;
+    let executor = match Int8DecodeExecutor::new(device) {
         Ok(executor) => executor,
         Err(_) => return STATUS_EXECUTION_ERROR,
     };
-    let result = match executor.execute(&activations_i8, &weights_i8, k, n) {
+    let (cached, cache_hit) = match decode_weights.entry(key) {
+        Entry::Vacant(entry) => {
+            let Some((weights_i8, scales)) = prepare() else {
+                return STATUS_INVALID_ARGUMENT;
+            };
+            let prepared = match executor.prepare_weights(&weights_i8, key.k, key.n) {
+                Ok(prepared) => prepared,
+                Err(_) => return STATUS_EXECUTION_ERROR,
+            };
+            *decode_cache_misses = decode_cache_misses.saturating_add(1);
+            (entry.insert(CachedW8A8Weight { prepared, scales }), false)
+        }
+        Entry::Occupied(entry) => {
+            *decode_cache_hits = decode_cache_hits.saturating_add(1);
+            (entry.into_mut(), true)
+        }
+    };
+
+    let result = match executor.execute_prepared(&activations_i8, &cached.prepared) {
         Ok(result) => result,
         Err(_) => return STATUS_EXECUTION_ERROR,
     };
     for ((dst, &acc), &weight_scale) in output_n_f32
         .iter_mut()
         .zip(&result.values)
-        .zip(&weight_scales)
+        .zip(&cached.scales)
     {
         *dst = acc as f32 * activation_scale * weight_scale;
+    }
+    let elapsed_ns = u64::try_from(call_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    if cache_hit {
+        *decode_cache_hit_ns = decode_cache_hit_ns.saturating_add(elapsed_ns);
+    } else {
+        *decode_cache_miss_ns = decode_cache_miss_ns.saturating_add(elapsed_ns);
     }
     STATUS_OK
 }
@@ -98,9 +221,49 @@ pub extern "C" fn rocknpu_device_count() -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn rocknpu_context_create() -> *mut RockNpuContext {
     match RocketDevice::open() {
-        Ok(device) => Box::into_raw(Box::new(RockNpuContext { device })),
+        Ok(device) => Box::into_raw(Box::new(RockNpuContext {
+            device,
+            decode_weights: HashMap::new(),
+            decode_cache_hits: 0,
+            decode_cache_misses: 0,
+            decode_cache_hit_ns: 0,
+            decode_cache_miss_ns: 0,
+        })),
         Err(_) => ptr::null_mut(),
     }
+}
+
+/// Read lazy W8A8 decode-cache statistics for diagnostics.
+///
+/// # Safety
+/// `context` must be a live RockNPU context and `out` must point to writable
+/// storage for one [`RockNpuDecodeCacheStats`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rocknpu_context_decode_cache_stats(
+    context: *const RockNpuContext,
+    out: *mut RockNpuDecodeCacheStats,
+) -> i32 {
+    if context.is_null() || out.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: both pointers were checked above and are required by the C ABI to
+    // remain valid for this synchronous call.
+    let context = unsafe { &*context };
+    let resident_bytes = context.decode_weights.values().fold(0usize, |acc, cached| {
+        acc.saturating_add(cached.prepared.stats().resident_bytes)
+    });
+    // SAFETY: out is non-null and caller provides writable storage for one stats value.
+    unsafe {
+        *out = RockNpuDecodeCacheStats {
+            hits: context.decode_cache_hits,
+            misses: context.decode_cache_misses,
+            entries: context.decode_weights.len(),
+            resident_bytes,
+            hit_ns: context.decode_cache_hit_ns,
+            miss_ns: context.decode_cache_miss_ns,
+        };
+    }
+    STATUS_OK
 }
 
 /// Destroy a context returned by [`rocknpu_context_create`].
@@ -265,17 +428,16 @@ pub unsafe extern "C" fn rocknpu_matmul_q4_k_f32_f32(
     };
 
     if m == 1 {
-        let mut weights = Vec::with_capacity(weight_values);
-        let mut decoded = [0.0f32; Q4_K_VALUES_PER_BLOCK];
-        for bytes in weight_bytes.chunks_exact(size_of::<BlockQ4K>()) {
-            let block: BlockQ4K = pod_read_unaligned(bytes);
-            dequantize_q4_k(&block, &mut decoded);
-            weights.extend_from_slice(&decoded);
-        }
-        if weights.len() != weight_values {
-            return STATUS_INVALID_ARGUMENT;
-        }
-        return execute_w8a8_m1(context, &weights, activations, output, k, n);
+        let key = DecodeWeightKey {
+            address: weight_bytes.as_ptr() as usize,
+            bytes: weight_bytes.len(),
+            k,
+            n,
+            kind: DecodeWeightKind::Q4K,
+        };
+        return execute_cached_w8a8_m1(context, key, activations, output, || {
+            prepare_q4_k_w8a8(weight_bytes, k, n)
+        });
     }
 
     let mut weights = Vec::with_capacity(weight_values);
@@ -374,17 +536,16 @@ pub unsafe extern "C" fn rocknpu_matmul_q6_k_f32_f32(
     };
 
     if m == 1 {
-        let mut weights = Vec::with_capacity(weight_values);
-        let mut decoded = [0.0f32; Q6_K_VALUES_PER_BLOCK];
-        for bytes in weight_bytes.chunks_exact(size_of::<BlockQ6K>()) {
-            let block: BlockQ6K = pod_read_unaligned(bytes);
-            dequantize_q6_k(&block, &mut decoded);
-            weights.extend_from_slice(&decoded);
-        }
-        if weights.len() != weight_values {
-            return STATUS_INVALID_ARGUMENT;
-        }
-        return execute_w8a8_m1(context, &weights, activations, output, k, n);
+        let key = DecodeWeightKey {
+            address: weight_bytes.as_ptr() as usize,
+            bytes: weight_bytes.len(),
+            k,
+            n,
+            kind: DecodeWeightKind::Q6K,
+        };
+        return execute_cached_w8a8_m1(context, key, activations, output, || {
+            prepare_q6_k_w8a8(weight_bytes, k, n)
+        });
     }
 
     let mut weights = Vec::with_capacity(weight_values);

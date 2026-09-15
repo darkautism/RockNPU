@@ -345,7 +345,7 @@ GGML_BACKEND_PATH="$GGML_BACKEND_PATH" \
 
 You do **not** need to modify llama.cpp source or pass a RockNPU-specific `--device` workaround. The GGML scheduler discovers `ROCKNPU0` through the plugin and sends supported operations to it; unsupported operations remain available to the other registered backends rather than being silently emulated inside the RockNPU adapter.
 
-The currently validated GGML slice is deliberately narrow: contiguous `GGML_OP_MUL_MAT` with F16, Q4_K, or Q6_K weights and F32 activations. Real TinyLlama Q4_K_M prefill and autoregressive decode are now hardware-proven. The `M=4` prefill projections use the FP16 correctness bridge; quantized Q4_K/Q6_K `M=1` projections with `K % 512 == 0`, `N % 32 == 0`, and `N <= 8192` use the W8A8/INT8 decode path through upstream Rocket. With prompt `The capital of` and greedy `-n 2`, stock CPU and RockNPU both produce `" the United"`; the traced RockNPU run executes 157 `M=1` W8A8 MatMuls (three output-pruned final-layer FFN projections during prefill plus all `22 x 7 = 154` transformer-block projections for the autoregressive decode step). The `N=32000` output head remains on CPU by design. This path is correctness-first: it currently dequantizes, requantizes, allocates, and repacks static weights for every `M=1` call, so it is not yet a decode-performance claim.
+The currently validated GGML slice is deliberately narrow: contiguous `GGML_OP_MUL_MAT` with F16, Q4_K, or Q6_K weights and F32 activations. Real TinyLlama Q4_K_M prefill and autoregressive decode are hardware-proven. The `M=4` prefill projections use the FP16 correctness bridge; quantized Q4_K/Q6_K `M=1` projections with `K % 512 == 0`, `N % 32 == 0`, and `N <= 8192` use the W8A8/INT8 decode path through upstream Rocket. Static decode weights are lazily dequantized/requantized once, packed into Rocket-resident INT8 BOs, and then reused by later tokens. With prompt `The capital of` and greedy `-n 3`, stock CPU and RockNPU both produce `" the United States"`. The traced run builds 154 resident projection entries (924 MiB), then reports 154 misses and 157 hits across 311 `M=1` calls. Direct C-ABI timing measured `132.921 ms` average on cache misses versus `2.573 ms` on hits, about a `51.7x` reduction in per-projection hot-path cost. The `N=32000` output head remains on CPU by design; decode is functional and much faster after warmup, but still not competitive with optimized llama.cpp CPU decode yet.
 
 For exact backend ABI constraints, correctness tests and the pinned llama.cpp validation revision, see [`adapters/ggml-rocknpu/README.md`](adapters/ggml-rocknpu/README.md) and [`docs/repro.md`](docs/repro.md).
 
@@ -371,7 +371,7 @@ cargo run --release -p rocket-smoke --bin int8_decode_m1 -- 2048 5632
 cargo run --release -p rocket-smoke --bin int8_decode_widek
 ```
 
-All four gates bit-match their CPU int32 references on the verified RK3588 host. The same primitive is now wired into quantized stock GGML `M=1` execution; see the real TinyLlama `-n 2` gate in [`docs/repro.md`](docs/repro.md).
+All four gates bit-match their CPU int32 references on the verified RK3588 host. `int8_decode_m1` now also prepares the static weight BO once and exact-checks both first use and reuse. The same prepared primitive backs quantized stock GGML `M=1` execution; see the resident-cache TinyLlama `-n 3` gate in [`docs/repro.md`](docs/repro.md).
 
 ### Real pretrained model gates
 

@@ -10,6 +10,15 @@ extern "C" {
 
 typedef struct RockNpuContext rocknpu_context;
 
+typedef struct rocknpu_decode_cache_stats {
+    size_t hits;
+    size_t misses;
+    size_t entries;
+    size_t resident_bytes;
+    uint64_t hit_ns;
+    uint64_t miss_ns;
+} rocknpu_decode_cache_stats;
+
 enum rocknpu_status {
     ROCKNPU_STATUS_OK = 0,
     ROCKNPU_STATUS_INVALID_ARGUMENT = -1,
@@ -19,6 +28,9 @@ enum rocknpu_status {
 
 size_t rocknpu_device_count(void);
 rocknpu_context * rocknpu_context_create(void);
+int rocknpu_context_decode_cache_stats(
+    const rocknpu_context * context,
+    rocknpu_decode_cache_stats * out);
 void rocknpu_context_destroy(rocknpu_context * context);
 
 int rocknpu_matmul_f16_f32_f32(

@@ -820,9 +820,9 @@ GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" \
 
 Accepted result: `3/3 tests passed`, `Backend ROCKNPU: OK`.
 
-The Q4_K/Q6_K bridge forwards raw GGML quantized blocks into Rust. `M>=4` uses the existing FP16 correctness bridge. Supported `M=1` calls are dequantized and requantized to W8A8 in Rust, executed as INT8 MatMul through Rocket, then rescaled from int32 to F32. This is correctness-first; current M=1 execution rebuilds the static weight conversion/packing on every call and is not a throughput claim.
+The Q4_K/Q6_K bridge forwards raw GGML quantized blocks into Rust. `M>=4` uses the existing FP16 correctness bridge. Supported `M=1` weights are lazily dequantized/requantized to W8A8 once, packed into resident Rocket BOs, cached by stable GGML weight identity plus dtype/shape, then reused across decode tokens. Each call only quantizes the activation, submits INT8 MatMul through Rocket, and rescales int32 output to F32.
 
-For a real-model gate, first run stock CPU with the four-token prompt `The capital of` and `-n 2`; greedy generation produces `" the United"`. Then run:
+For the resident-cache real-model gate, first run stock CPU with the four-token prompt `The capital of` and `-n 3`; greedy generation produces `" the United States"`. Then run:
 
 ```sh
 ROCKNPU_GGML_TRACE=1 \
@@ -830,10 +830,10 @@ GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" \
   /build/llama.cpp-reference/build-dl/bin/llama-completion \
   -fit off -ngl 0 \
   -m artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf \
-  -no-cnv -p "The capital of" -n 2 --temp 0 --no-warmup --verbose-prompt
+  -no-cnv -p "The capital of" -n 3 --temp 0 --no-warmup --verbose-prompt
 ```
 
-The RockNPU run produces the same `" the United"` continuation. Opt-in execution tracing at the actual backend boundary proves the transition from M=4 prefill to true M=1 decode:
+The RockNPU run produces the same `" the United States"` continuation. Opt-in execution tracing at the actual backend boundary proves the transition from M=4 prefill to true M=1 decode and exposes cache behavior:
 
 ```text
 ROCKNPU GGML TRACE mul_mat weight=blk.0.attn_q.weight type=q4_K M=4 K=2048 N=2048 path=fp16_bridge
@@ -842,10 +842,11 @@ ROCKNPU GGML TRACE mul_mat weight=blk.21.ffn_gate.weight type=q4_K M=1 K=2048 N=
 ROCKNPU GGML TRACE mul_mat weight=blk.21.ffn_down.weight type=q4_K M=1 K=5632 N=2048 path=w8a8_m1
 ROCKNPU GGML TRACE mul_mat weight=blk.0.attn_q.weight type=q4_K M=1 K=2048 N=2048 path=w8a8_m1
 ...
-ROCKNPU GGML TRACE summary q4_K_mul_mat=268 q6_K_mul_mat=40 f16_mul_mat=0 w8a8_m1_mul_mat=157
+ROCKNPU GGML TRACE summary q4_K_mul_mat=402 q6_K_mul_mat=60 f16_mul_mat=0 w8a8_m1_mul_mat=311
+ROCKNPU GGML TRACE decode_cache hits=157 misses=154 entries=154 resident_mb=924.00 hit_ms=403.93 hit_avg_ms=2.573 miss_ms=20469.88 miss_avg_ms=132.921
 ```
 
-The 157 `w8a8_m1` calls consist of the three output-pruned final-layer FFN projections during prefill plus all 154 (`22 layers x 7`) transformer-block projections for the subsequent autoregressive token. `output.weight` remains on CPU because its N=32000 exceeds the deliberately validated W8A8 limit N<=8192. This is the first stock llama.cpp autoregressive decode gate through RockNPU -> Rocket -> real RK3588 NPU.
+The cache contains exactly the 154 transformer-block projection weights (`22 layers x 7`). Across the `-n 3` run it records 154 misses while the cache is populated and 157 hits as already prepared weights are reused. Direct timing at the C ABI boundary gives `132.921 ms` average per miss versus `2.573 ms` average per hit, a `51.7x` hot-path reduction. The 157 hit calls total `403.93 ms`; 154 full-token projection calls at the same measured average are about `396 ms` before the remaining CPU-side model work. This is still slower than the separately measured optimized llama.cpp CPU decode baseline (~49.4 ms/token), so the next target is multi-core N-split / submit consolidation rather than more host packing work. `output.weight` remains on CPU because N=32000 exceeds the W8A8 N<=8192 envelope.
 
 ### W8A8 M=1 decode through upstream Rocket
 
@@ -885,4 +886,4 @@ Observed gate:
 INT8 WIDE-K DECODE PASS M=1 K=5632 N=2048 slices=6 outputs=2048 submit_wait_us=4121.8 host_accum_us=32.1
 ```
 
-These timings are first correctness measurements, not optimized throughput claims. The reusable executor's first-submit measurements also show that current host packing dominates NPU compute (for example K=2048,N=5632 was about 158 ms packing versus about 4 ms NPU submit/wait in one observed run). GGML M=1 routing and symmetric W8A8 scaling are now integrated and validated above; resident/prepacked weights, cached regcmds, and multi-core N-column splitting remain the major performance work.
+The prepared-weight hardware gate exact-checks both the first execution and a second reuse of the same Rocket-resident BO. Representative observations: K=2048,N=5632 prepares once in about `134.7 ms`, then per-call host staging is about `0.02 ms` and NPU submit/wait about `3.9-4.1 ms`; K=5632,N=2048 prepares once in about `89.4 ms`, then staging is about `0.07 ms` and NPU submit/wait about `4.4 ms`. GGML now uses this prepared path automatically. Cached regcmds, multi-core N-column splitting, and submit consolidation remain the major performance work.
