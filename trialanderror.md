@@ -182,3 +182,49 @@ The stock median is deliberately recorded as +4.82%, not rounded into a >5% clai
 - FFN-down `K=5632,N=2048` N3/K3 tuning is noisy across fresh processes: five observed fresh tuner outcomes split 3x K3 / 2x N3 because the candidates are close to the 5% selection threshold. A stronger same-pool exact-output smoke with 7 warmups + 51 interleaved reps measured N3 median `1.622 ms` and K3 median `1.569 ms` (`1.0336x` K3 advantage). This can be used later to reduce tuner variability, but its whole-token ceiling is roughly 1.4 ms/token (<1%), so it is not a current priority.
 - `GGML_SCHED_DEBUG=2` on the pinned llama.cpp decode graph showed 221 backend splits for a single TinyLlama decode graph: 111 CPU and 110 ROCKNPU, nearly alternating. Representative CPU op counts were RMS_NORM 45, MUL 45, ROPE 44, SET_ROWS 44, ADD 44, FLASH_ATTN 22, SWIGLU 22, plus small GET_ROWS/output-head work. This motivated testing whether scheduler partition boundaries themselves were a large avoidable cost.
 - A pure-userspace opt-in prototype made ROCKNPU claim CPU-supported ops and delegated non-NPU graph views to the pinned upstream GGML CPU backend while keeping native MUL_MAT on RockNPU. It preserved upstream CPU math and shared the same host buffer type, but it still had about 111 CPU delegate groups/token because the CPU/NPU dependencies are real. With no attached persistent CPU threadpool, GGML creates/frees a disposable threadpool for every delegated group; 8-thread delegation is structurally poor. A 1-thread triage avoided extra worker creation but still measured `4.36 ± 0.37 t/s` on `tg32,r=3`, while the immediately adjacent authoritative-main run under the same board conditions measured `5.27 ± 0.46 t/s`. This is a cross-process rejection/triage, not a formal fine-grained speedup claim; the gap is large enough that generic backend-label merging is not worth productionizing. A materially different future route would need to eliminate/fuse dependent CPU work or genuinely share the caller's persistent threadpool, not merely move the same ~111 segments inside the RockNPU plugin.
+
+
+## 2026-09-16 — RK3588 stock Rocket 200 MHz frequency trap and 700 MHz correction
+
+### Stock mainline state was genuinely fixed at 200 MHz
+
+- Both RK3588 boards were running the packaged mainline `rocket` module with no NPU devfreq device and no frequency ioctl/module parameter. The live DT assigns the shared NPU compute clock 200 MHz.
+- A load-time sampler on the stock validator observed 166 samples during real TinyLlama decode: `scmi_clk_npu` stayed exactly `200000000` for every sample; DDR stayed `2112000000`; `aclk_npu0/1/2` and `clk_npu_dsu0` stayed `250000000`.
+- Therefore the earlier ~5 tok/s decode measurements were real **200 MHz-class** NPU measurements, not an idle-clock reporting artifact.
+- CPU policies were also initially `ondemand`. Locking all three CPU policies to `performance` and using only the four Cortex-A76 cores (`taskset -c 4-7`, llama.cpp `-t 4`) improved the native-W8 `tg32,r=3` result from `5.02 ± 0.54 t/s` to `5.85 ± 0.41 t/s` while NPU remained at 200 MHz. Do not benchmark RK3588 decode with `-t 8`; the A55 cores add threadpool/barrier contention.
+
+### Controlled 700 MHz setup
+
+- For benchmarking only, both boards were switched at runtime from the packaged stock module to the public experimental Rocket devfreq reference `sky-rk3588/rk3588-npu-gpu@ed52a89afa8e68fedf636c8e891bd8fc47e82d26`, built against the exact running `6.18.43-current-rockchip64` headers.
+- No DTB/boot/kernel image change was made. NPU rail stayed at the board's existing 800 mV. The devfreq ceiling was capped at `700000000` and the `userspace` governor target was set to `700000000`.
+- The driver guards NPU power-domain transitions by returning the compute clock to the safe 200 MHz rate; do not replace this with raw CRU or `/dev/mem` clock writes.
+- A stock-validator `freq_probe` exact resident-MatMul gate passed at target/cur/max 700 MHz. Current run: `M256 K512 N128`, 41 reps, `wait=0.173539 ms`, `wait-effective=193.35 GFLOP/s`. This is clearly faster than the prior controlled 200 MHz reference (`0.399286 ms`, `84.04 GFLOP/s`), although it did not reproduce the best historical 700 MHz wait (`0.125-0.131 ms`).
+
+The operator guide for build/swap/set/restore is now in `README.md` (introduced by commit `10af99a`, `Document RK3588 700MHz benchmark setup`). Reboot or restoring the packaged module returns to the stock 200 MHz-class state.
+
+### Whole-model decode at 700 MHz
+
+Pinned llama.cpp source remained `391fac16460f15233a7740550d858ac96df3419d`. CPU policies were `performance`; decode used four A76 cores; NPU target/cur was 700 MHz.
+
+Production Q4_K_M -> resident-W8 path, `tg32,r=3`:
+
+- stock validator: `10.17 ± 1.74 t/s`
+- exploration board: `10.86 ± 1.94 t/s`
+
+The independently generated native-W8 sidecar path on the stock validator measured:
+
+- `tg32,r=3`: `11.34 ± 1.41 t/s`
+- `tg32,r=6`: **`11.53 ± 0.89 t/s`**
+
+Thus NPU frequency was a major hidden limiter: the cleaner native-W8 path rose from about `5.85 t/s` at the corrected 200 MHz/CPU setup to about `11.53 t/s` at 700 MHz, roughly a 1.97x throughput increase. However, frequency alone does **not** close the gap to Rockchip's published TinyLlama W8A8 figure (~24.43 tok/s under their benchmark conditions). Current open-path native-W8 decode remains roughly 2.1x below that published target, so execution/dataflow remains the primary optimization problem.
+
+### IRQ/cpuidle A/B did not help this decode path
+
+The exploration board initially had the NPU IRQ effective on CPU0 (A55) and CPU6 cpuidle state1 enabled. The reference project's fast-boot recipe recommends IRQ -> CPU6 plus disabling CPU6 state1, so this was tested at 700 MHz. Production `tg32,r=3` changed from `10.86 ± 1.94 t/s` to `10.69 ± 2.16 t/s`, i.e. no measurable gain. Both settings were reverted and are not part of the RockNPU README benchmark recipe.
+
+### Decision / interpretation
+
+- Any future RK3588 performance claim must state the NPU frequency. A 200 MHz stock-Rocket number must not be presented as the silicon's normal high-performance ceiling.
+- Use the 700 MHz/800 mV experimental setup only for controlled performance investigation; production remains a userspace project over the packaged Rocket unless that project policy is explicitly changed.
+- Native W8 removes Q4->W8 conversion/quantization-format ambiguity but does not itself provide the missing ~2x to the published closed-stack result.
+- The exact `freq_probe` gate demonstrates hardware correctness at 700 MHz, but it does not repair the previously observed whole-model CPU-reference logit divergence of the approximate W8A8 inference path. Performance and model-semantic correctness remain separate acceptance gates.
