@@ -152,3 +152,24 @@ The stock median is deliberately recorded as +4.82%, not rounded into a >5% clai
 - `ROCKNPU_QKV_TRIPLE=0` remains the rollback/A-B isolation switch.
 - Keep the two-observation stability gate; saving one extra warmup token is not worth weakening model-generation safety.
 - Do not claim kernel batching or GGML scheduler fusion: this is a pure userspace backend precompute/stash optimization over the stock Rocket UAPI.
+
+## 2026-09-16 — TinyLlama vocab/output-head offload dead ends
+
+### Wide-N W8A8 output head: hardware-valid, quality-invalid
+
+- TinyLlama `output.weight` is Q6_K with decode geometry `M=1,K=2048,N=32000`; main keeps it on CPU because the normal RockNPU W8A8 path caps a single decode projection at `N<=8192`.
+- A pure-userspace experiment split `N=32000` into stock-compatible W8A8 waves (`24576 + 7424` rows). Real trace confirmed `output.weight ... path=w8a8_m1_wide_n`; no kernel/module change was used.
+- The hardware route completed and added the expected ~62.5 MiB resident W8 head cache (`~924 -> ~986.5 MiB`).
+- The deterministic 24-token TinyLlama gate diverged immediately after `Paris.` into a different continuation. This is output-logit quantization error, not an N-tiling failure: Q6_K -> per-row W8 is not a production-quality-equivalent output-head replacement.
+- **Decision:** do not promote or retry W8 output-head offload without a materially different logits-preserving quantization scheme.
+
+### Resident FP16 output head via padded M=4: quality-valid, performance-invalid
+
+- The existing FP16 prepacked pool requires `M % 4 == 0`. An opt-in experiment therefore dequantized the static Q6_K head once into resident FP16, padded the real M=1 activation to M=4 with three zero rows, ran the existing three-core prepared FP16 pool, and returned only row 0 logits.
+- Real trace confirmed `output.weight type=q6_K M=1 K=2048 N=32000 path=fp16_m4_wide_n` and the deterministic 24-token continuation remained exactly equal to production: `Paris. -> 2. B.C. -> Beijing. -> 3. A`.
+- A first single-context env-toggle ABBA appeared positive (~+5%), but dedicated dispatch tracing proved it was **invalid**: llama.cpp scheduler graph reuse fixed the output-head backend after the first graph build, so changing `ROCKNPU_WIDE_N_FP16` between reps did not reroute the head. Do not reuse that benchmark method for backend-routing comparisons.
+- A valid same-process benchmark used one loaded model with two independent llama contexts: B was created/warmed with CPU output head, A with RockNPU FP16 output head. Dedicated dispatch trace showed B had zero FP16-head dispatches while A dispatched `N=32000` once per generated token. Both contexts were fully warmed before `tg32`, `r=12`, B,A,A,B timing.
+- B samples ns: `[7807287060, 7300489171, 7313049513, 7834310876, 7875517732, 9206511897]`.
+- A samples ns: `[8500388395, 8209864108, 8512710945, 7914259689, 8232033508, 8405309782]`.
+- Medians: `7820798968 -> 8318671645 ns`; time ratio / throughput speedup `0.940150x`, i.e. about **-6.0% throughput**. The first two four-sample blocks were clearly negative (~-9.6% and ~-7.8% throughput); the final block was noise-sensitive because the last B sample rose to 9.21s, but did not overturn the negative median.
+- **Decision:** padded-M4 FP16 output-head offload is correctness-safe on this gate but slower than the optimized CPU Q6_K head. Do not promote. Reopen only if a true high-precision `M=1` NPU path becomes available without 4x M padding.
