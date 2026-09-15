@@ -34,6 +34,12 @@ impl fmt::Display for Int8DecodePoolError {
 
 impl std::error::Error for Int8DecodePoolError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Int8DecodeSplit {
+    N,
+    K,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Int8DecodePoolPreparedStats {
     pub workers: usize,
@@ -44,11 +50,20 @@ pub struct Int8DecodePoolPreparedStats {
     pub prepare_wall_ns: u128,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkerSlice {
+    k0: usize,
+    ksub: usize,
+    n0: usize,
+    nsub: usize,
+}
+
 pub struct Int8DecodePoolPreparedWeights {
     weight_id: u64,
     k: usize,
     n: usize,
-    slices: Vec<(usize, usize)>,
+    split: Int8DecodeSplit,
+    slices: Vec<WorkerSlice>,
     stats: Int8DecodePoolPreparedStats,
 }
 
@@ -65,6 +80,10 @@ impl Int8DecodePoolPreparedWeights {
         self.stats.workers
     }
 
+    pub const fn split(&self) -> Int8DecodeSplit {
+        self.split
+    }
+
     pub const fn stats(&self) -> Int8DecodePoolPreparedStats {
         self.stats
     }
@@ -72,6 +91,7 @@ impl Int8DecodePoolPreparedWeights {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Int8DecodePoolStats {
+    pub split: Int8DecodeSplit,
     pub workers_used: usize,
     pub npu_tasks: usize,
     pub wall_ns: u128,
@@ -89,23 +109,19 @@ enum WorkerCommand {
         request_id: u64,
         weight_id: u64,
         weights: Arc<[i8]>,
-        k: usize,
-        n0: usize,
-        nsub: usize,
+        full_k: usize,
+        slice: WorkerSlice,
     },
     RunPrepared {
         request_id: u64,
         weight_id: u64,
         activation: Arc<[i8]>,
-        k: usize,
-        n0: usize,
-        nsub: usize,
+        slice: WorkerSlice,
     },
     Release {
         request_id: u64,
         weight_id: u64,
-        n0: usize,
-        nsub: usize,
+        slice: WorkerSlice,
     },
     Stop,
 }
@@ -119,8 +135,7 @@ enum WorkerResponse {
 struct WorkerResult {
     request_id: u64,
     worker: usize,
-    n0: usize,
-    nsub: usize,
+    slice: WorkerSlice,
     response: WorkerResponse,
 }
 
@@ -174,32 +189,25 @@ impl Int8DecodePool {
                             request_id,
                             weight_id,
                             weights,
-                            k,
-                            n0,
-                            nsub,
+                            full_k,
+                            slice,
                         } => {
-                            let begin = n0.saturating_mul(k);
-                            let end = n0.saturating_add(nsub).saturating_mul(k);
                             let prepared = if resident.contains_key(&weight_id) {
                                 Err(format!("worker {worker}: duplicate resident weight id"))
-                            } else if end > weights.len() {
-                                Err(format!("worker {worker}: weight slice out of range"))
                             } else {
-                                match executor.prepare_weights(&weights[begin..end], k, nsub) {
-                                    Ok(prepared) => {
+                                prepare_worker_weights(&executor, &weights, full_k, slice)
+                                    .map(|prepared| {
                                         let stats = prepared.stats();
                                         resident.insert(weight_id, prepared);
-                                        Ok(stats)
-                                    }
-                                    Err(err) => Err(format!("worker {worker}: {err}")),
-                                }
+                                        stats
+                                    })
+                                    .map_err(|err| format!("worker {worker}: {err}"))
                             };
                             if result_tx
                                 .send(WorkerResult {
                                     request_id,
                                     worker,
-                                    n0,
-                                    nsub,
+                                    slice,
                                     response: WorkerResponse::Prepared(prepared),
                                 })
                                 .is_err()
@@ -211,15 +219,22 @@ impl Int8DecodePool {
                             request_id,
                             weight_id,
                             activation,
-                            k,
-                            n0,
-                            nsub,
+                            slice,
                         } => {
                             let output = match resident.get(&weight_id) {
-                                Some(prepared) if prepared.k() == k && prepared.n() == nsub => {
-                                    executor
-                                        .execute_prepared(&activation, prepared)
-                                        .map_err(|err| format!("worker {worker}: {err}"))
+                                Some(prepared)
+                                    if prepared.k() == slice.ksub && prepared.n() == slice.nsub =>
+                                {
+                                    let end = slice.k0.saturating_add(slice.ksub);
+                                    if end > activation.len() {
+                                        Err(format!(
+                                            "worker {worker}: activation slice out of range"
+                                        ))
+                                    } else {
+                                        executor
+                                            .execute_prepared(&activation[slice.k0..end], prepared)
+                                            .map_err(|err| format!("worker {worker}: {err}"))
+                                    }
                                 }
                                 Some(_) => Err(format!("worker {worker}: resident shape mismatch")),
                                 None => {
@@ -230,8 +245,7 @@ impl Int8DecodePool {
                                 .send(WorkerResult {
                                     request_id,
                                     worker,
-                                    n0,
-                                    nsub,
+                                    slice,
                                     response: WorkerResponse::Ran(output),
                                 })
                                 .is_err()
@@ -242,16 +256,14 @@ impl Int8DecodePool {
                         WorkerCommand::Release {
                             request_id,
                             weight_id,
-                            n0,
-                            nsub,
+                            slice,
                         } => {
                             resident.remove(&weight_id);
                             if result_tx
                                 .send(WorkerResult {
                                     request_id,
                                     worker,
-                                    n0,
-                                    nsub,
+                                    slice,
                                     response: WorkerResponse::Released,
                                 })
                                 .is_err()
@@ -300,10 +312,17 @@ impl Int8DecodePool {
         n: usize,
         requested: usize,
     ) -> Result<usize, Int8DecodePoolError> {
-        if requested == 0 || requested > self.senders.len() {
-            return Err(Int8DecodePoolError::InvalidWorkerCount(requested));
-        }
+        self.validate_requested_workers(requested)?;
         Ok(split_n(n, requested)?.len())
+    }
+
+    pub fn effective_workers_for_k(
+        &self,
+        k: usize,
+        requested: usize,
+    ) -> Result<usize, Int8DecodePoolError> {
+        self.validate_requested_workers(requested)?;
+        Ok(split_k(k, requested)?.len())
     }
 
     pub fn prepare_weights(
@@ -313,29 +332,37 @@ impl Int8DecodePool {
         n: usize,
         workers: usize,
     ) -> Result<Int8DecodePoolPreparedWeights, Int8DecodePoolError> {
+        self.prepare_weights_with_split(weights, k, n, workers, Int8DecodeSplit::N)
+    }
+
+    pub fn prepare_weights_with_split(
+        &mut self,
+        weights: Arc<[i8]>,
+        k: usize,
+        n: usize,
+        workers: usize,
+        split: Int8DecodeSplit,
+    ) -> Result<Int8DecodePoolPreparedWeights, Int8DecodePoolError> {
         if weights.len() != n.saturating_mul(k) {
             return Err(Int8DecodePoolError::InvalidInput(
                 "weights must contain exactly N*K elements",
             ));
         }
-        if workers == 0 || workers > self.senders.len() {
-            return Err(Int8DecodePoolError::InvalidWorkerCount(workers));
-        }
-        let slices = split_n(n, workers)?;
+        self.validate_requested_workers(workers)?;
+        let slices = worker_slices(k, n, workers, split)?;
         let request_id = self.allocate_request_id();
         let weight_id = self.next_weight_id;
         self.next_weight_id = self.next_weight_id.wrapping_add(1);
         let start = Instant::now();
 
-        for (worker, &(n0, nsub)) in slices.iter().enumerate() {
+        for (worker, &slice) in slices.iter().enumerate() {
             self.senders[worker]
                 .send(WorkerCommand::Prepare {
                     request_id,
                     weight_id,
                     weights: Arc::clone(&weights),
-                    k,
-                    n0,
-                    nsub,
+                    full_k: k,
+                    slice,
                 })
                 .map_err(|_| Int8DecodePoolError::ChannelClosed)?;
         }
@@ -376,6 +403,7 @@ impl Int8DecodePool {
             weight_id,
             k,
             n,
+            split,
             slices,
             stats,
         })
@@ -393,15 +421,13 @@ impl Int8DecodePool {
         }
         let request_id = self.allocate_request_id();
         let start = Instant::now();
-        for (worker, &(n0, nsub)) in weights.slices.iter().enumerate() {
+        for (worker, &slice) in weights.slices.iter().enumerate() {
             self.senders[worker]
                 .send(WorkerCommand::RunPrepared {
                     request_id,
                     weight_id: weights.weight_id,
                     activation: Arc::clone(&activation),
-                    k: weights.k,
-                    n0,
-                    nsub,
+                    slice,
                 })
                 .map_err(|_| Int8DecodePoolError::ChannelClosed)?;
         }
@@ -420,15 +446,29 @@ impl Int8DecodePool {
                     ));
                 }
             };
-            if output.values.len() != result.nsub
-                || result.n0.saturating_add(result.nsub) > weights.n
+            if output.values.len() != result.slice.nsub
+                || result.slice.n0.saturating_add(result.slice.nsub) > weights.n
             {
                 return Err(Int8DecodePoolError::Worker(format!(
                     "worker {} returned invalid output geometry",
                     result.worker
                 )));
             }
-            values[result.n0..result.n0 + result.nsub].copy_from_slice(&output.values);
+            match weights.split {
+                Int8DecodeSplit::N => {
+                    values[result.slice.n0..result.slice.n0 + result.slice.nsub]
+                        .copy_from_slice(&output.values);
+                }
+                Int8DecodeSplit::K => {
+                    for (sum, partial) in values.iter_mut().zip(output.values) {
+                        *sum = sum.checked_add(partial).ok_or_else(|| {
+                            Int8DecodePoolError::Worker(
+                                "K-split host int32 accumulation overflow".to_string(),
+                            )
+                        })?;
+                    }
+                }
+            }
             npu_tasks = npu_tasks.saturating_add(output.stats.npu_tasks);
             worker_total_ns[result.worker] = output.stats.total_ns;
         }
@@ -436,6 +476,7 @@ impl Int8DecodePool {
         Ok(Int8DecodePoolOutput {
             values,
             stats: Int8DecodePoolStats {
+                split: weights.split,
                 workers_used: weights.slices.len(),
                 npu_tasks,
                 wall_ns: start.elapsed().as_nanos(),
@@ -449,6 +490,13 @@ impl Int8DecodePool {
         weights: &Int8DecodePoolPreparedWeights,
     ) -> Result<(), Int8DecodePoolError> {
         self.release_weight_id(weights.weight_id, &weights.slices)
+    }
+
+    fn validate_requested_workers(&self, workers: usize) -> Result<(), Int8DecodePoolError> {
+        if workers == 0 || workers > self.senders.len() {
+            return Err(Int8DecodePoolError::InvalidWorkerCount(workers));
+        }
+        Ok(())
     }
 
     fn allocate_request_id(&mut self) -> u64 {
@@ -477,16 +525,15 @@ impl Int8DecodePool {
     fn release_weight_id(
         &mut self,
         weight_id: u64,
-        slices: &[(usize, usize)],
+        slices: &[WorkerSlice],
     ) -> Result<(), Int8DecodePoolError> {
         let request_id = self.allocate_request_id();
-        for (worker, &(n0, nsub)) in slices.iter().enumerate() {
+        for (worker, &slice) in slices.iter().enumerate() {
             self.senders[worker]
                 .send(WorkerCommand::Release {
                     request_id,
                     weight_id,
-                    n0,
-                    nsub,
+                    slice,
                 })
                 .map_err(|_| Int8DecodePoolError::ChannelClosed)?;
         }
@@ -513,33 +560,109 @@ impl Drop for Int8DecodePool {
     }
 }
 
+fn prepare_worker_weights(
+    executor: &Int8DecodeExecutor<'_>,
+    weights: &[i8],
+    full_k: usize,
+    slice: WorkerSlice,
+) -> Result<Int8PreparedWeights, crate::Int8DecodeError> {
+    if slice.k0 == 0 && slice.ksub == full_k {
+        let begin = slice.n0.saturating_mul(full_k);
+        let end = slice.n0.saturating_add(slice.nsub).saturating_mul(full_k);
+        if end > weights.len() {
+            return Err(crate::Int8DecodeError::InvalidInput(
+                "weight slice out of range",
+            ));
+        }
+        return executor.prepare_weights(&weights[begin..end], slice.ksub, slice.nsub);
+    }
+
+    let mut sliced = Vec::with_capacity(slice.nsub.saturating_mul(slice.ksub));
+    for row in slice.n0..slice.n0.saturating_add(slice.nsub) {
+        let row_start = row.saturating_mul(full_k);
+        let begin = row_start.saturating_add(slice.k0);
+        let end = begin.saturating_add(slice.ksub);
+        if end > weights.len() {
+            return Err(crate::Int8DecodeError::InvalidInput(
+                "weight slice out of range",
+            ));
+        }
+        sliced.extend_from_slice(&weights[begin..end]);
+    }
+    executor.prepare_weights(&sliced, slice.ksub, slice.nsub)
+}
+
+fn worker_slices(
+    k: usize,
+    n: usize,
+    workers: usize,
+    split: Int8DecodeSplit,
+) -> Result<Vec<WorkerSlice>, Int8DecodePoolError> {
+    match split {
+        Int8DecodeSplit::N => Ok(split_n(n, workers)?
+            .into_iter()
+            .map(|(n0, nsub)| WorkerSlice {
+                k0: 0,
+                ksub: k,
+                n0,
+                nsub,
+            })
+            .collect()),
+        Int8DecodeSplit::K => Ok(split_k(k, workers)?
+            .into_iter()
+            .map(|(k0, ksub)| WorkerSlice {
+                k0,
+                ksub,
+                n0: 0,
+                nsub: n,
+            })
+            .collect()),
+    }
+}
+
 fn split_n(n: usize, workers: usize) -> Result<Vec<(usize, usize)>, Int8DecodePoolError> {
     if n == 0 || !n.is_multiple_of(32) {
         return Err(Int8DecodePoolError::InvalidInput(
             "N must be non-zero and 32-aligned",
         ));
     }
+    split_blocks(n / 32, 32, workers)
+}
+
+fn split_k(k: usize, workers: usize) -> Result<Vec<(usize, usize)>, Int8DecodePoolError> {
+    if k == 0 || !k.is_multiple_of(512) {
+        return Err(Int8DecodePoolError::InvalidInput(
+            "K must be non-zero and 512-aligned",
+        ));
+    }
+    split_blocks(k / 512, 512, workers)
+}
+
+fn split_blocks(
+    blocks: usize,
+    block_width: usize,
+    workers: usize,
+) -> Result<Vec<(usize, usize)>, Int8DecodePoolError> {
     if !(1..=3).contains(&workers) {
         return Err(Int8DecodePoolError::InvalidWorkerCount(workers));
     }
-    let blocks = n / 32;
     let active = workers.min(blocks);
     let base = blocks / active;
     let extra = blocks % active;
     let mut slices = Vec::with_capacity(active);
-    let mut n0 = 0usize;
+    let mut start = 0usize;
     for worker in 0..active {
         let worker_blocks = base + usize::from(worker < extra);
-        let nsub = worker_blocks * 32;
-        slices.push((n0, nsub));
-        n0 += nsub;
+        let width = worker_blocks * block_width;
+        slices.push((start, width));
+        start += width;
     }
     Ok(slices)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::split_n;
+    use super::{split_k, split_n};
 
     #[test]
     fn three_way_tinyllama_gate_split_is_aligned_and_complete() {
@@ -553,5 +676,13 @@ mod tests {
     fn requested_workers_are_capped_by_channel_blocks() {
         assert_eq!(split_n(32, 3).unwrap(), vec![(0, 32)]);
         assert_eq!(split_n(64, 3).unwrap(), vec![(0, 32), (32, 32)]);
+    }
+
+    #[test]
+    fn three_way_wide_k_split_is_aligned_and_complete() {
+        let slices = split_k(5632, 3).unwrap();
+        assert_eq!(slices, vec![(0, 2048), (2048, 2048), (4096, 1536)]);
+        assert_eq!(slices.iter().map(|(_, k)| k).sum::<usize>(), 5632);
+        assert!(slices.iter().all(|(k0, k)| k0 % 512 == 0 && k % 512 == 0));
     }
 }

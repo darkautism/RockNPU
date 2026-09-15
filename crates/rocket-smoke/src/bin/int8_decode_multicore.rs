@@ -16,7 +16,7 @@ type SpawnedWorkers = (
     mpsc::Receiver<WorkerResult>,
     Vec<Int8PreparedWeightStats>,
 );
-type MulticoreRun = (Vec<i32>, f64, Vec<f64>);
+type MulticoreRun = (Vec<i32>, f64, Vec<Int8DecodeOutput>);
 
 enum WorkerCommand {
     Run(Arc<[i8]>),
@@ -203,7 +203,7 @@ fn run_multicore(
     }
 
     let mut values = vec![0i32; n];
-    let mut worker_ms = vec![0.0f64; workers.len()];
+    let mut worker_outputs = Vec::with_capacity(workers.len());
     for _ in 0..workers.len() {
         let result = result_rx.recv()?;
         if result.worker >= workers.len() || result.n0 + result.nsub > n {
@@ -214,9 +214,13 @@ fn run_multicore(
             return Err(format!("worker {} returned wrong output length", result.worker).into());
         }
         values[result.n0..result.n0 + result.nsub].copy_from_slice(&output.values);
-        worker_ms[result.worker] = output.stats.total_ns as f64 / 1.0e6;
+        worker_outputs.push(output);
     }
-    Ok((values, start.elapsed().as_secs_f64() * 1.0e3, worker_ms))
+    Ok((
+        values,
+        start.elapsed().as_secs_f64() * 1.0e3,
+        worker_outputs,
+    ))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -247,8 +251,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut single_samples = Vec::with_capacity(REPS);
+    let mut single_pack_samples = Vec::with_capacity(REPS);
+    let mut single_submit_samples = Vec::with_capacity(REPS);
+    let mut single_accum_samples = Vec::with_capacity(REPS);
+    let mut single_other_samples = Vec::with_capacity(REPS);
     let mut multi_samples = Vec::with_capacity(REPS);
-    let mut last_worker_ms = Vec::new();
+    let mut last_worker_stats = Vec::new();
     for rep in 0..REPS {
         if rep % 2 == 0 {
             let start = Instant::now();
@@ -256,24 +264,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let wall_ms = start.elapsed().as_secs_f64() * 1.0e3;
             verify("single sample", &output.values, &reference)?;
             single_samples.push(wall_ms);
+            single_pack_samples.push(output.stats.pack_ns as f64 / 1.0e6);
+            single_submit_samples.push(output.stats.submit_wait_ns as f64 / 1.0e6);
+            single_accum_samples.push(output.stats.host_accum_ns as f64 / 1.0e6);
+            let accounted = output
+                .stats
+                .pack_ns
+                .saturating_add(output.stats.submit_wait_ns)
+                .saturating_add(output.stats.host_accum_ns);
+            single_other_samples
+                .push(output.stats.total_ns.saturating_sub(accounted) as f64 / 1.0e6);
 
-            let (output, wall_ms, worker_ms) =
+            let (output, wall_ms, worker_outputs) =
                 run_multicore(&workers, &result_rx, Arc::clone(&a), n)?;
             verify("multicore sample", &output, &reference)?;
             multi_samples.push(wall_ms);
-            last_worker_ms = worker_ms;
+            last_worker_stats = worker_outputs.iter().map(|output| output.stats).collect();
         } else {
-            let (output, wall_ms, worker_ms) =
+            let (output, wall_ms, worker_outputs) =
                 run_multicore(&workers, &result_rx, Arc::clone(&a), n)?;
             verify("multicore sample", &output, &reference)?;
             multi_samples.push(wall_ms);
-            last_worker_ms = worker_ms;
+            last_worker_stats = worker_outputs.iter().map(|output| output.stats).collect();
 
             let start = Instant::now();
             let output = single_executor.execute_prepared(&a, &single_weights)?;
             let wall_ms = start.elapsed().as_secs_f64() * 1.0e3;
             verify("single sample", &output.values, &reference)?;
             single_samples.push(wall_ms);
+            single_pack_samples.push(output.stats.pack_ns as f64 / 1.0e6);
+            single_submit_samples.push(output.stats.submit_wait_ns as f64 / 1.0e6);
+            single_accum_samples.push(output.stats.host_accum_ns as f64 / 1.0e6);
+            let accounted = output
+                .stats
+                .pack_ns
+                .saturating_add(output.stats.submit_wait_ns)
+                .saturating_add(output.stats.host_accum_ns);
+            single_other_samples
+                .push(output.stats.total_ns.saturating_sub(accounted) as f64 / 1.0e6);
         }
     }
 
@@ -288,6 +316,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let single_median_ms = median(single_samples);
+    let single_pack_median_ms = median(single_pack_samples);
+    let single_submit_median_ms = median(single_submit_samples);
+    let single_accum_median_ms = median(single_accum_samples);
+    let single_other_median_ms = median(single_other_samples);
     let multi_median_ms = median(multi_samples);
     let speedup = single_median_ms / multi_median_ms;
     let resident_bytes: usize = multicore_prepare
@@ -299,8 +331,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|stats| stats.pack_ns as f64 / 1.0e6)
         .fold(0.0f64, f64::max);
 
+    let last_worker_breakdown_ms: Vec<_> = last_worker_stats
+        .iter()
+        .map(|stats| {
+            let accounted = stats
+                .pack_ns
+                .saturating_add(stats.submit_wait_ns)
+                .saturating_add(stats.host_accum_ns);
+            (
+                stats.pack_ns as f64 / 1.0e6,
+                stats.submit_wait_ns as f64 / 1.0e6,
+                stats.host_accum_ns as f64 / 1.0e6,
+                stats.total_ns.saturating_sub(accounted) as f64 / 1.0e6,
+                stats.total_ns as f64 / 1.0e6,
+            )
+        })
+        .collect();
     println!(
-        "INT8 MULTICORE DECODE PASS M=1 K={k} N={n} slices={slices:?} single_median_ms={single_median_ms:.3} multicore_median_ms={multi_median_ms:.3} speedup={speedup:.2}x resident_mb={:.2} max_worker_prepare_ms={prepare_wall_equivalent_ms:.3} last_worker_ms={last_worker_ms:?}",
+        "INT8 MULTICORE DECODE PASS M=1 K={k} N={n} slices={slices:?} single_median_ms={single_median_ms:.3} single_breakdown_ms=[pack:{single_pack_median_ms:.3},submit:{single_submit_median_ms:.3},accum:{single_accum_median_ms:.3},other:{single_other_median_ms:.3}] multicore_median_ms={multi_median_ms:.3} speedup={speedup:.2}x resident_mb={:.2} max_worker_prepare_ms={prepare_wall_equivalent_ms:.3} last_worker_breakdown_ms={last_worker_breakdown_ms:?}",
         resident_bytes as f64 / (1024.0 * 1024.0),
     );
 

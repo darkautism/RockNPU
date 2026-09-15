@@ -4,7 +4,9 @@ use bytemuck::pod_read_unaligned;
 use half::f16;
 use llama_gguf::tensor::quant::{BlockQ4K, BlockQ6K, dequantize_q4_k, dequantize_q6_k};
 use rocket_runtime::RocketDevice;
-use rocknpu_matmul::{Fp16MatmulExecutor, Int8DecodePool, Int8DecodePoolPreparedWeights};
+use rocknpu_matmul::{
+    Fp16MatmulExecutor, Int8DecodePool, Int8DecodePoolPreparedWeights, Int8DecodeSplit,
+};
 use std::collections::{HashMap, hash_map::Entry};
 use std::mem::size_of;
 use std::ptr;
@@ -31,22 +33,29 @@ struct DecodeWeightKey {
     kind: DecodeWeightKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecodeChoice {
+    split: Int8DecodeSplit,
+    workers: usize,
+}
+
 struct CachedW8A8Weight {
     prepared: Int8DecodePoolPreparedWeights,
     scales: Vec<f32>,
-    workers: usize,
+    choice: DecodeChoice,
 }
 
 pub struct RockNpuContext {
     device: RocketDevice,
     decode_pool: Int8DecodePool,
-    decode_worker_cache: HashMap<(usize, usize), usize>,
+    decode_worker_cache: HashMap<(usize, usize), DecodeChoice>,
     decode_weights: HashMap<DecodeWeightKey, CachedW8A8Weight>,
     decode_cache_hits: usize,
     decode_cache_misses: usize,
     decode_cache_hit_ns: u64,
     decode_cache_miss_ns: u64,
     decode_worker_calls: [usize; 3],
+    decode_ksplit_calls: usize,
 }
 
 #[repr(C)]
@@ -62,6 +71,7 @@ pub struct RockNpuDecodeCacheStats {
     pub worker1_calls: usize,
     pub worker2_calls: usize,
     pub worker3_calls: usize,
+    pub ksplit_calls: usize,
 }
 
 fn quantize_symmetric(values: &[f32]) -> Option<(Vec<i8>, f32)> {
@@ -144,14 +154,37 @@ fn prepare_q6_k_w8a8(weight_bytes: &[u8], k: usize, n: usize) -> Option<(Vec<i8>
     (weights.len() == n.checked_mul(k)? && scales.len() == n).then_some((weights, scales))
 }
 
-fn decode_worker_candidates(pool: &Int8DecodePool, n: usize) -> Result<Vec<usize>, ()> {
-    let mut candidates = vec![1usize];
-    let mut last_effective = 1usize;
+fn decode_worker_candidates(
+    pool: &Int8DecodePool,
+    k: usize,
+    n: usize,
+) -> Result<Vec<DecodeChoice>, ()> {
+    let mut candidates = vec![DecodeChoice {
+        split: Int8DecodeSplit::N,
+        workers: 1,
+    }];
+    let mut last_effective_n = 1usize;
     for requested in 2..=pool.workers() {
         let effective = pool.effective_workers_for_n(n, requested).map_err(|_| ())?;
-        if effective > last_effective {
-            candidates.push(requested);
-            last_effective = effective;
+        if effective > last_effective_n {
+            candidates.push(DecodeChoice {
+                split: Int8DecodeSplit::N,
+                workers: requested,
+            });
+            last_effective_n = effective;
+        }
+    }
+    if k > 4096 {
+        let mut last_effective_k = 1usize;
+        for requested in 2..=pool.workers() {
+            let effective = pool.effective_workers_for_k(k, requested).map_err(|_| ())?;
+            if effective > last_effective_k {
+                candidates.push(DecodeChoice {
+                    split: Int8DecodeSplit::K,
+                    workers: requested,
+                });
+                last_effective_k = effective;
+            }
         }
     }
     Ok(candidates)
@@ -180,12 +213,18 @@ fn tune_decode_workers(
     activation: Arc<[i8]>,
     k: usize,
     n: usize,
-) -> Result<(usize, Int8DecodePoolPreparedWeights), ()> {
-    let candidates = decode_worker_candidates(pool, n)?;
+) -> Result<(DecodeChoice, Int8DecodePoolPreparedWeights), ()> {
+    let candidates = decode_worker_candidates(pool, k, n)?;
     let mut prepared = Vec::with_capacity(candidates.len());
-    for &workers in &candidates {
-        match pool.prepare_weights(Arc::clone(&weights), k, n, workers) {
-            Ok(handle) => prepared.push((workers, handle)),
+    for &choice in &candidates {
+        match pool.prepare_weights_with_split(
+            Arc::clone(&weights),
+            k,
+            n,
+            choice.workers,
+            choice.split,
+        ) {
+            Ok(handle) => prepared.push((choice, handle)),
             Err(_) => {
                 for (_, handle) in prepared {
                     let _ = pool.release_prepared(&handle);
@@ -240,9 +279,9 @@ fn tune_decode_workers(
     };
 
     let mut winner = None;
-    for (index, (workers, handle)) in prepared.into_iter().enumerate() {
+    for (index, (choice, handle)) in prepared.into_iter().enumerate() {
         if index == best_index {
-            winner = Some((workers, handle));
+            winner = Some((choice, handle));
         } else if pool.release_prepared(&handle).is_err() {
             return Err(());
         }
@@ -284,6 +323,7 @@ where
         decode_cache_hit_ns,
         decode_cache_miss_ns,
         decode_worker_calls,
+        decode_ksplit_calls,
     } = context;
 
     let (cached, cache_hit) = match decode_weights.entry(key) {
@@ -297,19 +337,20 @@ where
             };
             let weights: Arc<[i8]> = Arc::from(weights_i8);
             let shape = (key.k, key.n);
-            let (workers, prepared) = if let Some(&workers) = decode_worker_cache.get(&shape) {
-                let prepared = match decode_pool.prepare_weights(
+            let (choice, prepared) = if let Some(&choice) = decode_worker_cache.get(&shape) {
+                let prepared = match decode_pool.prepare_weights_with_split(
                     Arc::clone(&weights),
                     key.k,
                     key.n,
-                    workers,
+                    choice.workers,
+                    choice.split,
                 ) {
                     Ok(prepared) => prepared,
                     Err(_) => return STATUS_EXECUTION_ERROR,
                 };
-                (workers, prepared)
+                (choice, prepared)
             } else {
-                let (workers, prepared) = match tune_decode_workers(
+                let (choice, prepared) = match tune_decode_workers(
                     decode_pool,
                     Arc::clone(&weights),
                     Arc::clone(&activation),
@@ -319,15 +360,15 @@ where
                     Ok(result) => result,
                     Err(()) => return STATUS_EXECUTION_ERROR,
                 };
-                decode_worker_cache.insert(shape, workers);
-                (workers, prepared)
+                decode_worker_cache.insert(shape, choice);
+                (choice, prepared)
             };
             *decode_cache_misses = decode_cache_misses.saturating_add(1);
             (
                 entry.insert(CachedW8A8Weight {
                     prepared,
                     scales,
-                    workers,
+                    choice,
                 }),
                 false,
             )
@@ -338,8 +379,11 @@ where
         Ok(result) => result,
         Err(_) => return STATUS_EXECUTION_ERROR,
     };
-    if let Some(calls) = decode_worker_calls.get_mut(cached.workers.saturating_sub(1)) {
+    if let Some(calls) = decode_worker_calls.get_mut(cached.choice.workers.saturating_sub(1)) {
         *calls = calls.saturating_add(1);
+    }
+    if cached.choice.split == Int8DecodeSplit::K {
+        *decode_ksplit_calls = decode_ksplit_calls.saturating_add(1);
     }
     for ((dst, &acc), &weight_scale) in output_n_f32
         .iter_mut()
@@ -380,6 +424,7 @@ pub extern "C" fn rocknpu_context_create() -> *mut RockNpuContext {
             decode_cache_hit_ns: 0,
             decode_cache_miss_ns: 0,
             decode_worker_calls: [0; 3],
+            decode_ksplit_calls: 0,
         })),
         _ => ptr::null_mut(),
     }
@@ -417,6 +462,7 @@ pub unsafe extern "C" fn rocknpu_context_decode_cache_stats(
             worker1_calls: context.decode_worker_calls[0],
             worker2_calls: context.decode_worker_calls[1],
             worker3_calls: context.decode_worker_calls[2],
+            ksplit_calls: context.decode_ksplit_calls,
         };
     }
     STATUS_OK

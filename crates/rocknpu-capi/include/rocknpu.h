@@ -21,6 +21,7 @@ typedef struct rocknpu_decode_cache_stats {
     size_t worker1_calls;
     size_t worker2_calls;
     size_t worker3_calls;
+    size_t ksplit_calls;
 } rocknpu_decode_cache_stats;
 
 enum rocknpu_status {

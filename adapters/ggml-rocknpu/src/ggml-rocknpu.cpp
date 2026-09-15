@@ -109,7 +109,7 @@ void rocknpu_backend_free(ggml_backend_t backend) {
             const double hit_ms = static_cast<double>(cache.hit_ns) / 1.0e6;
             const double miss_ms = static_cast<double>(cache.miss_ns) / 1.0e6;
             std::fprintf(stderr,
-                "ROCKNPU GGML TRACE decode_cache hits=%zu misses=%zu entries=%zu resident_mb=%.2f hit_ms=%.2f hit_avg_ms=%.3f miss_ms=%.2f miss_avg_ms=%.3f tuned_shapes=%zu worker_calls=[%zu,%zu,%zu]\n",
+                "ROCKNPU GGML TRACE decode_cache hits=%zu misses=%zu entries=%zu resident_mb=%.2f hit_ms=%.2f hit_avg_ms=%.3f miss_ms=%.2f miss_avg_ms=%.3f tuned_shapes=%zu worker_calls=[%zu,%zu,%zu] ksplit_calls=%zu\n",
                 cache.hits,
                 cache.misses,
                 cache.entries,
@@ -121,7 +121,8 @@ void rocknpu_backend_free(ggml_backend_t backend) {
                 cache.tuned_shapes,
                 cache.worker1_calls,
                 cache.worker2_calls,
-                cache.worker3_calls);
+                cache.worker3_calls,
+                cache.ksplit_calls);
         }
     }
     rocknpu_context_destroy(context->runtime);
