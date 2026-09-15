@@ -808,7 +808,7 @@ GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" \
   test -b ROCKNPU0 -o MUL_MAT -p q4_K
 ```
 
-Accepted result: `6/6 tests passed`, `Backend ROCKNPU: OK`. M=1/non-multiple-of-4 rows, batched/permuted layouts, and F16 activations are explicitly not supported.
+Accepted result: `7/7 tests passed`, `Backend ROCKNPU: OK`. The stock oracle's M=1 sample uses K=256 and remains intentionally outside the W8A8 M=1 contract; the real-model gate below verifies supported M=1 execution.
 
 Run the stock Q6_K oracle:
 
@@ -820,9 +820,9 @@ GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" \
 
 Accepted result: `3/3 tests passed`, `Backend ROCKNPU: OK`.
 
-The Q4_K/Q6_K bridge forwards raw GGML quantized blocks into Rust, dequantizes there, converts to RockNPU's existing FP16 weight contract, then runs the real Rocket/NPU MatMul. It is correctness-first and does not claim native quantized-kernel performance.
+The Q4_K/Q6_K bridge forwards raw GGML quantized blocks into Rust. `M>=4` uses the existing FP16 correctness bridge. Supported `M=1` calls are dequantized and requantized to W8A8 in Rust, executed as INT8 MatMul through Rocket, then rescaled from int32 to F32. This is correctness-first; current M=1 execution rebuilds the static weight conversion/packing on every call and is not a throughput claim.
 
-For a real-model gate, first run stock CPU with the four-token prompt `The capital of`; greedy generation produces `" the"`. Then run:
+For a real-model gate, first run stock CPU with the four-token prompt `The capital of` and `-n 2`; greedy generation produces `" the United"`. Then run:
 
 ```sh
 ROCKNPU_GGML_TRACE=1 \
@@ -830,23 +830,26 @@ GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" \
   /build/llama.cpp-reference/build-dl/bin/llama-completion \
   -fit off -ngl 0 \
   -m artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf \
-  -no-cnv -p "The capital of" -n 1 --temp 0 --no-warmup --verbose-prompt
+  -no-cnv -p "The capital of" -n 2 --temp 0 --no-warmup --verbose-prompt
 ```
 
-The RockNPU run produces the same `" the"` continuation. Opt-in execution tracing at the actual backend boundary reports 131 Q4_K plus 20 Q6_K MatMuls:
+The RockNPU run produces the same `" the United"` continuation. Opt-in execution tracing at the actual backend boundary proves the transition from M=4 prefill to true M=1 decode:
 
 ```text
-ROCKNPU GGML TRACE mul_mat weight=blk.0.attn_q.weight type=q4_K M=4 K=2048 N=2048
-ROCKNPU GGML TRACE mul_mat weight=blk.0.attn_v.weight type=q6_K M=4 K=2048 N=256
+ROCKNPU GGML TRACE mul_mat weight=blk.0.attn_q.weight type=q4_K M=4 K=2048 N=2048 path=fp16_bridge
 ...
-ROCKNPU GGML TRACE summary q4_K_mul_mat=131 q6_K_mul_mat=20 f16_mul_mat=0
+ROCKNPU GGML TRACE mul_mat weight=blk.21.ffn_gate.weight type=q4_K M=1 K=2048 N=5632 path=w8a8_m1
+ROCKNPU GGML TRACE mul_mat weight=blk.21.ffn_down.weight type=q4_K M=1 K=5632 N=2048 path=w8a8_m1
+ROCKNPU GGML TRACE mul_mat weight=blk.0.attn_q.weight type=q4_K M=1 K=2048 N=2048 path=w8a8_m1
+...
+ROCKNPU GGML TRACE summary q4_K_mul_mat=268 q6_K_mul_mat=40 f16_mul_mat=0 w8a8_m1_mul_mat=157
 ```
 
-This is all 151 block-projection MatMuls that stock llama.cpp presents with the NPU-eligible `M=4` shape in this gate. Output pruning reduces the final layer's `ffn_gate`, `ffn_up`, and `ffn_down` plus `output.weight` to `M=1`; those remain on CPU/another scheduler backend in the current GGML adapter. This establishes real Q4_K/Q6_K TinyLlama prefill through stock GGML into RockNPU on RK3588 without claiming GGML M=1 decode or broader operator/layout coverage.
+The 157 `w8a8_m1` calls consist of the three output-pruned final-layer FFN projections during prefill plus all 154 (`22 layers x 7`) transformer-block projections for the subsequent autoregressive token. `output.weight` remains on CPU because its N=32000 exceeds the deliberately validated W8A8 limit N<=8192. This is the first stock llama.cpp autoregressive decode gate through RockNPU -> Rocket -> real RK3588 NPU.
 
 ### W8A8 M=1 decode through upstream Rocket
 
-RockNPU now carries an ISC-attributed Rust port of ork-driver's RK3588 INT8/W8A8 full-K register-command template, shape patching, and 32x32 weight layout. The reference source is pinned in `docs/licenses/ork-driver-ISC.txt`. Only the hardware-programming knowledge is reused: BO allocation, IOVA ownership, task submission, synchronization, and timeout/reset remain the project-owned Rust implementation over `/dev/accel/accel0`.
+RockNPU's M=1 work was accelerated by ork-driver's public RK3588 INT8/W8A8 research. The directly source-derived baseline regcmd template is isolated in `crates/rocknpu-regcmd/src/int8/ork_isc.rs` under its original ISC notice; the surrounding Rust encoder, executor, BO management, IOVA ownership, task submission, synchronization, and Rocket integration are MIT RockNPU code. The upstream notice is also preserved in `docs/licenses/ork-driver-ISC.txt`.
 
 Build the two hardware gates:
 
@@ -882,4 +885,4 @@ Observed gate:
 INT8 WIDE-K DECODE PASS M=1 K=5632 N=2048 slices=6 outputs=2048 submit_wait_us=4121.8 host_accum_us=32.1
 ```
 
-These timings are first correctness measurements, not optimized throughput claims. Resident/precomputed regcmds, multi-core N-column splitting, quantization/scales, and the GGML M=1 routing layer are not yet included in these gates.
+These timings are first correctness measurements, not optimized throughput claims. The reusable executor's first-submit measurements also show that current host packing dominates NPU compute (for example K=2048,N=5632 was about 158 ms packing versus about 4 ms NPU submit/wait in one observed run). GGML M=1 routing and symmetric W8A8 scaling are now integrated and validated above; resident/prepacked weights, cached regcmds, and multi-core N-column splitting remain the major performance work.

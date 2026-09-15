@@ -340,12 +340,12 @@ GGML_BACKEND_PATH="$GGML_BACKEND_PATH" \
   "$LLAMA_CPP_DIR/build-rocknpu/bin/llama-completion" \
   -fit off -ngl 0 \
   -m /path/to/model.gguf \
-  -p "The capital of" -n 1 --temp 0 --no-warmup
+  -p "The capital of" -n 2 --temp 0 --no-warmup
 ```
 
 You do **not** need to modify llama.cpp source or pass a RockNPU-specific `--device` workaround. The GGML scheduler discovers `ROCKNPU0` through the plugin and sends supported operations to it; unsupported operations remain available to the other registered backends rather than being silently emulated inside the RockNPU adapter.
 
-The currently validated GGML slice is deliberately narrow: contiguous `GGML_OP_MUL_MAT` with F16, Q4_K, or Q6_K weights and F32 activations. Real TinyLlama Q4_K_M prefill is hardware-proven: all 151 block-projection MatMuls that stock llama.cpp presents with the current NPU-eligible `M=4` shape execute through RockNPU. Stock llama.cpp prunes the final layer's three FFN projections and the output head to `M=1`; those still remain on CPU in the GGML adapter. The older generic FP16 RK3588 MatMul geometry is not correct for M=1, but RockNPU now has a separate hardware-proven W8A8/INT8 M=1 primitive derived from the ISC-licensed ork-driver implementation and submitted through upstream Rocket. Wiring that primitive into quantized GGML decode is the next integration step; this is not yet an all-NPU llama.cpp execution path.
+The currently validated GGML slice is deliberately narrow: contiguous `GGML_OP_MUL_MAT` with F16, Q4_K, or Q6_K weights and F32 activations. Real TinyLlama Q4_K_M prefill and autoregressive decode are now hardware-proven. The `M=4` prefill projections use the FP16 correctness bridge; quantized Q4_K/Q6_K `M=1` projections with `K % 512 == 0`, `N % 32 == 0`, and `N <= 8192` use the W8A8/INT8 decode path through upstream Rocket. With prompt `The capital of` and greedy `-n 2`, stock CPU and RockNPU both produce `" the United"`; the traced RockNPU run executes 157 `M=1` W8A8 MatMuls (three output-pruned final-layer FFN projections during prefill plus all `22 x 7 = 154` transformer-block projections for the autoregressive decode step). The `N=32000` output head remains on CPU by design. This path is correctness-first: it currently dequantizes, requantizes, allocates, and repacks static weights for every `M=1` call, so it is not yet a decode-performance claim.
 
 For exact backend ABI constraints, correctness tests and the pinned llama.cpp validation revision, see [`adapters/ggml-rocknpu/README.md`](adapters/ggml-rocknpu/README.md) and [`docs/repro.md`](docs/repro.md).
 
@@ -371,7 +371,7 @@ cargo run --release -p rocket-smoke --bin int8_decode_m1 -- 2048 5632
 cargo run --release -p rocket-smoke --bin int8_decode_widek
 ```
 
-All four gates bit-match their CPU int32 references on the verified RK3588 host. This proves a correct logical M=1 NPU path through Rocket; it does not yet mean stock llama.cpp routes its decode graph through this primitive.
+All four gates bit-match their CPU int32 references on the verified RK3588 host. The same primitive is now wired into quantized stock GGML `M=1` execution; see the real TinyLlama `-n 2` gate in [`docs/repro.md`](docs/repro.md).
 
 ### Real pretrained model gates
 

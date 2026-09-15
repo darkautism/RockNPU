@@ -14,6 +14,7 @@ struct rocknpu_backend_context {
     size_t q4_k_mul_mat_calls = 0;
     size_t q6_k_mul_mat_calls = 0;
     size_t f16_mul_mat_calls = 0;
+    size_t w8a8_m1_mul_mat_calls = 0;
 };
 
 bool rocknpu_trace_enabled() {
@@ -82,8 +83,11 @@ bool rocknpu_mul_mat_supported(const ggml_tensor * op) {
     const int64_t k = weights->ne[0];
     const int64_t n = weights->ne[1];
     const int64_t m = activations->ne[1];
-    const int64_t k_alignment =
-        (weights->type == GGML_TYPE_Q4_K || weights->type == GGML_TYPE_Q6_K) ? 256 : 32;
+    const bool quantized = weights->type == GGML_TYPE_Q4_K || weights->type == GGML_TYPE_Q6_K;
+    if (m == 1) {
+        return quantized && k > 0 && n > 0 && k % 512 == 0 && n % 32 == 0 && n <= 8192;
+    }
+    const int64_t k_alignment = quantized ? 256 : 32;
     return m > 0 && k > 0 && n > 0 && m % 4 == 0 && k % k_alignment == 0 && n % 16 == 0;
 }
 
@@ -95,10 +99,11 @@ void rocknpu_backend_free(ggml_backend_t backend) {
     auto * context = static_cast<rocknpu_backend_context *>(backend->context);
     if (rocknpu_trace_enabled()) {
         std::fprintf(stderr,
-            "ROCKNPU GGML TRACE summary q4_K_mul_mat=%zu q6_K_mul_mat=%zu f16_mul_mat=%zu\n",
+            "ROCKNPU GGML TRACE summary q4_K_mul_mat=%zu q6_K_mul_mat=%zu f16_mul_mat=%zu w8a8_m1_mul_mat=%zu\n",
             context->q4_k_mul_mat_calls,
             context->q6_k_mul_mat_calls,
-            context->f16_mul_mat_calls);
+            context->f16_mul_mat_calls,
+            context->w8a8_m1_mul_mat_calls);
     }
     rocknpu_context_destroy(context->runtime);
     delete context;
@@ -134,14 +139,18 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                 } else {
                     context->f16_mul_mat_calls++;
                 }
+                if (m == 1 && (weights->type == GGML_TYPE_Q4_K || weights->type == GGML_TYPE_Q6_K)) {
+                    context->w8a8_m1_mul_mat_calls++;
+                }
                 if (rocknpu_trace_enabled()) {
                     std::fprintf(stderr,
-                        "ROCKNPU GGML TRACE mul_mat weight=%s type=%s M=%zu K=%zu N=%zu\n",
+                        "ROCKNPU GGML TRACE mul_mat weight=%s type=%s M=%zu K=%zu N=%zu path=%s\n",
                         weights->name,
                         weight_type,
                         m,
                         k,
-                        n);
+                        n,
+                        m == 1 ? "w8a8_m1" : "fp16_bridge");
                 }
                 int status;
                 if (weights->type == GGML_TYPE_Q4_K) {
@@ -226,7 +235,7 @@ ggml_backend_t rocknpu_device_init(ggml_backend_dev_t dev, const char *) {
         return nullptr;
     }
 
-    auto * context = new rocknpu_backend_context { runtime, 0, 0, 0 };
+    auto * context = new rocknpu_backend_context { runtime, 0, 0, 0, 0 };
     return new ggml_backend {
         /* .guid    = */ rocknpu_backend_guid(),
         /* .iface   = */ rocknpu_backend_iface,
