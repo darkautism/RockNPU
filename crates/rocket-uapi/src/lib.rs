@@ -70,9 +70,15 @@ pub struct Job {
     pub task_struct_size: u32,
     pub in_bo_handle_count: u32,
     pub out_bo_handle_count: u32,
-    /// Optional trailing job flags. Kernels predating this field copy only the
-    /// v1 prefix; kernels implementing interface >= 1.1 interpret bit 0 as the
-    /// self-chained, single-kick contract.
+}
+
+/// Rocket interface >= 1.1 appends per-job flags after the stock v1 job.
+/// Keep `Job` itself at the Linux v6.18 40-byte ABI so ordinary submits stay
+/// byte-for-byte compatible with stock kernels.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct JobFlagged {
+    pub job: Job,
     pub flags: u32,
     pub reserved: u32,
 }
@@ -138,6 +144,8 @@ mod tests {
         assert_eq!(core::mem::size_of::<FiniBo>(), 8);
         assert_eq!(core::mem::size_of::<Task>(), 8);
         assert_eq!(core::mem::size_of::<Job>(), 40);
+        assert_eq!(core::mem::size_of::<JobFlagged>(), 48);
+        assert_eq!(core::mem::offset_of!(JobFlagged, flags), 40);
         assert_eq!(core::mem::size_of::<Submit>(), 24);
         assert_eq!(core::mem::size_of::<GemClose>(), 8);
     }

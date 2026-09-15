@@ -74,6 +74,12 @@ impl RocketDevice {
                 "Rocket job requires at least one task",
             ));
         }
+        if flags & !uapi::JOB_BATCHED != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unknown Rocket job flags",
+            ));
+        }
         if flags & uapi::JOB_BATCHED != 0 && !self.batched_submit_supported() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -95,16 +101,29 @@ impl RocketDevice {
             out_bo_handle_count: outputs.len().try_into().map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput, "too many output BOs")
             })?,
-            flags,
-            reserved: 0,
         };
-        let submit = uapi::Submit {
-            jobs: (&job as *const uapi::Job) as usize as u64,
-            job_count: 1,
-            job_struct_size: core::mem::size_of::<uapi::Job>() as u32,
-            reserved: 0,
-        };
-        uapi::submit(self.fd(), &submit)
+        if flags == 0 {
+            let submit = uapi::Submit {
+                jobs: (&job as *const uapi::Job) as usize as u64,
+                job_count: 1,
+                job_struct_size: core::mem::size_of::<uapi::Job>() as u32,
+                reserved: 0,
+            };
+            uapi::submit(self.fd(), &submit)
+        } else {
+            let flagged = uapi::JobFlagged {
+                job,
+                flags,
+                reserved: 0,
+            };
+            let submit = uapi::Submit {
+                jobs: (&flagged as *const uapi::JobFlagged) as usize as u64,
+                job_count: 1,
+                job_struct_size: core::mem::size_of::<uapi::JobFlagged>() as u32,
+                reserved: 0,
+            };
+            uapi::submit(self.fd(), &submit)
+        }
     }
 
     /// Conservative capability probe for the out-of-tree Rocket batched-submit
