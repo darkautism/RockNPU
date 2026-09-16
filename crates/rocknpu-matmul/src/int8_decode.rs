@@ -496,13 +496,10 @@ impl<'a> Int8DecodeExecutor<'a> {
         scratch.input.fini()?;
         let input_stage_ns = input_stage_start.elapsed().as_nanos();
 
-        let partial_stage_start = Instant::now();
-        if std::env::var_os("ROCKNPU_EXPERIMENT_NO_PARTIAL_PREZERO").is_none() {
-            scratch.partials.prep_relative(0)?;
-            scratch.partials.as_mut_slice()[..partial_bytes].fill(0);
-            scratch.partials.fini()?;
-        }
-        let partial_stage_ns = partial_stage_start.elapsed().as_nanos();
+        // Every INT8 WDMA task fully overwrites its assigned int32 output range.
+        // The persistent direct-submit path therefore does not need to acquire,
+        // zero, and release the partial BO before handing it to the device.
+        let partial_stage_ns = 0;
 
         let regcmd_stage_start = Instant::now();
         scratch.regcmd.prep_relative(0)?;
