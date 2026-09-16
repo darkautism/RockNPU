@@ -946,7 +946,29 @@ where
             };
             let weights: Arc<[i8]> = Arc::from(weights_i8);
             let shape = (key.k, key.n);
-            let (choice, prepared) = if let Some(&choice) = decode_worker_cache.get(&shape) {
+            // Persistent direct-submit changed the relative split cost: for the
+            // TinyLlama down projection, K3 is consistently slightly faster
+            // than N3 but the generic 5% tuner hysteresis rejects that small
+            // win. Scope this override to the scratch path that was measured.
+            let prefer_down_k3 =
+                env_enabled("ROCKNPU_EXPERIMENT_DIRECT_SCRATCH") && key.k == 5632 && key.n == 2048;
+            let (choice, prepared) = if prefer_down_k3 {
+                let choice = DecodeChoice {
+                    split: Int8DecodeSplit::K,
+                    workers: decode_pool.workers().min(3),
+                };
+                let prepared = match decode_pool.prepare_weights_with_split(
+                    Arc::clone(&weights),
+                    key.k,
+                    key.n,
+                    choice.workers,
+                    choice.split,
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(_) => return STATUS_EXECUTION_ERROR,
+                };
+                (choice, prepared)
+            } else if let Some(&choice) = decode_worker_cache.get(&shape) {
                 let prepared = match decode_pool.prepare_weights_with_split(
                     Arc::clone(&weights),
                     key.k,
