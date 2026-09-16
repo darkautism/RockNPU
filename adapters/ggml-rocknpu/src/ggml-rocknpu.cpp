@@ -69,8 +69,46 @@ bool rocknpu_read_exact(const std::string & path, void * dst, size_t bytes) {
     return file.good() || static_cast<size_t>(file.gcount()) == bytes;
 }
 
+uint64_t rocknpu_source_sample_fingerprint(const uint8_t * data, size_t bytes) {
+    constexpr uint64_t offset_basis = 14695981039346656037ULL;
+    constexpr uint64_t prime = 1099511628211ULL;
+    uint64_t hash = offset_basis;
+    const uint64_t byte_count = static_cast<uint64_t>(bytes);
+    for (unsigned shift = 0; shift < 64; shift += 8) {
+        hash ^= static_cast<uint8_t>(byte_count >> shift);
+        hash *= prime;
+    }
+    const auto update = [&](size_t offset, size_t count) {
+        for (size_t i = 0; i < count; ++i) {
+            hash ^= data[offset + i];
+            hash *= prime;
+        }
+    };
+    constexpr size_t sample_bytes = 4096;
+    if (bytes <= sample_bytes * 3) {
+        update(0, bytes);
+    } else {
+        update(0, sample_bytes);
+        update((bytes - sample_bytes) / 2, sample_bytes);
+        update(bytes - sample_bytes, sample_bytes);
+    }
+    return hash;
+}
+
+bool rocknpu_read_source_fingerprint(const std::string & path, uint64_t * value) {
+    std::ifstream file(path);
+    std::string encoded;
+    if (!file || !(file >> encoded) || encoded.size() != 16) return false;
+    char * end = nullptr;
+    const unsigned long long parsed = std::strtoull(encoded.c_str(), &end, 16);
+    if (end != encoded.c_str() + encoded.size()) return false;
+    *value = static_cast<uint64_t>(parsed);
+    return true;
+}
+
 rocknpu_w8_tensor * rocknpu_w8_sidecar_get(
-    rocknpu_backend_context * context, const char * name, size_t k, size_t n) {
+    rocknpu_backend_context * context, const char * name, size_t k, size_t n,
+    const uint8_t * source_data, size_t source_bytes) {
     const char * dir = std::getenv("ROCKNPU_W8_SIDECAR_DIR");
     if (dir == nullptr || dir[0] == '\0' || name == nullptr || name[0] == '\0') return nullptr;
     auto & tensor = context->w8_sidecar[std::string(name)];
@@ -79,9 +117,19 @@ rocknpu_w8_tensor * rocknpu_w8_sidecar_get(
         tensor.k = k;
         tensor.n = n;
         const size_t weight_count = k * n;
+        const std::string base = std::string(dir) + "/" + name;
+        uint64_t expected_fingerprint = 0;
+        const bool source_matches = source_data != nullptr && source_bytes != 0 &&
+            rocknpu_read_source_fingerprint(base + ".source.fnv1a64", &expected_fingerprint) &&
+            expected_fingerprint == rocknpu_source_sample_fingerprint(source_data, source_bytes);
+        if (!source_matches) {
+            if (rocknpu_trace_enabled()) {
+                std::fprintf(stderr, "ROCKNPU GGML TRACE native_w8_rejected_source weight=%s\n", name);
+            }
+            return nullptr;
+        }
         tensor.weights.resize(weight_count);
         tensor.scales.resize(n);
-        const std::string base = std::string(dir) + "/" + name;
         if (rocknpu_read_exact(base + ".w8", tensor.weights.data(), weight_count) &&
             rocknpu_read_exact(base + ".scale.f32", tensor.scales.data(), n * sizeof(float))) {
             tensor.valid = true;
@@ -339,9 +387,13 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                             state.pending = false;
                             const std::string v_name = "blk." + std::to_string(q_layer) + ".attn_v.weight";
                             const std::string k_name = "blk." + std::to_string(q_layer) + ".attn_k.weight";
-                            rocknpu_w8_tensor * q_w8 = rocknpu_w8_sidecar_get(context, q_weights->name, 2048, 2048);
-                            rocknpu_w8_tensor * v_w8 = rocknpu_w8_sidecar_get(context, v_name.c_str(), 2048, 256);
-                            rocknpu_w8_tensor * k_w8 = rocknpu_w8_sidecar_get(context, k_name.c_str(), 2048, 256);
+                            rocknpu_w8_tensor * q_w8 = rocknpu_w8_sidecar_get(
+                                context, q_weights->name, 2048, 2048,
+                                static_cast<const uint8_t *>(q_weights->data), ggml_nbytes(q_weights));
+                            rocknpu_w8_tensor * v_w8 = rocknpu_w8_sidecar_get(
+                                context, v_name.c_str(), 2048, 256, state.v.data, state.v.bytes);
+                            rocknpu_w8_tensor * k_w8 = rocknpu_w8_sidecar_get(
+                                context, k_name.c_str(), 2048, 256, state.k.data, state.k.bytes);
                             const bool native_w8 = q_w8 != nullptr && v_w8 != nullptr && k_w8 != nullptr;
                             const int status = native_w8 ? rocknpu_matmul_w8a8_triple_f32_f32_m1(
                                 context->runtime,
@@ -396,8 +448,12 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                             rocknpu_quant_kind(second_weights, &second_kind);
                         if (ffn_pair) {
                             const size_t k_pair = static_cast<size_t>(first_weights->ne[0]);
-                            rocknpu_w8_tensor * first_w8 = rocknpu_w8_sidecar_get(context, first_weights->name, k_pair, 5632);
-                            rocknpu_w8_tensor * second_w8 = rocknpu_w8_sidecar_get(context, second_weights->name, k_pair, 5632);
+                            rocknpu_w8_tensor * first_w8 = rocknpu_w8_sidecar_get(
+                                context, first_weights->name, k_pair, 5632,
+                                static_cast<const uint8_t *>(first_weights->data), ggml_nbytes(first_weights));
+                            rocknpu_w8_tensor * second_w8 = rocknpu_w8_sidecar_get(
+                                context, second_weights->name, k_pair, 5632,
+                                static_cast<const uint8_t *>(second_weights->data), ggml_nbytes(second_weights));
                             const bool native_w8 = first_w8 != nullptr && second_w8 != nullptr;
                             const int status = native_w8 ? rocknpu_matmul_w8a8_pair_f32_f32_m1(
                                 context->runtime,
@@ -484,8 +540,12 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                                 }
                             }
                             const size_t k_pair = static_cast<size_t>(first_weights->ne[0]);
-                            rocknpu_w8_tensor * first_w8 = rocknpu_w8_sidecar_get(context, first_weights->name, k_pair, 256);
-                            rocknpu_w8_tensor * second_w8 = rocknpu_w8_sidecar_get(context, second_weights->name, k_pair, 256);
+                            rocknpu_w8_tensor * first_w8 = rocknpu_w8_sidecar_get(
+                                context, first_weights->name, k_pair, 256,
+                                static_cast<const uint8_t *>(first_weights->data), ggml_nbytes(first_weights));
+                            rocknpu_w8_tensor * second_w8 = rocknpu_w8_sidecar_get(
+                                context, second_weights->name, k_pair, 256,
+                                static_cast<const uint8_t *>(second_weights->data), ggml_nbytes(second_weights));
                             const bool native_w8 = first_w8 != nullptr && second_w8 != nullptr;
                             const int status = native_w8 ? rocknpu_matmul_w8a8_pair_f32_f32_m1(
                                 context->runtime,
@@ -550,7 +610,9 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                         m == 1 ? (w4a4_m1 ? "w4a4_m1" : "w8a8_m1") : "fp16_bridge");
                 }
                 int status;
-                rocknpu_w8_tensor * native_w8 = m == 1 ? rocknpu_w8_sidecar_get(context, weights->name, k, n) : nullptr;
+                rocknpu_w8_tensor * native_w8 = m == 1 ? rocknpu_w8_sidecar_get(
+                    context, weights->name, k, n,
+                    static_cast<const uint8_t *>(weights->data), ggml_nbytes(weights)) : nullptr;
                 if (native_w8 != nullptr) {
                     status = rocknpu_matmul_w8a8_f32_f32_m1(
                         context->runtime, native_w8->weights.data(), native_w8->scales.data(),

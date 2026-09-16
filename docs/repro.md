@@ -909,6 +909,44 @@ cargo build --release -p rocket-smoke --bin int8_decode_ksplit
 
 The exact production-pool gate for K5632/N2048 passed against every CPU int32 result and measured `4.231 ms` single-worker versus `1.676 ms` with three-way K-split (`2.52x`). The standalone topology prototype measured `1.713 ms` in the same run. This is modestly faster than the corresponding three-way N-split because each K-split worker executes one full-K task rather than six sequential 1024/512-wide tasks. These observations are characterization only; production includes K-split candidates only for shapes that otherwise require multiple K tasks and measures them against N-split candidates at runtime. With host overhead now reduced to tens of microseconds, submit/kernel efficiency is the dominant remaining performance target.
 
+### GGUF-faithful native-W8 sidecar
+
+For native prequantized W8 experiments, generate the sidecar from the **exact GGUF being executed**, not from the original FP16/BF16 checkpoint. The runtime W8 path dequantizes the live Q4_K/Q6_K tensor first, so a sidecar quantized from a different source model is numerically a different model.
+
+```sh
+python3 scripts/make_tinyllama_w8_sidecar_gguf.py \
+  artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf \
+  /build/w8a8-models/native-w8-gguf \
+  --gguf-py /build/llama.cpp-reference/gguf-py
+```
+
+The generator emits `rocknpu-w8-sidecar-v2`, records the source GGUF size/SHA-256, uses half-away-from-zero row quantization to match the Rust runtime, and writes a lightweight source fingerprint beside every tensor. The GGML loader checks that fingerprint against the live quantized GGUF bytes before accepting a sidecar tensor. Missing or mismatched fingerprints are rejected and the normal runtime-W8 conversion is used instead; legacy v1 sidecars therefore cannot silently substitute weights.
+
+Use the corrected sidecar with:
+
+```sh
+ROCKNPU_W8_SIDECAR_DIR=/build/w8a8-models/native-w8-gguf \
+GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" \
+  /build/llama.cpp-reference/build-dl/bin/llama-completion \
+  -fit off -ngl 0 \
+  -m artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf \
+  -no-cnv -p "The capital of France is" -n 24 --temp 0 --no-warmup -t 4
+```
+
+Validated deterministic stdout is exactly:
+
+```text
+ The capital of France is Paris.
+
+2. B.C. The capital of China is Beijing.
+
+3. A
+```
+
+Its stdout SHA-256 is `08730f9092a465cc9915db41d7ba8f999504c968e4937d73b6d9f068dcae8f8d`, identical for runtime-W8, corrected-sidecar threaded, and corrected-sidecar direct-submit paths. With `ROCKNPU_GGML_TRACE=1`, the corrected v2 sidecar loaded `154/154` tensors with zero source rejections; the legacy v1 sidecar loaded zero and rejected all 154 before safe fallback.
+
+The experimental direct-submit scheduler can be enabled with `ROCKNPU_W8_DIRECT_SUBMIT=1`. On the stock 700 MHz validator, corrected-sidecar `llama-bench -p 0 -n 32 -r 12 -t 4 -dev ROCKNPU0` measured `11.58 ± 0.79 tok/s` threaded versus `13.69 ± 1.07 tok/s` direct.
+
 ### Experimental native W4A4 M=1 decode
 
 The repository also contains a native signed-int4 M=1 register-command/executor path. The source-derived baseline register template is isolated in `crates/rocknpu-regcmd/src/int4/ork_isc.rs` under ork-driver's ISC notice; RockNPU's geometry patching, nibble packing, Rocket BO ownership/submission, resident cache, grouped execution, and multicore pool are Rust/MIT code around that isolated template.
