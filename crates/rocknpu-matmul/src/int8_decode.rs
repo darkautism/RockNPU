@@ -101,6 +101,19 @@ pub struct Int8DecodeOutput {
     pub stats: Int8DecodeStats,
 }
 
+pub struct Int8PendingDecode<'a> {
+    _regcmd: RocketBuffer<'a>,
+    _input: RocketBuffer<'a>,
+    partials: RocketBuffer<'a>,
+    slices: usize,
+    n: usize,
+    npu_tasks: usize,
+    pack_ns: u128,
+    submit_ns: u128,
+    submit_wait_start: Instant,
+    total_start: Instant,
+}
+
 /// W8A8 M=1 executor for RK3588 decode projections.
 ///
 /// Input `a_k` is row-major A[1,K]. Public weights are B[N,K]. Static weights
@@ -112,7 +125,7 @@ pub struct Int8DecodeOutput {
 /// accumulated exactly on the host.
 pub struct Int8DecodeExecutor<'a> {
     device: &'a RocketDevice,
-    _guard: RocketBuffer<'a>,
+    _guard: Option<RocketBuffer<'a>>,
 }
 
 impl<'a> Int8DecodeExecutor<'a> {
@@ -121,8 +134,15 @@ impl<'a> Int8DecodeExecutor<'a> {
         check_dma32_range(guard.dma_address(), guard.len())?;
         Ok(Self {
             device,
-            _guard: guard,
+            _guard: Some(guard),
         })
+    }
+
+    pub(crate) fn from_externally_guarded_device(device: &'a RocketDevice) -> Self {
+        Self {
+            device,
+            _guard: None,
+        }
     }
 
     /// Compatibility one-shot path. Prefer `prepare_weights` +
@@ -199,13 +219,14 @@ impl<'a> Int8DecodeExecutor<'a> {
         })
     }
 
-    /// Execute A[1,K] against already packed/resident INT8 weights. The static
-    /// weight BO is neither CPU-touched nor repacked on this path.
-    pub fn execute_prepared(
+    /// Begin A[1,K] against already packed/resident INT8 weights. This stages
+    /// the per-call BOs and submits the asynchronous Rocket job, but does not
+    /// wait for the output fence/BO yet.
+    pub fn begin_execute_prepared(
         &self,
         a_k: &[i8],
         weights: &Int8PreparedWeights,
-    ) -> Result<Int8DecodeOutput, Int8DecodeError> {
+    ) -> Result<Int8PendingDecode<'a>, Int8DecodeError> {
         let total_start = Instant::now();
         if self.device.fd() != weights.device_fd {
             return Err(Int8DecodeError::InvalidInput(
@@ -299,36 +320,69 @@ impl<'a> Int8DecodeExecutor<'a> {
             &[partials.handle()],
         )?;
         let submit_ns = submit_start.elapsed().as_nanos();
+
+        Ok(Int8PendingDecode {
+            _regcmd: regcmd,
+            _input: input,
+            partials,
+            slices,
+            n,
+            npu_tasks: tasks.len(),
+            pack_ns,
+            submit_ns,
+            submit_wait_start,
+            total_start,
+        })
+    }
+
+    pub fn finish_execute_prepared(
+        &self,
+        pending: Int8PendingDecode<'a>,
+    ) -> Result<Int8DecodeOutput, Int8DecodeError> {
         let wait_start = Instant::now();
-        partials.prep_relative(WAIT_NS)?;
+        pending.partials.prep_relative(WAIT_NS)?;
         let wait_ns = wait_start.elapsed().as_nanos();
-        let submit_wait_ns = submit_wait_start.elapsed().as_nanos();
+        let submit_wait_ns = pending.submit_wait_start.elapsed().as_nanos();
 
         let accum_start = Instant::now();
-        let mut values = vec![0i32; n];
-        for slice in 0..slices {
+        let mut values = vec![0i32; pending.n];
+        for slice in 0..pending.slices {
             for (col, sum) in values.iter_mut().enumerate() {
                 *sum = sum
-                    .checked_add(read_i32(partials.as_slice(), slice * n + col))
+                    .checked_add(read_i32(
+                        pending.partials.as_slice(),
+                        slice * pending.n + col,
+                    ))
                     .ok_or(Int8DecodeError::InvalidInput("int32 accumulation overflow"))?;
             }
         }
         let host_accum_ns = accum_start.elapsed().as_nanos();
-        partials.fini()?;
+        pending.partials.fini()?;
 
         Ok(Int8DecodeOutput {
             values,
             stats: Int8DecodeStats {
-                k_slices: slices,
-                npu_tasks: tasks.len(),
-                pack_ns,
-                submit_ns,
+                k_slices: pending.slices,
+                npu_tasks: pending.npu_tasks,
+                pack_ns: pending.pack_ns,
+                submit_ns: pending.submit_ns,
                 wait_ns,
                 submit_wait_ns,
                 host_accum_ns,
-                total_ns: total_start.elapsed().as_nanos(),
+                total_ns: pending.total_start.elapsed().as_nanos(),
             },
         })
+    }
+
+    /// Execute A[1,K] against already packed/resident INT8 weights. The static
+    /// weight BO is neither CPU-touched nor repacked on this path.
+    pub fn execute_prepared(
+        &self,
+        a_k: &[i8],
+        weights: &Int8PreparedWeights,
+    ) -> Result<Int8DecodeOutput, Int8DecodeError> {
+        let pending = self.begin_execute_prepared(a_k, weights)?;
+        self.finish_execute_prepared(pending)
     }
 }
 
