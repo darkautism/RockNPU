@@ -947,6 +947,8 @@ Its stdout SHA-256 is `08730f9092a465cc9915db41d7ba8f999504c968e4937d73b6d9f068d
 
 The experimental direct-submit scheduler can be enabled with `ROCKNPU_W8_DIRECT_SUBMIT=1`. On the stock 700 MHz validator, corrected-sidecar `llama-bench -p 0 -n 32 -r 12 -t 4 -dev ROCKNPU0` measured `11.58 ± 0.79 tok/s` threaded versus `13.69 ± 1.07 tok/s` direct.
 
+A second opt-in, `ROCKNPU_EXPERIMENT_DIRECT_SCRATCH=1`, keeps per-worker, per-prepared-shape regcmd/input/partial Rocket BOs alive across direct-submit decode calls. This is intentionally coupled to the caller-thread direct-submit path rather than the older sleeping-worker path: eliminating repeated `CREATE_BO+mmap` also reduces the delay between core0/core1/core2 submits. The deterministic 24-token TinyLlama gate remains exact. Two adjacent `tg32,r=12` A/B runs on the same 700 MHz board measured baseline `13.72 ± 1.12` / `13.73 ± 1.13 tok/s` versus persistent-scratch `15.28 ± 1.31` / `15.28 ± 1.32 tok/s`, a reproducible center gain of about 11.3–11.4%. Projection microbenchmarks also moved QKV N3 from `0.333 ms` to `0.293 ms` and attention-output N3 from `0.302 ms` to `0.255 ms` while preserving the exact int32 CPU oracle.
+
 ### Experimental native W4A4 M=1 decode
 
 The repository also contains a native signed-int4 M=1 register-command/executor path. The source-derived baseline register template is isolated in `crates/rocknpu-regcmd/src/int4/ork_isc.rs` under ork-driver's ISC notice; RockNPU's geometry patching, nibble packing, Rocket BO ownership/submission, resident cache, grouped execution, and multicore pool are Rust/MIT code around that isolated template.
