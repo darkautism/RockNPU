@@ -1023,3 +1023,56 @@ ROCKNPU_W4A4_SCOPE=ffn   # or attn / proj2048 / kv / explicit all
 This path has **hardware correctness but not model-level equivalence**. Prompt `The capital of` with greedy `-n 3` can still produce the W8A8 continuation `" the United States"`, but the longer `-n 16` gate diverges. Default W8A8 continued with `" the United States of America, Washington D.C. Is the most populous"`; FFN full-K Hadamard W4A4 instead continued `" the United States, located in the state of Virginia.\n\n2. New"`, and G=512 Hadamard also diverged later. A Q/O-only W4 experiment diverged as well. Since all of these runs reported zero saturation, the remaining difference is quantization error rather than an int16-overflow or Rocket execution failure.
 
 Whole-model speed is also not yet materially better: same-setting dynamic-backend `llama-bench -p 0 -n 8 -r 3 -t 8 -ngl 0` measured `5.09 ± 0.13 tok/s` for the FFN W4 experiment and `5.02 ± 0.17 tok/s` for default W8A8. Treat that difference as noise. W4A4 is therefore kept as an explicit research path for half-width resident weights, native-int4 kernel work, and future quantization-quality experiments; W8A8 remains the supported default decode route.
+
+### RK3588 NPU IRQ-thread latency tuning
+
+After enabling the validated per-core Rocket IOMMU-domain cache, runtime-PM bookkeeping was measured before changing it. Scoped function-graph samples put the ordinary autosuspend bookkeeping at roughly `1.167 us` median for `__pm_runtime_suspend()` (700 samples, p90 `2.042 us`), while directly observed `__pm_runtime_resume()` calls inside `rocket_job_run()` were about `5.25-5.54 us` under tracing. This is measurable but too small to be the primary remaining decode bottleneck.
+
+Rocket completion is a threaded IRQ. With the default three NPU IRQ affinities set to `0-7`, 1450 hard-IRQ/thread-entry pairs measured:
+
+```text
+p10       5 us
+median   10 us
+p90      21 us
+p99      51 us
+mean   12.208 us
+max     149 us
+```
+
+The trace repeatedly showed NPU interrupts landing on CPU0 from idle, and the board's `cpu-sleep` cpuidle state advertises a `220 us` exit latency. Pinning NPU IRQs to the A76 cluster reduced wake latency dramatically but hurt TinyLlama throughput, so do not use the big cores for this purpose.
+
+The validated topology keeps the three NPU IRQ threads on separate A55 cores and prevents only those cores from entering the deep `cpu-sleep` state:
+
+```sh
+sudo scripts/tune_rocket_irq_latency.sh apply
+# restore the normal platform policy after testing:
+sudo scripts/tune_rocket_irq_latency.sh restore
+```
+
+The helper discovers the IRQ numbers for `fdab0000.npu`, `fdac0000.npu`, and `fdad0000.npu` dynamically. On the validator, `apply` produced CPU affinity `0,1,2`; `restore` returned all three IRQs to `0-7` and re-enabled `cpu-sleep` on CPUs 0/1/2.
+
+With the A55 layout, the identical 1450-completion wake-latency distribution improved to:
+
+```text
+p10       5 us
+median    6 us
+p90       8 us
+p99      23 us
+mean    6.820 us
+max      82 us
+```
+
+The deterministic 24-token TinyLlama continuation remained exact. At `700 MHz / 800 mV`, CPU governors `performance`, per-core IOMMU-domain cache enabled, corrected GGUF-faithful native W8 sidecar, `ROCKNPU_W8_DIRECT_SUBMIT=1`, `ROCKNPU_EXPERIMENT_DIRECT_SCRATCH=1`, and flash attention forced on, interleaved whole-model blocks measured:
+
+```text
+baseline       17.74 +/- 2.47 tok/s
+A55 IRQ tune   19.18 +/- 2.15 tok/s
+baseline       18.61 +/- 1.91 tok/s
+A55 IRQ tune   19.57 +/- 2.09 tok/s
+
+# matching longer tg32,r=24 pair
+A55 IRQ tune   19.33 +/- 1.81 tok/s
+baseline       17.86 +/- 2.06 tok/s
+```
+
+The `r=24` pair is about +8.2% in center. Across these three blocks the rough unweighted centers are `18.07` baseline versus `19.36 tok/s` tuned (~+7.1%). Treat approximately `19.3-19.4 tok/s` as the repeatable candidate center, not the single `19.57` block. The known CPU TinyLlama reference is about `21.23 tok/s`, so this tuning closes the NPU path to roughly 91% of CPU throughput.
