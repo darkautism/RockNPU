@@ -951,6 +951,36 @@ A second opt-in, `ROCKNPU_EXPERIMENT_DIRECT_SCRATCH=1`, keeps per-worker, per-pr
 
 For TinyLlama decode, forcing llama.cpp flash attention with `-fa on` also avoids the classic CPU attention chain (`KQ MUL_MAT -> SOFT_MAX -> KQV MUL_MAT -> CONT`) that `auto` selected in this mixed RockNPU/CPU configuration. The deterministic 24-token continuation remains exact. Two order-swapped `tg32,r=12` comparisons measured `15.84 ± 1.45` auto versus `16.40 ± 2.09 tok/s` with flash attention (+3.5% center), then `17.24 ± 1.96` with flash attention versus `15.51 ± 1.42 tok/s` auto (+11.2% center). This is a llama.cpp execution-mode result, not a new RockNPU NPU kernel. Applicability may vary by model/attention shape; unsupported or slower cases should retain the existing classic-attention fallback rather than globally forcing the mode without validation.
 
+### Experimental Rocket IOMMU-domain cache
+
+The current Rocket scheduler attaches the submitting file's IOMMU domain to the selected NPU core for each job and detaches it again on completion. Low-overhead kprobes measured roughly `9.5 us` median attach plus `11.0 us` median detach on a small cached job. For M=1 decode, where RockNPU submits many short jobs, that fixed kernel cost is large enough to matter.
+
+A research-only patch was validated against the external GPL-2.0 RK3588 Rocket/DVFS tree at commit `ed52a89afa8e68fedf636c8e891bd8fc47e82d26`. It keeps a per-core `attached_domain`: repeated jobs from the same file/domain reuse the attachment; a different domain first detaches the old one; reset, file close, and driver fini detach/clear it. The patch is intentionally not copied into RockNPU's MIT production source. A module parameter was used only to perform idle-state A/B switching during validation.
+
+Use only controlled clock data for this experiment. A non-DVFS OOT Rocket build stayed at the DT-default 200 MHz and produced about `6.3-6.8 tok/s`; those runs are not part of the 700 MHz comparison. The authoritative board state was read back as NPU compute `700 MHz`, NPU rail `800 mV`, CPU governors `performance`.
+
+At 700 MHz with `ROCKNPU_W8_DIRECT_SUBMIT=1` and `ROCKNPU_EXPERIMENT_DIRECT_SCRATCH=1`, cache off -> on projection medians were:
+
+```text
+K=512  N=32    60.96 -> 37.04 us
+K=2048 N=32    64.46 -> 45.50 us
+K=2048 N=256  113.75 -> 88.08 us
+K=2048 N=2048 249.81 -> 248.20 us
+```
+
+The deterministic 24-token TinyLlama gate passed with the cache both disabled and enabled. In addition, two independent `llama-completion` processes were run concurrently with caching enabled; both returned the exact expected stdout, providing a real multi-file/domain-switch correctness check.
+
+Whole-model `tg32` results remain noisy, so preserve the complete sequence rather than quoting only the best run. With flash attention on, a 700 MHz `r=24` A-B-A-B sequence was:
+
+```text
+cache on   17.14 ± 1.98 tok/s
+cache off  15.32 ± 1.96 tok/s
+cache on   18.12 ± 1.29 tok/s
+cache off  16.84 ± 1.92 tok/s
+```
+
+The two cache-on centers average `17.63 tok/s` versus `16.08 tok/s` for cache-off (about +9.6% center), while short `r=12` runs were less monotonic. Treat the fixed-cost microbenchmark win as established and the exact whole-model percentage as provisional until the driver change is landed in the maintained Rocket/kernel path and repeated there. In particular, `18.39 tok/s` observed in one shorter cache-on run is a valid sample but **not** a stable topline claim.
+
 ### Experimental native W4A4 M=1 decode
 
 The repository also contains a native signed-int4 M=1 register-command/executor path. The source-derived baseline register template is isolated in `crates/rocknpu-regcmd/src/int4/ork_isc.rs` under ork-driver's ISC notice; RockNPU's geometry patching, nibble packing, Rocket BO ownership/submission, resident cache, grouped execution, and multicore pool are Rust/MIT code around that isolated template.
