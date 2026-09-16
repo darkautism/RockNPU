@@ -714,38 +714,28 @@ impl Int8DecodePool {
                     "direct scratch worker {worker} missing shape cache"
                 ))
             })?;
-            let executor = Int8DecodeExecutor::from_externally_guarded_device(&worker_state.device);
-            let output = executor
-                .finish_execute_prepared_owned(pending, scratch_slot)
-                .map_err(|err| {
-                    Int8DecodePoolError::Worker(format!(
-                        "direct scratch worker {worker} finish: {err}"
-                    ))
-                })?;
-            if output.values.len() != slice.nsub || slice.n0.saturating_add(slice.nsub) > weights.n
-            {
+            if slice.n0.saturating_add(slice.nsub) > weights.n {
                 return Err(Int8DecodePoolError::Worker(format!(
                     "direct scratch worker {worker} returned invalid output geometry"
                 )));
             }
-            match weights.split {
-                Int8DecodeSplit::N => {
-                    values[slice.n0..slice.n0 + slice.nsub].copy_from_slice(&output.values);
-                }
+            let executor = Int8DecodeExecutor::from_externally_guarded_device(&worker_state.device);
+            let stats = match weights.split {
+                Int8DecodeSplit::N => executor.finish_execute_prepared_owned_into(
+                    pending,
+                    scratch_slot,
+                    &mut values[slice.n0..slice.n0 + slice.nsub],
+                ),
                 Int8DecodeSplit::K => {
-                    for (sum, partial) in values.iter_mut().zip(output.values) {
-                        *sum = sum.checked_add(partial).ok_or_else(|| {
-                            Int8DecodePoolError::Worker(
-                                "direct scratch K-split host int32 accumulation overflow"
-                                    .to_string(),
-                            )
-                        })?;
-                    }
+                    executor.finish_execute_prepared_owned_into(pending, scratch_slot, &mut values)
                 }
             }
-            npu_tasks = npu_tasks.saturating_add(output.stats.npu_tasks);
-            worker_total_ns[worker] = output.stats.total_ns;
-            worker_stats[worker] = output.stats;
+            .map_err(|err| {
+                Int8DecodePoolError::Worker(format!("direct scratch worker {worker} finish: {err}"))
+            })?;
+            npu_tasks = npu_tasks.saturating_add(stats.npu_tasks);
+            worker_total_ns[worker] = stats.total_ns;
+            worker_stats[worker] = stats;
         }
 
         Ok(Int8DecodePoolOutput {

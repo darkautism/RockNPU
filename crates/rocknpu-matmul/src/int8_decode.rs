@@ -574,11 +574,17 @@ impl<'a> Int8DecodeExecutor<'a> {
         })
     }
 
-    pub(crate) fn finish_execute_prepared_owned(
+    pub(crate) fn finish_execute_prepared_owned_into(
         &self,
         pending: Int8OwnedPending,
         scratch_slot: &mut Option<Int8OwnedScratch>,
-    ) -> Result<Int8DecodeOutput, Int8DecodeError> {
+        values: &mut [i32],
+    ) -> Result<Int8DecodeStats, Int8DecodeError> {
+        if values.len() != pending.n {
+            return Err(Int8DecodeError::InvalidInput(
+                "persistent output length must equal prepared N",
+            ));
+        }
         let scratch = scratch_slot
             .as_mut()
             .ok_or(Int8DecodeError::InvalidInput("persistent scratch missing"))?;
@@ -588,7 +594,6 @@ impl<'a> Int8DecodeExecutor<'a> {
         let submit_wait_ns = pending.submit_wait_start.elapsed().as_nanos();
 
         let accum_start = Instant::now();
-        let mut values = vec![0i32; pending.n];
         for slice in 0..pending.slices {
             for (col, sum) in values.iter_mut().enumerate() {
                 *sum = sum
@@ -604,23 +609,20 @@ impl<'a> Int8DecodeExecutor<'a> {
         scratch.partials.fini()?;
         let output_fini_ns = output_fini_start.elapsed().as_nanos();
 
-        Ok(Int8DecodeOutput {
-            values,
-            stats: Int8DecodeStats {
-                k_slices: pending.slices,
-                npu_tasks: pending.npu_tasks,
-                pack_ns: pending.pack_ns,
-                alloc_ns: pending.alloc_ns,
-                input_stage_ns: pending.input_stage_ns,
-                partial_stage_ns: pending.partial_stage_ns,
-                regcmd_stage_ns: pending.regcmd_stage_ns,
-                output_fini_ns,
-                submit_ns: pending.submit_ns,
-                wait_ns,
-                submit_wait_ns,
-                host_accum_ns,
-                total_ns: pending.total_start.elapsed().as_nanos(),
-            },
+        Ok(Int8DecodeStats {
+            k_slices: pending.slices,
+            npu_tasks: pending.npu_tasks,
+            pack_ns: pending.pack_ns,
+            alloc_ns: pending.alloc_ns,
+            input_stage_ns: pending.input_stage_ns,
+            partial_stage_ns: pending.partial_stage_ns,
+            regcmd_stage_ns: pending.regcmd_stage_ns,
+            output_fini_ns,
+            submit_ns: pending.submit_ns,
+            wait_ns,
+            submit_wait_ns,
+            host_accum_ns,
+            total_ns: pending.total_start.elapsed().as_nanos(),
         })
     }
 
