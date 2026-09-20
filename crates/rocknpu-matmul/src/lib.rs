@@ -726,6 +726,14 @@ pub struct PoolPreparedWeightStats {
     pub workers: usize,
     pub resident_bytes: usize,
     pub unique_tiles: usize,
+    pub worker_total_ns_max: u128,
+    pub plan_ns_max: u128,
+    pub layout_ns_max: u128,
+    pub alloc_mmap_ns_max: u128,
+    pub prep_ns_max: u128,
+    pub zero_ns_max: u128,
+    pub tile_pack_ns_max: u128,
+    pub fini_ns_max: u128,
     pub pack_ns_sum: u128,
     pub pack_ns_max: u128,
     pub prepare_wall_ns: u128,
@@ -1322,6 +1330,14 @@ impl Fp16MatmulPool {
                 PoolWorkerResponse::Prepared(Ok(ws)) => {
                     stats.resident_bytes += ws.resident_bytes;
                     stats.unique_tiles += ws.unique_tiles;
+                    stats.worker_total_ns_max = stats.worker_total_ns_max.max(ws.total_ns);
+                    stats.plan_ns_max = stats.plan_ns_max.max(ws.plan_ns);
+                    stats.layout_ns_max = stats.layout_ns_max.max(ws.layout_ns);
+                    stats.alloc_mmap_ns_max = stats.alloc_mmap_ns_max.max(ws.alloc_mmap_ns);
+                    stats.prep_ns_max = stats.prep_ns_max.max(ws.prep_ns);
+                    stats.zero_ns_max = stats.zero_ns_max.max(ws.zero_ns);
+                    stats.tile_pack_ns_max = stats.tile_pack_ns_max.max(ws.tile_pack_ns);
+                    stats.fini_ns_max = stats.fini_ns_max.max(ws.fini_ns);
                     stats.pack_ns_sum += ws.pack_ns;
                     stats.pack_ns_max = stats.pack_ns_max.max(ws.pack_ns);
                 }

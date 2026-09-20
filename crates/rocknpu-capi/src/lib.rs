@@ -77,10 +77,36 @@ struct CachedPoolW4A4Weight {
     workers: usize,
 }
 
+#[derive(Default)]
+struct PrefillProfile {
+    cache_hits: usize,
+    cache_misses: usize,
+    resident_bytes: usize,
+    pool_create_ns: u128,
+    dequant_ns: u128,
+    host_to_arc_ns: u128,
+    prepare_call_ns: u128,
+    prepare_pool_wall_ns: u128,
+    prepare_worker_critical_ns: u128,
+    plan_critical_ns: u128,
+    layout_critical_ns: u128,
+    alloc_mmap_critical_ns: u128,
+    prep_critical_ns: u128,
+    zero_critical_ns: u128,
+    tile_pack_critical_ns: u128,
+    fini_critical_ns: u128,
+    pack_critical_ns: u128,
+    pack_worker_sum_ns: u128,
+    activation_convert_ns: u128,
+    execute_ns: u128,
+    output_copy_ns: u128,
+}
+
 pub struct RockNpuContext {
     device: RocketDevice,
     prefill_pool: Option<Fp16MatmulPool>,
     prefill_weights: HashMap<DecodeWeightKey, (usize, Fp16MatmulPoolPreparedWeights)>,
+    prefill_profile: Option<PrefillProfile>,
     decode_pool: Int8DecodePool,
     decode_worker_cache: HashMap<(usize, usize), DecodeChoice>,
     decode_weights: HashMap<DecodeWeightKey, CachedW8A8Weight>,
@@ -123,6 +149,10 @@ fn env_enabled(name: &str) -> bool {
     env::var(name)
         .map(|value| !value.is_empty() && value != "0")
         .unwrap_or(false)
+}
+
+fn ns_to_ms(value: u128) -> f64 {
+    value as f64 / 1.0e6
 }
 
 fn w4a4_shape_enabled(k: usize, n: usize) -> bool {
@@ -1344,39 +1374,103 @@ where
     F: FnOnce() -> Vec<f16>,
 {
     if context.prefill_pool.is_none() {
+        let started = context.prefill_profile.as_ref().map(|_| Instant::now());
         context.prefill_pool = match Fp16MatmulPool::new(3) {
             Ok(pool) => Some(pool),
             Err(_) => return STATUS_EXECUTION_ERROR,
         };
+        if let (Some(profile), Some(started)) = (context.prefill_profile.as_mut(), started) {
+            profile.pool_create_ns += started.elapsed().as_nanos();
+        }
     }
-    let pool = context.prefill_pool.as_mut().unwrap();
     if context
         .prefill_weights
         .get(&key)
         .is_some_and(|(old_m, _)| *old_m != m)
     {
         let (_, old) = context.prefill_weights.remove(&key).unwrap();
-        if pool.release_prepared(&old).is_err() {
+        if context
+            .prefill_pool
+            .as_mut()
+            .unwrap()
+            .release_prepared(&old)
+            .is_err()
+        {
             return STATUS_EXECUTION_ERROR;
         }
     }
-    if let Entry::Vacant(entry) = context.prefill_weights.entry(key) {
+    if !context.prefill_weights.contains_key(&key) {
+        if let Some(profile) = context.prefill_profile.as_mut() {
+            profile.cache_misses += 1;
+        }
+        let started = context.prefill_profile.as_ref().map(|_| Instant::now());
         let weights = decode();
+        if let (Some(profile), Some(started)) = (context.prefill_profile.as_mut(), started) {
+            profile.dequant_ns += started.elapsed().as_nanos();
+        }
         if weights.len() != key.k.saturating_mul(key.n) {
             return STATUS_INVALID_ARGUMENT;
         }
-        let prepared = match pool.prepare_weights_f32(Arc::from(weights), m, key.k, key.n) {
+        let started = context.prefill_profile.as_ref().map(|_| Instant::now());
+        let weights: Arc<[f16]> = Arc::from(weights);
+        if let (Some(profile), Some(started)) = (context.prefill_profile.as_mut(), started) {
+            profile.host_to_arc_ns += started.elapsed().as_nanos();
+        }
+        let started = context.prefill_profile.as_ref().map(|_| Instant::now());
+        let prepared = match context
+            .prefill_pool
+            .as_mut()
+            .unwrap()
+            .prepare_weights_f32(weights, m, key.k, key.n)
+        {
             Ok(prepared) => prepared,
             Err(_) => return STATUS_EXECUTION_ERROR,
         };
-        entry.insert((m, prepared));
+        if let Some(profile) = context.prefill_profile.as_mut() {
+            if let Some(started) = started {
+                profile.prepare_call_ns += started.elapsed().as_nanos();
+            }
+            let stats = prepared.stats();
+            profile.resident_bytes = profile.resident_bytes.saturating_add(stats.resident_bytes);
+            profile.prepare_pool_wall_ns += stats.prepare_wall_ns;
+            profile.prepare_worker_critical_ns += stats.worker_total_ns_max;
+            profile.plan_critical_ns += stats.plan_ns_max;
+            profile.layout_critical_ns += stats.layout_ns_max;
+            profile.alloc_mmap_critical_ns += stats.alloc_mmap_ns_max;
+            profile.prep_critical_ns += stats.prep_ns_max;
+            profile.zero_critical_ns += stats.zero_ns_max;
+            profile.tile_pack_critical_ns += stats.tile_pack_ns_max;
+            profile.fini_critical_ns += stats.fini_ns_max;
+            profile.pack_critical_ns += stats.pack_ns_max;
+            profile.pack_worker_sum_ns += stats.pack_ns_sum;
+        }
+        context.prefill_weights.insert(key, (m, prepared));
+    } else if let Some(profile) = context.prefill_profile.as_mut() {
+        profile.cache_hits += 1;
     }
+    let started = context.prefill_profile.as_ref().map(|_| Instant::now());
     let a: Arc<[f16]> = activations.iter().copied().map(f16::from_f32).collect();
-    let result = match pool.execute_prepared_f32(a, m, &context.prefill_weights[&key].1) {
+    if let (Some(profile), Some(started)) = (context.prefill_profile.as_mut(), started) {
+        profile.activation_convert_ns += started.elapsed().as_nanos();
+    }
+    let started = context.prefill_profile.as_ref().map(|_| Instant::now());
+    let result = match context
+        .prefill_pool
+        .as_mut()
+        .unwrap()
+        .execute_prepared_f32(a, m, &context.prefill_weights[&key].1)
+    {
         Ok(result) => result,
         Err(_) => return STATUS_EXECUTION_ERROR,
     };
+    if let (Some(profile), Some(started)) = (context.prefill_profile.as_mut(), started) {
+        profile.execute_ns += started.elapsed().as_nanos();
+    }
+    let started = context.prefill_profile.as_ref().map(|_| Instant::now());
     output.copy_from_slice(&result.values);
+    if let (Some(profile), Some(started)) = (context.prefill_profile.as_mut(), started) {
+        profile.output_copy_ns += started.elapsed().as_nanos();
+    }
     STATUS_OK
 }
 
@@ -1403,6 +1497,7 @@ pub extern "C" fn rocknpu_context_create() -> *mut RockNpuContext {
             device,
             prefill_pool: None,
             prefill_weights: HashMap::new(),
+            prefill_profile: env_enabled("ROCKNPU_PREFILL_PROFILE").then(PrefillProfile::default),
             decode_pool,
             decode_worker_cache: HashMap::new(),
             decode_weights: HashMap::new(),
@@ -1524,6 +1619,34 @@ pub unsafe extern "C" fn rocknpu_context_destroy(context: *mut RockNpuContext) {
                 context.w4a4_worker_cache.len(),
                 context.w4a4_saturated_calls,
                 context.w4a4_saturated_outputs
+            );
+        }
+        if let Some(profile) = &context.prefill_profile {
+            eprintln!(
+                "ROCKNPU PREFILL PROFILE hits={} misses={} resident_mb={:.2} pool_create_ms={:.3} dequant_ms={:.3} host_to_arc_ms={:.3} prepare_call_ms={:.3} prepare_pool_wall_ms={:.3} prepare_call_overhead_ms={:.3} prepare_worker_critical_ms={:.3} prepare_pool_residual_ms={:.3} plan_critical_ms={:.3} layout_critical_ms={:.3} alloc_mmap_critical_ms={:.3} prep_critical_ms={:.3} zero_critical_ms={:.3} tile_pack_critical_ms={:.3} fini_critical_ms={:.3} pack_critical_ms={:.3} pack_worker_sum_ms={:.3} activation_convert_ms={:.3} execute_ms={:.3} output_copy_ms={:.3}",
+                profile.cache_hits,
+                profile.cache_misses,
+                profile.resident_bytes as f64 / (1024.0 * 1024.0),
+                ns_to_ms(profile.pool_create_ns),
+                ns_to_ms(profile.dequant_ns),
+                ns_to_ms(profile.host_to_arc_ns),
+                ns_to_ms(profile.prepare_call_ns),
+                ns_to_ms(profile.prepare_pool_wall_ns),
+                ns_to_ms(profile.prepare_call_ns.saturating_sub(profile.prepare_pool_wall_ns)),
+                ns_to_ms(profile.prepare_worker_critical_ns),
+                ns_to_ms(profile.prepare_pool_wall_ns.saturating_sub(profile.prepare_worker_critical_ns)),
+                ns_to_ms(profile.plan_critical_ns),
+                ns_to_ms(profile.layout_critical_ns),
+                ns_to_ms(profile.alloc_mmap_critical_ns),
+                ns_to_ms(profile.prep_critical_ns),
+                ns_to_ms(profile.zero_critical_ns),
+                ns_to_ms(profile.tile_pack_critical_ns),
+                ns_to_ms(profile.fini_critical_ns),
+                ns_to_ms(profile.pack_critical_ns),
+                ns_to_ms(profile.pack_worker_sum_ns),
+                ns_to_ms(profile.activation_convert_ns),
+                ns_to_ms(profile.execute_ns),
+                ns_to_ms(profile.output_copy_ns),
             );
         }
         drop(context);

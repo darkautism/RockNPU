@@ -1,14 +1,32 @@
 use super::*;
 use rocket_runtime::{RocketBuffer, RocketDevice, Task};
 use std::os::fd::RawFd;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 const WEIGHT_ALIGN: usize = 4096;
+
+fn prefill_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ROCKNPU_PREFILL_PROFILE")
+            .map(|value| !value.is_empty() && value != "0")
+            .unwrap_or(false)
+    })
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PrepackedWeightStats {
     pub unique_tiles: usize,
     pub resident_bytes: usize,
+    pub total_ns: u128,
+    pub plan_ns: u128,
+    pub layout_ns: u128,
+    pub alloc_mmap_ns: u128,
+    pub prep_ns: u128,
+    pub zero_ns: u128,
+    pub tile_pack_ns: u128,
+    pub fini_ns: u128,
     pub pack_ns: u128,
 }
 
@@ -240,8 +258,14 @@ impl<'a> Fp16MatmulExecutor<'a> {
         k: usize,
         n: usize,
     ) -> Result<Fp16PrepackedWeights<'a>, MatmulError> {
+        let total_start = prefill_profile_enabled().then(Instant::now);
+        let plan_start = prefill_profile_enabled().then(Instant::now);
         let plan = plan_fp16_matmul(m, k, n)?;
-        self.prepack_weights_plan(b, k, n, plan, false)
+        let plan_ns = plan_start.map(|started| started.elapsed().as_nanos()).unwrap_or(0);
+        let mut prepared = self.prepack_weights_plan(b, k, n, plan, false)?;
+        prepared.stats.plan_ns = plan_ns;
+        prepared.stats.total_ns = total_start.map(|started| started.elapsed().as_nanos()).unwrap_or(0);
+        Ok(prepared)
     }
 
     /// Pack B[N,K] once using an M-invariant N/K tile geometry.
@@ -256,8 +280,14 @@ impl<'a> Fp16MatmulExecutor<'a> {
         k: usize,
         n: usize,
     ) -> Result<Fp16PrepackedWeights<'a>, MatmulError> {
+        let total_start = prefill_profile_enabled().then(Instant::now);
+        let plan_start = prefill_profile_enabled().then(Instant::now);
         let plan = plan_fp16_matmul_compatible_m(4, k, n)?;
-        self.prepack_weights_plan(b, k, n, plan, true)
+        let plan_ns = plan_start.map(|started| started.elapsed().as_nanos()).unwrap_or(0);
+        let mut prepared = self.prepack_weights_plan(b, k, n, plan, true)?;
+        prepared.stats.plan_ns = plan_ns;
+        prepared.stats.total_ns = total_start.map(|started| started.elapsed().as_nanos()).unwrap_or(0);
+        Ok(prepared)
     }
 
     fn prepack_weights_plan(
@@ -276,9 +306,14 @@ impl<'a> Fp16MatmulExecutor<'a> {
                 "B must contain exactly N*K elements",
             ));
         }
+        let profiling = prefill_profile_enabled();
+        let layout_start = profiling.then(Instant::now);
         let (tiles, total_bytes) = unique_weight_layout(&plan)?;
+        let layout_ns = layout_start.map(|started| started.elapsed().as_nanos()).unwrap_or(0);
         let unique_tiles = tiles.len();
+        let alloc_start = profiling.then(Instant::now);
         let mut bo = self.device.alloc_buffer(total_bytes)?;
+        let alloc_mmap_ns = alloc_start.map(|started| started.elapsed().as_nanos()).unwrap_or(0);
         let last = bo
             .dma_address()
             .checked_add((total_bytes - 1) as u64)
@@ -287,8 +322,13 @@ impl<'a> Fp16MatmulExecutor<'a> {
             return Err(MatmulError::AddressAbove32Bit(last));
         }
         let pack_start = Instant::now();
+        let phase = profiling.then(Instant::now);
         bo.prep_relative(0)?;
+        let prep_ns = phase.map(|started| started.elapsed().as_nanos()).unwrap_or(0);
+        let phase = profiling.then(Instant::now);
         bo.as_mut_slice().fill(0);
+        let zero_ns = phase.map(|started| started.elapsed().as_nanos()).unwrap_or(0);
+        let phase = profiling.then(Instant::now);
         for entry in &tiles {
             let tile = Fp16MatmulTile {
                 m0: 0,
@@ -301,7 +341,10 @@ impl<'a> Fp16MatmulExecutor<'a> {
             let dst = &mut bo.as_mut_slice()[entry.offset..entry.offset + entry.bytes];
             pack_weight_bytes(dst, b, k, tile);
         }
+        let tile_pack_ns = phase.map(|started| started.elapsed().as_nanos()).unwrap_or(0);
+        let phase = profiling.then(Instant::now);
         bo.fini()?;
+        let fini_ns = phase.map(|started| started.elapsed().as_nanos()).unwrap_or(0);
         let pack_ns = pack_start.elapsed().as_nanos();
         Ok(Fp16PrepackedWeights {
             device_fd: self.device.fd(),
@@ -311,6 +354,14 @@ impl<'a> Fp16MatmulExecutor<'a> {
             stats: PrepackedWeightStats {
                 unique_tiles,
                 resident_bytes: total_bytes,
+                total_ns: 0,
+                plan_ns: 0,
+                layout_ns,
+                alloc_mmap_ns,
+                prep_ns,
+                zero_ns,
+                tile_pack_ns,
+                fini_ns,
                 pack_ns,
             },
             compatible_m,
