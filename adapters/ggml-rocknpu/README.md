@@ -13,6 +13,7 @@ For normal `GGML_BACKEND_PATH` auto-loading, build llama.cpp with its stock dyna
 ```sh
 cmake -S adapters/ggml-rocknpu \
   -B target/ggml-rocknpu \
+  -DCMAKE_BUILD_TYPE=Release \
   -DGGML_SOURCE_DIR=/build/llama.cpp-reference/ggml
 cmake --build target/ggml-rocknpu -j
 
@@ -25,6 +26,89 @@ Acceptance on a usable RK3588/Rocket host:
 ```text
 ROCKNPU0: RockNPU RK3588
 ```
+
+### NPU prompt processing with CPU generation
+
+For TinyLlama Q4_K_M, the native ARM CPU is currently faster at token generation
+than W8A8 NPU decode. The alternative below uses NPU acceleration for aligned
+prompt batches and leaves M=1 generation on CPU. It needs no W8 sidecar:
+
+```sh
+cmake -S /build/llama.cpp-reference -B /build/llama.cpp-reference/build-native \
+  -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DGGML_BACKEND_DL=ON -DLLAMA_CURL=OFF
+cmake --build /build/llama.cpp-reference/build-native --target llama-bench llama-completion -j4
+
+ROCKNPU_PREFILL_CACHE=1 ROCKNPU_DECODE=0 \
+GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" \
+  taskset -c 4-7 /build/llama.cpp-reference/build-native/bin/llama-bench \
+  -m /path/to/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf \
+  -dev ROCKNPU0 -p 0 -n 0 -pg 512,128 -r 3 -t 4 -fa on -o json
+```
+
+`ROCKNPU_PREFILL_CACHE=1` retains Q4_K/Q6_K weights as FP16 NPU tiles in a
+persistent three-worker pool. Output partials remain FP32, with host f64 K
+accumulation and a single narrowing to f32. Native-order output gathering changes
+memory access order without changing each value's accumulation order. F16 source
+weights still use the original bridge. The additional resident memory can approach
+two bytes per accelerated model weight, plus execution scratch.
+
+Weights must remain immutable for the lifetime of the backend context. Each weight
+keeps one exact-M layout; changing batch size replaces that layout, and freeing the
+context releases resident buffers and workers. Initial packing and a changed batch
+size incur setup cost. These switches are read before graph assignment: set them
+before creating a context, rather than toggling a context with a reused graph.
+Unset `ROCKNPU_PREFILL_CACHE` to restore the uncached bridge; unset
+`ROCKNPU_DECODE` to restore NPU W8A8 M=1 routing.
+
+The performance claim is limited to the measured prompt-plus-generation workload;
+it is not a faster-decode claim. FP16 input rounding means CPU and NPU need not
+produce identical logits or tokens. `scripts/check_llama_prefill.py` records short
+and long deterministic comparisons and actual dispatch traces.
+Use `scripts/bench_llama_cpu_npu.py --mode request --prefill-cache --npu-decode off`
+with explicit artifact paths to collect isolated CPU/NPU ABBA measurements, hashes,
+raw samples and environment snapshots. By default llama-bench performs a prompt warmup in the same
+context, so resident prefill weights are warm before timed repetitions; add `--no-warmup` when the
+first timed request must include resident-cache preparation. The recorded `pp512+tg128` cold check
+was slower than native CPU while the warmed ABBA was faster, so do not present the steady-state
+result as a cold-start claim. See [the measurement record](../../docs/benchmarks/2026-09-20/README.md).
+
+### Direct-submit decode
+
+For the validated TinyLlama W8A8 path, enable caller-thread submission and
+resident scratch together before creating the backend:
+
+```sh
+export GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so"
+export ROCKNPU_W8_DIRECT_SUBMIT=1
+export ROCKNPU_EXPERIMENT_DIRECT_SCRATCH=1
+```
+
+The existing switches remain opt-in. To return to the threaded path, **unset**
+both variables (the direct-submit switch tests presence, so `=0` is insufficient).
+The scratch path submits all selected NPU workers before waiting, reuses their
+shape-specific BOs, and accumulates their int32 outputs directly into the final
+output. It does not change the W8A8 quantization policy.
+
+An optional GGUF-derived v2 sidecar avoids preparing W8 weights from GGUF at
+runtime; see [the generator and provenance checks](../../docs/repro.md).
+Only use `make_tinyllama_w8_sidecar_gguf.py` for a GGUF-backed model. The older
+safetensors generator describes different source weights.
+
+Always verify `CMakeFiles/ggml-rocknpu.dir/flags.make` contains `-O3 -DNDEBUG`
+for the benchmark build. Cargo's `--release` optimizes the Rust library alone;
+it does not optimize C++. An unset single-config CMake build type now defaults
+to Release, while an explicit Debug build is still respected.
+
+Use the same llama.cpp executable, GGUF, CPU affinity and attention setting for
+both sides of a CPU comparison. CPU-only runs must clear `GGML_BACKEND_PATH`
+and select `-dev none -nopo 1` in llama-bench; verify stderr loads only the CPU
+backend. RockNPU is an ACCEL backend, so `-dev none` alone does not exclude it
+when the plugin is loaded. Build the CPU reference with `GGML_NATIVE=ON` on
+the RK3588 so ARM dot-product instructions are available to both runs.
+Report warm decode separately from model loading,
+weight-cache preparation and first-token latency. W8A8 remains approximate
+relative to the CPU's original GGUF quantization; matching the existing W8A8
+continuation is a regression check, not a general model-quality equivalence claim.
 
 Device registration is not a C++ stub: `ggml_backend_score` and the registry call `rocknpu_device_count()`, which probes availability through Rust `RocketDevice::open()`.
 
@@ -127,7 +211,9 @@ Accepted on RK3588: `3/3 tests passed`, `Backend ROCKNPU: OK`.
 
 ## Real TinyLlama gate
 
-Configure the same unmodified llama.cpp source with dynamic backends:
+The following is the historical correctness smoke, recorded with a generic CPU
+build. For performance work use the native Release build above; this generic build
+must not serve as the CPU speed target. Configure the unmodified source with dynamic backends:
 
 ```sh
 cmake -S /build/llama.cpp-reference \

@@ -123,6 +123,113 @@ fn unique_weight_layout(plan: &Fp16MatmulPlan) -> Result<(Vec<WeightTile>, usize
 }
 
 impl<'a> Fp16MatmulExecutor<'a> {
+    /// High-accuracy fp16-input MatMul. Every NPU K partial is emitted as
+    /// fp32 (C2=4), then K partials are accumulated on the host in f64 and
+    /// narrowed once to f32. This intentionally avoids EW accumulation entirely.
+    pub fn execute_prepacked_f32(
+        &mut self,
+        a: &[f16],
+        weights: &Fp16PrepackedWeights<'a>,
+    ) -> Result<Fp32MatmulOutput, MatmulError> {
+        let total_start = Instant::now();
+        let (m, k, n) = (weights.m(), weights.k(), weights.n());
+        if weights.device_fd != self.device.fd()
+            || weights.compatible_m
+            || a.len() != m.saturating_mul(k)
+        {
+            return Err(MatmulError::InvalidInput(
+                "exact prepacked FP32 shape/device mismatch",
+            ));
+        }
+        let plan_start = Instant::now();
+        let plan = weights.plan.clone();
+        let mut timing = ExecutionTiming {
+            plan_ns: plan_start.elapsed().as_nanos(),
+            ..ExecutionTiming::default()
+        };
+        let k_tiles = plan.k_tiles();
+        if k_tiles == 0 || plan.tiles.len() % k_tiles != 0 {
+            return Err(MatmulError::Internal(
+                "planner tile grouping is not rectangular",
+            ));
+        }
+        let mut values = vec![0.0f32; m * n];
+        let mut jobs = 0usize;
+        let mut groups = 0usize;
+        let mut host_kacc_groups = 0usize;
+
+        for group in plan.tiles.chunks(k_tiles) {
+            groups += 1;
+            validate_group(group, k)?;
+            let first = group[0];
+            let mut acc = vec![0.0f64; first.m * first.n];
+            for &tile in group {
+                let phase = Instant::now();
+                self.ensure_scratch(tile, 4, false)?;
+                timing.scratch_ns += phase.elapsed().as_nanos();
+                let (weight_dma, weight_handle) = weights.tile(tile)?;
+                let ExecutorScratch {
+                    regcmd: Some(regcmd),
+                    input: Some(input),
+                    output0: Some(output),
+                    ..
+                } = &mut self.scratch
+                else {
+                    return Err(MatmulError::Internal("fp32 scratch allocation invariant"));
+                };
+                let phase = Instant::now();
+                pack_input(input, a, k, tile)?;
+                prepare_output(output)?;
+                timing.pack_ns += phase.elapsed().as_nanos();
+                let phase = Instant::now();
+                let ops = encode_fp16_matmul_fp32_output(Fp16MatmulDesc::new(
+                    tile.m,
+                    tile.k,
+                    tile.n,
+                    input.dma_address(),
+                    weight_dma,
+                    output.dma_address(),
+                ))?;
+                timing.encode_ns += phase.elapsed().as_nanos();
+                let phase = Instant::now();
+                write_regcmd(regcmd, &ops)?;
+                timing.regcmd_write_ns += phase.elapsed().as_nanos();
+                let phase = Instant::now();
+                submit_plain_weight(self.device, regcmd, input, weight_handle, output, ops.len())?;
+                timing.submit_ns += phase.elapsed().as_nanos();
+                let phase = Instant::now();
+                output.prep_relative(WAIT_NS)?;
+                timing.wait_ns += phase.elapsed().as_nanos();
+                let phase = Instant::now();
+                accumulate_fp32_cube(&mut acc, output.as_slice(), tile.m, tile.n);
+                timing.gather_ns += phase.elapsed().as_nanos();
+                output.fini()?;
+                jobs += 1;
+            }
+            if group.len() > 1 {
+                host_kacc_groups += 1;
+            }
+            for tm in 0..first.m {
+                for tn in 0..first.n {
+                    values[(first.m0 + tm) * n + first.n0 + tn] = acc[tm * first.n + tn] as f32;
+                }
+            }
+        }
+
+        timing.total_ns = total_start.elapsed().as_nanos();
+        Ok(Fp32MatmulOutput {
+            values,
+            stats: ExecutionStats {
+                plan,
+                jobs_submitted: jobs,
+                output_tile_groups: groups,
+                npu_kacc_groups: 0,
+                host_kacc_groups,
+                timing,
+            },
+        })
+    }
+
     /// Pack B[N,K] once into a resident BO for the exact planner geometry of M/K/N.
     /// The native weight tiles are deduplicated across M tiles because their layout
     /// depends only on the N/K tile geometry.
@@ -601,6 +708,20 @@ impl<'a> Fp16MatmulExecutor<'a> {
     }
 }
 
+// Read the DMA output in its native [N/4][M][4] order. Row-major reads
+// jump between feature planes for every scalar and repeatedly pay address
+// calculation/cache misses. K partials still accumulate in exactly the same order.
+fn accumulate_fp32_cube(acc: &mut [f64], src: &[u8], m: usize, n: usize) {
+    for (nb, plane) in src[..m * n * 4].chunks_exact(m * 16).enumerate() {
+        for (tm, lanes) in plane.chunks_exact(16).enumerate() {
+            let dst = &mut acc[tm * n + nb * 4..tm * n + nb * 4 + 4];
+            for lane in 0..4 {
+                dst[lane] += get_f32(lanes, lane) as f64;
+            }
+        }
+    }
+}
+
 fn submit_plain_weight(
     device: &RocketDevice,
     regcmd: &RocketBuffer<'_>,
@@ -646,6 +767,26 @@ fn submit_accumulate_weight(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fp32_cube_gather_matches_feature_addressing_and_accumulates() {
+        for (m, n) in [(4, 16), (12, 96), (256, 688)] {
+            let mut raw = vec![0u8; m * n * 4];
+            for row in 0..m {
+                for col in 0..n {
+                    let value = (row * n + col) as f32 / 16.0 - 3.0;
+                    let native = feature_data(n, m, 1, 4, col + 1, row + 1, 1);
+                    raw[native * 4..native * 4 + 4].copy_from_slice(&value.to_le_bytes());
+                }
+            }
+            let mut acc = vec![1.0f64; m * n];
+            accumulate_fp32_cube(&mut acc, &raw, m, n);
+            accumulate_fp32_cube(&mut acc, &raw, m, n);
+            for (index, actual) in acc.into_iter().enumerate() {
+                assert_eq!(actual, 1.0 + 2.0 * (index as f64 / 16.0 - 3.0));
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

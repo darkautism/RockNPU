@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.16)
 project(ggml-rocknpu LANGUAGES CXX)
 
+# This adapter sits on every decode projection. An unset single-config build
+# type otherwise produces an unoptimized plugin even though Cargo uses Release.
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 set(GGML_SOURCE_DIR "" CACHE PATH "Path to a llama.cpp ggml directory")
 if(NOT GGML_SOURCE_DIR)
     message(FATAL_ERROR "Set GGML_SOURCE_DIR to <llama.cpp>/ggml")

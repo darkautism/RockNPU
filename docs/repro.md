@@ -909,6 +909,78 @@ cargo build --release -p rocket-smoke --bin int8_decode_ksplit
 
 The exact production-pool gate for K5632/N2048 passed against every CPU int32 result and measured `4.231 ms` single-worker versus `1.676 ms` with three-way K-split (`2.52x`). The standalone topology prototype measured `1.713 ms` in the same run. This is modestly faster than the corresponding three-way N-split because each K-split worker executes one full-K task rather than six sequential 1024/512-wide tasks. These observations are characterization only; production includes K-split candidates only for shapes that otherwise require multiple K tasks and measures them against N-split candidates at runtime. With host overhead now reduced to tens of microseconds, submit/kernel efficiency is the dominant remaining performance target.
 
+### GGUF-faithful native-W8 sidecar
+
+For native prequantized W8 experiments, generate the sidecar from the **exact GGUF being executed**, not from the original FP16/BF16 checkpoint. The runtime W8 path dequantizes the live Q4_K/Q6_K tensor first, so a sidecar quantized from a different source model is numerically a different model.
+
+```sh
+python3 scripts/make_tinyllama_w8_sidecar_gguf.py \
+  artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf \
+  /build/w8a8-models/native-w8-gguf \
+  --gguf-py /build/llama.cpp-reference/gguf-py
+```
+
+The generator emits `rocknpu-w8-sidecar-v2`, records the source GGUF size/SHA-256, uses half-away-from-zero row quantization to match the Rust runtime, and writes a lightweight source fingerprint beside every tensor. The GGML loader checks that fingerprint against the live quantized GGUF bytes before accepting a sidecar tensor. Missing or mismatched fingerprints are rejected and the normal runtime-W8 conversion is used instead; legacy v1 sidecars therefore cannot silently substitute weights.
+
+Use the corrected sidecar with:
+
+```sh
+ROCKNPU_W8_SIDECAR_DIR=/build/w8a8-models/native-w8-gguf \
+GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" \
+  /build/llama.cpp-reference/build-dl/bin/llama-completion \
+  -fit off -ngl 0 \
+  -m artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf \
+  -no-cnv -p "The capital of France is" -n 24 --temp 0 --no-warmup -t 4
+```
+
+Validated deterministic stdout is exactly:
+
+```text
+ The capital of France is Paris.
+
+2. B.C. The capital of China is Beijing.
+
+3. A
+```
+
+Its stdout SHA-256 is `08730f9092a465cc9915db41d7ba8f999504c968e4937d73b6d9f068dcae8f8d`, identical for runtime-W8, corrected-sidecar threaded, and corrected-sidecar direct-submit paths. With `ROCKNPU_GGML_TRACE=1`, the corrected v2 sidecar loaded `154/154` tensors with zero source rejections; the legacy v1 sidecar loaded zero and rejected all 154 before safe fallback.
+
+The experimental direct-submit scheduler can be enabled with `ROCKNPU_W8_DIRECT_SUBMIT=1`. On the stock 700 MHz validator, corrected-sidecar `llama-bench -p 0 -n 32 -r 12 -t 4 -dev ROCKNPU0` measured `11.58 ± 0.79 tok/s` threaded versus `13.69 ± 1.07 tok/s` direct.
+
+A second opt-in, `ROCKNPU_EXPERIMENT_DIRECT_SCRATCH=1`, keeps per-worker, per-prepared-shape regcmd/input/partial Rocket BOs alive across direct-submit decode calls. This is intentionally coupled to the caller-thread direct-submit path rather than the older sleeping-worker path: eliminating repeated `CREATE_BO+mmap` also reduces the delay between core0/core1/core2 submits. The deterministic 24-token TinyLlama gate remains exact. Two adjacent `tg32,r=12` A/B runs on the same 700 MHz board measured baseline `13.72 ± 1.12` / `13.73 ± 1.13 tok/s` versus persistent-scratch `15.28 ± 1.31` / `15.28 ± 1.32 tok/s`, a reproducible center gain of about 11.3–11.4%; a clean branch rebuilt from `f54fcf2` measured `15.76 ± 1.40` versus `13.93 ± 1.12 tok/s`. Projection microbenchmarks also moved QKV N3 from `0.333 ms` to `0.293 ms` and attention-output N3 from `0.302 ms` to `0.255 ms` while preserving the exact int32 CPU oracle. The persistent path also omits the old partial-output `PREP -> memset(0) -> FINI` because each INT8 WDMA task fully overwrites its assigned int32 range. Two `tg32,r=12` order-swapped comparisons measured `15.65 vs 15.47` and `15.64 vs 15.35 tok/s`, adding roughly another 1–2% without changing the exact continuation. The persistent finish path now also accumulates each mapped worker partial directly into the pool's final `Vec<i32>` instead of allocating a worker-local intermediate `Vec<i32>` and copying/accumulating it again. The deterministic gate remains exact. Model-level comparisons stayed in the same direction: `15.35 vs 14.99 tok/s` (+2.4%), reversed `15.65 vs 15.95 tok/s` (+1.9% for the candidate), another reversed pair `15.80 vs 15.73 tok/s` (+0.45%), and a lower-noise `tg32,r=24` run `16.19 ± 1.06 vs 16.02 ± 1.03 tok/s` (+1.06%). With persistent scratch enabled, TinyLlama's down projection (`K=5632,N=2048`) now uses three-way K split directly. After the scratch/finish changes K3 is typically only 1–4% faster than N3, so the generic tuner's 5% hysteresis kept selecting N3. Two order-swapped whole-model `tg32,r=12` comparisons measured K3 `15.85` vs N3 `15.68 tok/s` (+1.1%) and N3 `15.47` vs K3 `15.80 tok/s` (+2.1%), with the 24-token exact gate unchanged.
+
+For TinyLlama decode, forcing llama.cpp flash attention with `-fa on` also avoids the classic CPU attention chain (`KQ MUL_MAT -> SOFT_MAX -> KQV MUL_MAT -> CONT`) that `auto` selected in this mixed RockNPU/CPU configuration. The deterministic 24-token continuation remains exact. Two order-swapped `tg32,r=12` comparisons measured `15.84 ± 1.45` auto versus `16.40 ± 2.09 tok/s` with flash attention (+3.5% center), then `17.24 ± 1.96` with flash attention versus `15.51 ± 1.42 tok/s` auto (+11.2% center). This is a llama.cpp execution-mode result, not a new RockNPU NPU kernel. Applicability may vary by model/attention shape; unsupported or slower cases should retain the existing classic-attention fallback rather than globally forcing the mode without validation.
+
+### Experimental Rocket IOMMU-domain cache
+
+The current Rocket scheduler attaches the submitting file's IOMMU domain to the selected NPU core for each job and detaches it again on completion. Low-overhead kprobes measured roughly `9.5 us` median attach plus `11.0 us` median detach on a small cached job. For M=1 decode, where RockNPU submits many short jobs, that fixed kernel cost is large enough to matter.
+
+A research-only patch was validated against the external GPL-2.0 RK3588 Rocket/DVFS tree at commit `ed52a89afa8e68fedf636c8e891bd8fc47e82d26`. It keeps a per-core `attached_domain`: repeated jobs from the same file/domain reuse the attachment; a different domain first detaches the old one; reset, file close, and driver fini detach/clear it. The patch is intentionally not copied into RockNPU's MIT production source. A module parameter was used only to perform idle-state A/B switching during validation.
+
+Use only controlled clock data for this experiment. A non-DVFS OOT Rocket build stayed at the DT-default 200 MHz and produced about `6.3-6.8 tok/s`; those runs are not part of the 700 MHz comparison. The authoritative board state was read back as NPU compute `700 MHz`, NPU rail `800 mV`, CPU governors `performance`.
+
+At 700 MHz with `ROCKNPU_W8_DIRECT_SUBMIT=1` and `ROCKNPU_EXPERIMENT_DIRECT_SCRATCH=1`, cache off -> on projection medians were:
+
+```text
+K=512  N=32    60.96 -> 37.04 us
+K=2048 N=32    64.46 -> 45.50 us
+K=2048 N=256  113.75 -> 88.08 us
+K=2048 N=2048 249.81 -> 248.20 us
+```
+
+The deterministic 24-token TinyLlama gate passed with the cache both disabled and enabled. In addition, two independent `llama-completion` processes were run concurrently with caching enabled; both returned the exact expected stdout, providing a real multi-file/domain-switch correctness check.
+
+Whole-model `tg32` results remain noisy, so preserve the complete sequence rather than quoting only the best run. With flash attention on, a 700 MHz `r=24` A-B-A-B sequence was:
+
+```text
+cache on   17.14 ± 1.98 tok/s
+cache off  15.32 ± 1.96 tok/s
+cache on   18.12 ± 1.29 tok/s
+cache off  16.84 ± 1.92 tok/s
+```
+
+The two cache-on centers average `17.63 tok/s` versus `16.08 tok/s` for cache-off (about +9.6% center), while short `r=12` runs were less monotonic. Treat the fixed-cost microbenchmark win as established and the exact whole-model percentage as provisional until the driver change is landed in the maintained Rocket/kernel path and repeated there. In particular, `18.39 tok/s` observed in one shorter cache-on run is a valid sample but **not** a stable topline claim.
+
 ### Experimental native W4A4 M=1 decode
 
 The repository also contains a native signed-int4 M=1 register-command/executor path. The source-derived baseline register template is isolated in `crates/rocknpu-regcmd/src/int4/ork_isc.rs` under ork-driver's ISC notice; RockNPU's geometry patching, nibble packing, Rocket BO ownership/submission, resident cache, grouped execution, and multicore pool are Rust/MIT code around that isolated template.
@@ -951,3 +1023,56 @@ ROCKNPU_W4A4_SCOPE=ffn   # or attn / proj2048 / kv / explicit all
 This path has **hardware correctness but not model-level equivalence**. Prompt `The capital of` with greedy `-n 3` can still produce the W8A8 continuation `" the United States"`, but the longer `-n 16` gate diverges. Default W8A8 continued with `" the United States of America, Washington D.C. Is the most populous"`; FFN full-K Hadamard W4A4 instead continued `" the United States, located in the state of Virginia.\n\n2. New"`, and G=512 Hadamard also diverged later. A Q/O-only W4 experiment diverged as well. Since all of these runs reported zero saturation, the remaining difference is quantization error rather than an int16-overflow or Rocket execution failure.
 
 Whole-model speed is also not yet materially better: same-setting dynamic-backend `llama-bench -p 0 -n 8 -r 3 -t 8 -ngl 0` measured `5.09 ± 0.13 tok/s` for the FFN W4 experiment and `5.02 ± 0.17 tok/s` for default W8A8. Treat that difference as noise. W4A4 is therefore kept as an explicit research path for half-width resident weights, native-int4 kernel work, and future quantization-quality experiments; W8A8 remains the supported default decode route.
+
+### RK3588 NPU IRQ-thread latency tuning
+
+After enabling the validated per-core Rocket IOMMU-domain cache, runtime-PM bookkeeping was measured before changing it. Scoped function-graph samples put the ordinary autosuspend bookkeeping at roughly `1.167 us` median for `__pm_runtime_suspend()` (700 samples, p90 `2.042 us`), while directly observed `__pm_runtime_resume()` calls inside `rocket_job_run()` were about `5.25-5.54 us` under tracing. This is measurable but too small to be the primary remaining decode bottleneck.
+
+Rocket completion is a threaded IRQ. With the default three NPU IRQ affinities set to `0-7`, 1450 hard-IRQ/thread-entry pairs measured:
+
+```text
+p10       5 us
+median   10 us
+p90      21 us
+p99      51 us
+mean   12.208 us
+max     149 us
+```
+
+The trace repeatedly showed NPU interrupts landing on CPU0 from idle, and the board's `cpu-sleep` cpuidle state advertises a `220 us` exit latency. Pinning NPU IRQs to the A76 cluster reduced wake latency dramatically but hurt TinyLlama throughput, so do not use the big cores for this purpose.
+
+The validated topology keeps the three NPU IRQ threads on separate A55 cores and prevents only those cores from entering the deep `cpu-sleep` state:
+
+```sh
+sudo scripts/tune_rocket_irq_latency.sh apply
+# restore the normal platform policy after testing:
+sudo scripts/tune_rocket_irq_latency.sh restore
+```
+
+The helper discovers the IRQ numbers for `fdab0000.npu`, `fdac0000.npu`, and `fdad0000.npu` dynamically. On the validator, `apply` produced CPU affinity `0,1,2`; `restore` returned all three IRQs to `0-7` and re-enabled `cpu-sleep` on CPUs 0/1/2.
+
+With the A55 layout, the identical 1450-completion wake-latency distribution improved to:
+
+```text
+p10       5 us
+median    6 us
+p90       8 us
+p99      23 us
+mean    6.820 us
+max      82 us
+```
+
+The deterministic 24-token TinyLlama continuation remained exact. At `700 MHz / 800 mV`, CPU governors `performance`, per-core IOMMU-domain cache enabled, corrected GGUF-faithful native W8 sidecar, `ROCKNPU_W8_DIRECT_SUBMIT=1`, `ROCKNPU_EXPERIMENT_DIRECT_SCRATCH=1`, and flash attention forced on, interleaved whole-model blocks measured:
+
+```text
+baseline       17.74 +/- 2.47 tok/s
+A55 IRQ tune   19.18 +/- 2.15 tok/s
+baseline       18.61 +/- 1.91 tok/s
+A55 IRQ tune   19.57 +/- 2.09 tok/s
+
+# matching longer tg32,r=24 pair
+A55 IRQ tune   19.33 +/- 1.81 tok/s
+baseline       17.86 +/- 2.06 tok/s
+```
+
+The `r=24` pair is about +8.2% in center. Across these three blocks the rough unweighted centers are `18.07` baseline versus `19.36 tok/s` tuned (~+7.1%). Treat approximately `19.3-19.4 tok/s` as the repeatable candidate center, not the single `19.57` block. The known CPU TinyLlama reference is about `21.23 tok/s`, so this tuning closes the NPU path to roughly 91% of CPU throughput.

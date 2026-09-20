@@ -1,0 +1,50 @@
+{
+  "settings": {
+    "bench": "/build/llama.cpp-reference/build-native-0920/bin/llama-bench",
+    "plugin": "/build/rocknpu-validated-0920/target/ggml-rocknpu-prefill-0920/libggml-rocknpu.so",
+    "model": "/build/rocknpu/artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf",
+    "sidecar": null,
+    "output": "/build/hybrid-abba-0920",
+    "mode": "request",
+    "prefill_cache": true,
+    "npu_decode": "off",
+    "prompt": 512,
+    "tokens": 128,
+    "reps": 3,
+    "blocks": 2,
+    "cpu_threads": 4,
+    "npu_threads": 4,
+    "frequency": 700000000,
+    "allow_generic_cpu": false
+  },
+  "source_hashes": {
+    "model": "5c66751b61537f9e55177b1b67e06af88e0e2df88f86de4909f5bf87fb1ae583",
+    "bench": "d812f96f6378b13f3aad8f85e226a3ad8387ec6793759fa847ce7adb13b4ae46",
+    "plugin": "685ef6bf56f3752cc6c3345b0300686e7e83eb6616d686b71b0d7ae16874c06c",
+    "capi": "bff552fb3cf71c3fd0efe64ea6fe8f338f1a22f507b7ab9351a2a3e3b63bf20d",
+    "cpu_backend": "b5751806dfcc0e581135a6b5caf856f47e177c34fc61a5aec2c1410e94b44152"
+  },
+  "cpu_native": true,
+  "initial_environment": {
+    "kernel": "6.18.43-current-rockchip64",
+    "machine": "aarch64",
+    "/sys/class/devfreq/fdab0000.npu/cur_freq": "700000000",
+    "/sys/class/devfreq/fdab0000.npu/target_freq": "700000000",
+    "/sys/class/devfreq/fdab0000.npu/max_freq": "700000000",
+    "/sys/devices/system/cpu/cpufreq/policy6/scaling_governor": "performance",
+    "/sys/devices/system/cpu/cpufreq/policy4/scaling_governor": "performance",
+    "/sys/devices/system/cpu/cpufreq/policy0/scaling_governor": "performance",
+    "/sys/devices/system/cpu/cpufreq/policy6/scaling_cur_freq": "2400000",
+    "/sys/devices/system/cpu/cpufreq/policy4/scaling_cur_freq": "2400000",
+    "/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq": "1800000",
+    "/sys/class/thermal/thermal_zone2/temp": "48076",
+    "/sys/class/thermal/thermal_zone0/temp": "47153",
+    "/sys/class/thermal/thermal_zone5/temp": "46230",
+    "/sys/class/thermal/thermal_zone3/temp": "48076",
+    "/sys/class/thermal/thermal_zone1/temp": "48076",
+    "/sys/class/thermal/thermal_zone6/temp": "46230",
+    "/sys/class/thermal/thermal_zone4/temp": "47153"
+  },
+  "warmup_policy": "llama-bench default warmup ran before timing; the same context therefore entered timed repetitions with resident prefill weights already prepared",
+  "timing_scope": "llama-bench timed workload; model loading and default warmup excluded; steady-state resident-cache measurement"
+}
