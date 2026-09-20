@@ -100,3 +100,67 @@ Mechanistically, the existing runtime conversion is better matched to this syste
 **H1-C is therefore rejected.** Do not retry raw row-major FP16 persistence unless the storage/memory mechanism changes materially (for example a genuinely device-ready compact representation with evidence that total bytes read are lower). The failed production prototype should not be promoted or retained in main.
 
 The next useful experiment is **H1-B**, specifically parallelizing the stable ~3 second Q4/Q6 dequant phase while leaving the already-parallel resident worker packing unchanged.
+
+## H1-B result: parallel Q4_K/Q6_K prefill dequant
+
+Candidate commit: `7e3c16249267a140d66be896f2fa1f259cebf2cd`.
+
+The candidate keeps serial dequant as the default and enables the experiment with `ROCKNPU_PREFILL_PARALLEL_DEQUANT=1`. Large projection tensors (at least 1,048,576 values) dequantize Q4_K/Q6_K blocks in parallel with Rayon. Formal runs used `RAYON_NUM_THREADS=4` and `taskset -c 4-7`, matching the four A76 cores. Small tensors remain serial.
+
+Correctness gates passed independently on o8g and o16g:
+
+- `rocknpu-capi`: 10/10, including new bit-for-bit serial-vs-parallel Q4_K and Q6_K dequant tests;
+- `rocknpu-matmul`: 20/20;
+- full `pp512+tg128` requests completed normally;
+- documented TinyLlama deterministic 24-token gate with runtime-W8 decode enabled produced stdout SHA-256 `08730f9092a465cc9915db41d7ba8f999504c968e4937d73b6d9f068dcae8f8d`, exactly matching the current contract.
+
+### o8g mechanism diagnostic
+
+Fresh-process `pp512 --no-warmup`, same build, profiling enabled only for diagnosis:
+
+| phase/workload | serial A | parallel B | effect |
+| --- | ---: | ---: | ---: |
+| dequant sample 1 | 3036.620 ms | 1257.234 ms | |
+| dequant sample 2 | 3023.819 ms | 1333.937 ms | |
+| **dequant mean** | **3030.220 ms** | **1295.586 ms** | **-57.24%** |
+| pp512 sample 1 | 10.955095 s | 9.211561 s | |
+| pp512 sample 2 | 10.961316 s | 9.482908 s | |
+| **pp512 mean** | **10.958205 s** | **9.347235 s** | **-14.70%**, `1.172x` |
+
+The resident preparation and NPU execute phases stayed in the same range. The improvement tracks the targeted CPU dequant phase rather than a scheduler/cache artifact.
+
+### o8g formal cold full request
+
+Tracing/profile off, fresh process, `pp512+tg128`, `--no-warmup`, A/B/B/A:
+
+- serial A: `15.761268`, `15.725260` s;
+- parallel B: `13.980560`, `14.342719` s;
+- serial mean/median: `15.743264` s;
+- parallel mean/median: `14.161640` s;
+- population stddev: serial `0.018004` s, parallel `0.181079` s;
+- absolute delta: `1.581624` s/request;
+- latency reduction: **10.05%**;
+- speedup: **1.112x**.
+
+### o16g independent validator
+
+o16g independently fetched and detached at the exact candidate commit, rebuilt the plugin, and re-ran targeted tests. Hardware was NPU 700 MHz with all CPU policies on `performance`; model SHA-256 remained `5c66751b61537f9e55177b1b67e06af88e0e2df88f86de4909f5bf87fb1ae583`.
+
+A parallel-only diagnostic measured `dequant=1193.468 ms`; the prior same-board H1 serial diagnostic measured `2942.869 ms`, confirming the same mechanism reduction.
+
+Formal tracing-off fresh-process `pp512+tg128`, `--no-warmup`, reversed order B/A/A/B:
+
+- parallel B: `13.884932`, `13.779607` s;
+- serial A: `15.891719`, `15.729858` s;
+- serial mean/median: `15.810788` s;
+- parallel mean/median: `13.832270` s;
+- population stddev: serial `0.080931` s, parallel `0.052662` s;
+- absolute delta: `1.978519` s/request;
+- latency reduction: **12.51%**;
+- speedup: **1.143x**.
+
+### Verdict
+
+**PROMOTE.** H1-B passes correctness, mechanism, o8g gain, o16g reproduction, whole-request gain above noise, and introduces no model-format/license change. It specifically improves cold first-use preparation; warmed resident-cache behavior should remain unchanged after preparation.
+
+One measured cold cost remains conspicuous after parallel dequant: converting the decoded `Vec<f16>` into `Arc<[f16]>` still costs roughly `0.7-0.8 s` per model load. A follow-up child experiment may remove that copy by borrowing the decoded Vec synchronously while the persistent workers pack resident BOs. Keep `7e3c162` as the validated fallback candidate if that extra optimization does not reproduce.
