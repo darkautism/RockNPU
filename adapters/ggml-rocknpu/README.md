@@ -52,6 +52,12 @@ memory access order without changing each value's accumulation order. F16 source
 weights still use the original bridge. The additional resident memory can approach
 two bytes per accelerated model weight, plus execution scratch.
 
+For cached Q4_K/Q6_K prompt weights, large cold dequantization is parallel by
+default. Set `ROCKNPU_PREFILL_PARALLEL_DEQUANT=0` before creating the context to
+force the serial fallback. The documented RK3588 performance setup already pins
+llama.cpp to the four Cortex-A76 cores (`taskset -c 4-7`); under that affinity no
+`RAYON_NUM_THREADS` override is required.
+
 Weights must remain immutable for the lifetime of the backend context. Each weight
 keeps one exact-M layout; changing batch size replaces that layout, and freeing the
 context releases resident buffers and workers. Initial packing and a changed batch
@@ -68,9 +74,11 @@ Use `scripts/bench_llama_cpu_npu.py --mode request --prefill-cache --npu-decode 
 with explicit artifact paths to collect isolated CPU/NPU ABBA measurements, hashes,
 raw samples and environment snapshots. By default llama-bench performs a prompt warmup in the same
 context, so resident prefill weights are warm before timed repetitions; add `--no-warmup` when the
-first timed request must include resident-cache preparation. The recorded `pp512+tg128` cold check
-was slower than native CPU while the warmed ABBA was faster, so do not present the steady-state
-result as a cold-start claim. See [the measurement record](../../docs/benchmarks/2026-09-20/README.md).
+first timed request must include resident-cache preparation. The original recorded `pp512+tg128` cold check predates the later H1 cold-start
+optimizations. Those optimizations materially narrow the cold gap but do not yet
+establish a cold CPU win; keep cold and steady-state claims separate. See
+[the measurement record](../../docs/benchmarks/2026-09-20/README.md) and the
+[H1 decomposition](../../docs/benchmarks/2026-09-20/h1-cold-phase-decomposition.md).
 
 ### Direct-submit decode
 

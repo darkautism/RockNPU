@@ -237,3 +237,21 @@ A custom RockNPU buffer type could in principle take ownership of model tensors 
 - H1-B parallel Q4_K/Q6_K dequant: **PROMOTE** — large mechanism and whole-request gains reproduced on two boards.
 - H1-B child Arc/Vec allocation reuse: **PROMOTE** — removes the remaining host bulk copy and yields an additional ~9.6-9.7% cold full-request latency reduction on two boards.
 - H1-A load-time eager prepare: **REJECT for current stock-GGML integration** — shifts rather than removes work and lacks a non-invasive model-load hook with the current host-buffer design.
+
+### Production default and fallback check
+
+After promotion, parallel Q4_K/Q6_K prefill dequant is enabled by default and
+`ROCKNPU_PREFILL_PARALLEL_DEQUANT=0` remains an explicit serial fallback.
+
+On o8g with the documented `taskset -c 4-7` affinity and `RAYON_NUM_THREADS`
+unset, the parallel path measured `dequant=1008.950 ms`, essentially identical to
+the explicit four-thread diagnostic (`1009.966 ms`). The serial opt-out measured
+`dequant=3188.919 ms`, confirming the fallback still selects the intended path.
+The Arc/Vec reuse remained active in both cases (`host_to_arc=0.125-0.127 ms`).
+
+A fresh-process production-default `pp512+tg128` diagnostic on o8g measured
+`13.302210 s`. A separate same-setting CPU diagnostic measured `11.949711 s`.
+These are single diagnostics rather than a formal CPU/hybrid ABBA, so they are not
+used as a promotion statistic; they confirm only that the cold CPU gap is narrowed
+but not yet eliminated. The existing warmed/steady-state result remains a separate
+claim.

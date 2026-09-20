@@ -146,10 +146,14 @@ pub struct RockNpuDecodeCacheStats {
     pub ksplit_calls: usize,
 }
 
-fn env_enabled(name: &str) -> bool {
+fn env_enabled_default(name: &str, default: bool) -> bool {
     env::var(name)
         .map(|value| !value.is_empty() && value != "0")
-        .unwrap_or(false)
+        .unwrap_or(default)
+}
+
+fn env_enabled(name: &str) -> bool {
+    env_enabled_default(name, false)
 }
 
 fn ns_to_ms(value: u128) -> f64 {
@@ -2351,7 +2355,7 @@ pub unsafe extern "C" fn rocknpu_matmul_q4_k_f32_f32(
             dequantize_q4_k_prefill_f16(
                 weight_bytes,
                 weight_values,
-                env_enabled("ROCKNPU_PREFILL_PARALLEL_DEQUANT"),
+                env_enabled_default("ROCKNPU_PREFILL_PARALLEL_DEQUANT", true),
             )
         });
     }
@@ -2476,7 +2480,7 @@ pub unsafe extern "C" fn rocknpu_matmul_q6_k_f32_f32(
             dequantize_q6_k_prefill_f16(
                 weight_bytes,
                 weight_values,
-                env_enabled("ROCKNPU_PREFILL_PARALLEL_DEQUANT"),
+                env_enabled_default("ROCKNPU_PREFILL_PARALLEL_DEQUANT", true),
             )
         });
     }
