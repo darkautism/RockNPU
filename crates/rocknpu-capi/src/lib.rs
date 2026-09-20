@@ -8,7 +8,8 @@ use rocket_runtime::RocketDevice;
 use rocknpu_matmul::{
     Fp16MatmulExecutor, Fp16MatmulPool, Fp16MatmulPoolPreparedWeights, Int4DecodeExecutor,
     Int4DecodePool, Int4DecodePoolPreparedWeights, Int4GroupedPreparedWeights, Int4PreparedWeights,
-    Int8DecodePool, Int8DecodePoolPreparedWeights, Int8DecodeSplit,
+    Int8DecodeExecutor, Int8DecodePool, Int8DecodePoolPreparedWeights, Int8DecodeSplit,
+    Int8MtileScratch, Int8PreparedWeights,
 };
 use std::collections::{HashMap, hash_map::Entry};
 use std::env;
@@ -62,6 +63,11 @@ struct CachedW8A8Weight {
     choice: DecodeChoice,
 }
 
+struct CachedW8MtileWeight {
+    prepared: Int8PreparedWeights,
+    scales: Vec<f32>,
+}
+
 struct CachedW4A4Weight {
     prepared: Int4PreparedWeights,
     scales: Vec<f32>,
@@ -76,6 +82,21 @@ struct CachedPoolW4A4Weight {
     prepared: Int4DecodePoolPreparedWeights,
     scales: Vec<f32>,
     workers: usize,
+}
+
+#[derive(Default)]
+struct MtileProfile {
+    calls: usize,
+    ksplit_calls: usize,
+    quant_ns: u128,
+    alloc_ns: u128,
+    input_stage_ns: u128,
+    regcmd_stage_ns: u128,
+    submit_ns: u128,
+    wait_ns: u128,
+    host_accum_ns: u128,
+    execute_total_ns: u128,
+    rescale_ns: u128,
 }
 
 #[derive(Default)]
@@ -108,9 +129,12 @@ pub struct RockNpuContext {
     prefill_pool: Option<Fp16MatmulPool>,
     prefill_weights: HashMap<DecodeWeightKey, (usize, Fp16MatmulPoolPreparedWeights)>,
     prefill_profile: Option<PrefillProfile>,
+    mtile_profile: Option<MtileProfile>,
     decode_pool: Int8DecodePool,
     decode_worker_cache: HashMap<(usize, usize), DecodeChoice>,
     decode_weights: HashMap<DecodeWeightKey, CachedW8A8Weight>,
+    decode_mtile_weights: HashMap<DecodeWeightKey, CachedW8MtileWeight>,
+    decode_mtile_scratch: HashMap<(usize, usize), Option<Int8MtileScratch>>,
     decode_pair_weights: HashMap<DecodePairKey, CachedW8A8Weight>,
     decode_triple_weights: HashMap<DecodeTripleKey, CachedW8A8Weight>,
     decode_w4a4_weights: HashMap<DecodeWeightKey, CachedW4A4Weight>,
@@ -1135,6 +1159,112 @@ where
     STATUS_OK
 }
 
+fn execute_cached_w8a8_m16<F>(
+    context: &mut RockNpuContext,
+    key: DecodeWeightKey,
+    activations_mk_f32: &[f32],
+    output_mn_f32: &mut [f32],
+    prepare: F,
+) -> i32
+where
+    F: FnOnce() -> Option<(Vec<i8>, Vec<f32>)>,
+{
+    const M: usize = 16;
+    let Some(expected_a) = M.checked_mul(key.k) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let Some(expected_out) = M.checked_mul(key.n) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    if activations_mk_f32.len() != expected_a
+        || output_mn_f32.len() != expected_out
+        || !(key.k <= 4096 || key.k == 5632)
+        || !key.k.is_multiple_of(512)
+        || !key.n.is_multiple_of(32)
+        || key.n > 8192
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    let quant_started = context.mtile_profile.as_ref().map(|_| Instant::now());
+    let mut activations_i8 = Vec::with_capacity(expected_a);
+    let mut activation_scales = Vec::with_capacity(M);
+    for row in activations_mk_f32.chunks_exact(key.k) {
+        let Some((q, scale)) = quantize_symmetric(row) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        activations_i8.extend_from_slice(&q);
+        activation_scales.push(scale);
+    }
+    if let (Some(profile), Some(started)) = (context.mtile_profile.as_mut(), quant_started) {
+        profile.quant_ns += started.elapsed().as_nanos();
+    }
+
+    let executor = Int8DecodeExecutor::from_externally_guarded_device(&context.device);
+    let cached = match context.decode_mtile_weights.entry(key) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => {
+            let Some((weights_i8, scales)) = prepare() else {
+                return STATUS_INVALID_ARGUMENT;
+            };
+            let prepared = match executor.prepare_weights(&weights_i8, key.k, key.n) {
+                Ok(prepared) => prepared,
+                Err(_) => return STATUS_EXECUTION_ERROR,
+            };
+            entry.insert(CachedW8MtileWeight { prepared, scales })
+        }
+    };
+
+    let result = if key.k > 4096 {
+        match executor.execute_prepared_m16(&activations_i8, &cached.prepared) {
+            Ok(result) => result,
+            Err(_) => return STATUS_EXECUTION_ERROR,
+        }
+    } else if env_enabled("ROCKNPU_MTILE_PERSIST") {
+        let scratch_slot = context
+            .decode_mtile_scratch
+            .entry((key.k, key.n))
+            .or_insert(None);
+        match executor.execute_prepared_m16_persistent(
+            &activations_i8,
+            &cached.prepared,
+            scratch_slot,
+        ) {
+            Ok(result) => result,
+            Err(_) => return STATUS_EXECUTION_ERROR,
+        }
+    } else {
+        match executor.execute_prepared_m16_single(&activations_i8, &cached.prepared) {
+            Ok(result) => result,
+            Err(_) => return STATUS_EXECUTION_ERROR,
+        }
+    };
+    if let Some(profile) = context.mtile_profile.as_mut() {
+        profile.calls += 1;
+        profile.ksplit_calls += usize::from(result.stats.k_slices > 1);
+        profile.alloc_ns += result.stats.alloc_ns;
+        profile.input_stage_ns += result.stats.input_stage_ns;
+        profile.regcmd_stage_ns += result.stats.regcmd_stage_ns;
+        profile.submit_ns += result.stats.submit_ns;
+        profile.wait_ns += result.stats.wait_ns;
+        profile.host_accum_ns += result.stats.host_accum_ns;
+        profile.execute_total_ns += result.stats.total_ns;
+    }
+    let rescale_started = context.mtile_profile.as_ref().map(|_| Instant::now());
+    for row in 0..M {
+        let a_scale = activation_scales[row];
+        for col in 0..key.n {
+            output_mn_f32[row * key.n + col] = result.values[row * key.n + col] as f32
+                * a_scale
+                * cached.scales[col];
+        }
+    }
+    if let (Some(profile), Some(started)) = (context.mtile_profile.as_mut(), rescale_started) {
+        profile.rescale_ns += started.elapsed().as_nanos();
+    }
+    STATUS_OK
+}
+
 fn execute_cached_w8a8_pair_m1<F>(
     context: &mut RockNpuContext,
     key: DecodePairKey,
@@ -1569,9 +1699,12 @@ pub extern "C" fn rocknpu_context_create() -> *mut RockNpuContext {
             prefill_pool: None,
             prefill_weights: HashMap::new(),
             prefill_profile: env_enabled("ROCKNPU_PREFILL_PROFILE").then(PrefillProfile::default),
+            mtile_profile: env_enabled("ROCKNPU_MTILE_PROFILE").then(MtileProfile::default),
             decode_pool,
             decode_worker_cache: HashMap::new(),
             decode_weights: HashMap::new(),
+            decode_mtile_weights: HashMap::new(),
+            decode_mtile_scratch: HashMap::new(),
             decode_pair_weights: HashMap::new(),
             decode_triple_weights: HashMap::new(),
             decode_w4a4_weights: HashMap::new(),
@@ -1690,6 +1823,22 @@ pub unsafe extern "C" fn rocknpu_context_destroy(context: *mut RockNpuContext) {
                 context.w4a4_worker_cache.len(),
                 context.w4a4_saturated_calls,
                 context.w4a4_saturated_outputs
+            );
+        }
+        if let Some(profile) = &context.mtile_profile {
+            eprintln!(
+                "ROCKNPU MTILE PROFILE calls={} ksplit_calls={} quant_ms={:.3} alloc_ms={:.3} input_stage_ms={:.3} regcmd_ms={:.3} submit_ms={:.3} wait_ms={:.3} host_accum_ms={:.3} execute_total_ms={:.3} rescale_ms={:.3}",
+                profile.calls,
+                profile.ksplit_calls,
+                ns_to_ms(profile.quant_ns),
+                ns_to_ms(profile.alloc_ns),
+                ns_to_ms(profile.input_stage_ns),
+                ns_to_ms(profile.regcmd_stage_ns),
+                ns_to_ms(profile.submit_ns),
+                ns_to_ms(profile.wait_ns),
+                ns_to_ms(profile.host_accum_ns),
+                ns_to_ms(profile.execute_total_ns),
+                ns_to_ms(profile.rescale_ns),
             );
         }
         if let Some(profile) = &context.prefill_profile {
@@ -1850,6 +1999,60 @@ pub unsafe extern "C" fn rocknpu_matmul_w8a8_f32_f32_m1(
         kind: DecodeWeightKind::Q4K,
     };
     execute_cached_w8a8_m1(context, key, activations, output, || {
+        Some((weights.to_vec(), scales.to_vec()))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rocknpu_matmul_w8a8_f32_f32_m16(
+    context: *mut RockNpuContext,
+    weights_nk_i8: *const i8,
+    weight_scales_n_f32: *const f32,
+    activations_mk_f32: *const f32,
+    output_mn_f32: *mut f32,
+    k: usize,
+    n: usize,
+) -> i32 {
+    const M: usize = 16;
+    if context.is_null()
+        || weights_nk_i8.is_null()
+        || weight_scales_n_f32.is_null()
+        || activations_mk_f32.is_null()
+        || output_mn_f32.is_null()
+        || k == 0
+        || n == 0
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let Some(weight_len) = k.checked_mul(n) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let Some(activation_len) = M.checked_mul(k) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let Some(output_len) = M.checked_mul(n) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let (weights, scales, activations, output, context) = unsafe {
+        (
+            slice::from_raw_parts(weights_nk_i8, weight_len),
+            slice::from_raw_parts(weight_scales_n_f32, n),
+            slice::from_raw_parts(activations_mk_f32, activation_len),
+            slice::from_raw_parts_mut(output_mn_f32, output_len),
+            &mut *context,
+        )
+    };
+    if scales.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let key = DecodeWeightKey {
+        address: weights.as_ptr() as usize,
+        bytes: weight_len,
+        k,
+        n,
+        kind: DecodeWeightKind::Q4K,
+    };
+    execute_cached_w8a8_m16(context, key, activations, output, || {
         Some((weights.to_vec(), scales.to_vec()))
     })
 }
@@ -2343,6 +2546,25 @@ pub unsafe extern "C" fn rocknpu_matmul_q4_k_f32_f32(
         });
     }
 
+    if m == 16
+        && k <= 4096
+        && k.is_multiple_of(512)
+        && n.is_multiple_of(32)
+        && n <= 8192
+        && env_enabled("ROCKNPU_W8_MTILE")
+    {
+        let key = DecodeWeightKey {
+            address: weight_bytes.as_ptr() as usize,
+            bytes: weight_bytes.len(),
+            k,
+            n,
+            kind: DecodeWeightKind::Q4K,
+        };
+        return execute_cached_w8a8_m16(context, key, activations, output, || {
+            prepare_q4_k_w8a8(weight_bytes, k, n)
+        });
+    }
+
     if env_enabled("ROCKNPU_PREFILL_CACHE") {
         let key = DecodeWeightKey {
             address: weight_bytes.as_ptr() as usize,
@@ -2464,6 +2686,25 @@ pub unsafe extern "C" fn rocknpu_matmul_q6_k_f32_f32(
             kind: DecodeWeightKind::Q6K,
         };
         return execute_cached_w8a8_m1(context, key, activations, output, || {
+            prepare_q6_k_w8a8(weight_bytes, k, n)
+        });
+    }
+
+    if m == 16
+        && k <= 4096
+        && k.is_multiple_of(512)
+        && n.is_multiple_of(32)
+        && n <= 8192
+        && env_enabled("ROCKNPU_W8_MTILE")
+    {
+        let key = DecodeWeightKey {
+            address: weight_bytes.as_ptr() as usize,
+            bytes: weight_bytes.len(),
+            k,
+            n,
+            kind: DecodeWeightKind::Q6K,
+        };
+        return execute_cached_w8a8_m16(context, key, activations, output, || {
             prepare_q6_k_w8a8(weight_bytes, k, n)
         });
     }

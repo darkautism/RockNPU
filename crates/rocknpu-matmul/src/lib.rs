@@ -29,7 +29,7 @@ pub use int4_decode_pool::{
 };
 pub use int8_decode::{
     Int8DecodeError, Int8DecodeExecutor, Int8DecodeOutput, Int8DecodeStats,
-    Int8PreparedWeightStats, Int8PreparedWeights,
+    Int8MtileScratch, Int8PreparedWeightStats, Int8PreparedWeights,
 };
 pub use int8_decode_pool::{
     Int8DecodePool, Int8DecodePoolError, Int8DecodePoolOutput, Int8DecodePoolPreparedStats,

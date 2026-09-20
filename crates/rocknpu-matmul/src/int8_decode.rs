@@ -3,7 +3,7 @@
 use rocket_runtime::{RocketBuffer, RocketDevice, RocketOwnedBuffer, Task};
 use rocknpu_regcmd::{
     INT8_REGCMD_COUNT, Int8DecodeDesc, Int8EncodeError, encode_int8_decode_m1,
-    weight_i8_fullk_index,
+    encode_int8_mtile, weight_i8_fullk_index,
 };
 use std::fmt;
 use std::io;
@@ -129,6 +129,12 @@ pub(crate) struct Int8OwnedScratch {
     partials: RocketOwnedBuffer,
 }
 
+pub struct Int8MtileScratch {
+    regcmd: RocketOwnedBuffer,
+    input: RocketOwnedBuffer,
+    output: RocketOwnedBuffer,
+}
+
 pub(crate) struct Int8OwnedPending {
     slices: usize,
     n: usize,
@@ -167,11 +173,460 @@ impl<'a> Int8DecodeExecutor<'a> {
         })
     }
 
-    pub(crate) fn from_externally_guarded_device(device: &'a RocketDevice) -> Self {
+    pub fn from_externally_guarded_device(device: &'a RocketDevice) -> Self {
         Self {
             device,
             _guard: None,
         }
+    }
+    /// Execute the hardware-proven research M=16 W8A8 tile against one full-K resident
+    /// weight slice while reusing context-owned Rocket BOs across calls.
+    pub fn execute_prepared_m16_persistent(
+        &self,
+        a_mk: &[i8],
+        weights: &Int8PreparedWeights,
+        scratch_slot: &mut Option<Int8MtileScratch>,
+    ) -> Result<Int8DecodeOutput, Int8DecodeError> {
+        const M: usize = 16;
+        let total_start = Instant::now();
+        if self.device.fd() != weights.device_fd {
+            return Err(Int8DecodeError::InvalidInput(
+                "prepared weights belong to a different Rocket device",
+            ));
+        }
+        if weights.slices != 1 || weights.k > SINGLE_SUBMIT_K_MAX {
+            return Err(Int8DecodeError::InvalidInput(
+                "persistent M=16 path requires one full-K prepared weight slice",
+            ));
+        }
+        let expected_a = M
+            .checked_mul(weights.k)
+            .ok_or(Int8DecodeError::SizeOverflow)?;
+        if a_mk.len() != expected_a {
+            return Err(Int8DecodeError::InvalidInput("A length must equal 16*K"));
+        }
+        let output_values = M
+            .checked_mul(weights.n)
+            .ok_or(Int8DecodeError::SizeOverflow)?;
+        let output_bytes = output_values
+            .checked_mul(4)
+            .ok_or(Int8DecodeError::SizeOverflow)?;
+
+        let alloc_start = Instant::now();
+        let needs_grow = scratch_slot.as_ref().is_none_or(|scratch| {
+            scratch.regcmd.len() < REGCMD_BYTES
+                || scratch.input.len() < expected_a
+                || scratch.output.len() < output_bytes
+        });
+        if needs_grow {
+            let old = scratch_slot.as_ref();
+            let regcmd_capacity = old.map_or(REGCMD_BYTES, |s| s.regcmd.len().max(REGCMD_BYTES));
+            let input_capacity = old.map_or(expected_a, |s| s.input.len().max(expected_a));
+            let output_capacity = old.map_or(output_bytes, |s| s.output.len().max(output_bytes));
+            let scratch = Int8MtileScratch {
+                regcmd: self.device.alloc_owned_buffer(regcmd_capacity)?,
+                input: self.device.alloc_owned_buffer(input_capacity)?,
+                output: self.device.alloc_owned_buffer(output_capacity)?,
+            };
+            for (addr, len) in [
+                (scratch.regcmd.dma_address(), scratch.regcmd.len()),
+                (scratch.input.dma_address(), scratch.input.len()),
+                (scratch.output.dma_address(), scratch.output.len()),
+            ] {
+                check_dma32_range(addr, len)?;
+            }
+            *scratch_slot = Some(scratch);
+        }
+        let alloc_ns = alloc_start.elapsed().as_nanos();
+        let scratch = scratch_slot
+            .as_mut()
+            .ok_or(Int8DecodeError::InvalidInput("persistent M=16 scratch missing"))?;
+
+        let input_stage_start = Instant::now();
+        scratch.input.prep_relative(0)?;
+        for (dst, src) in scratch.input.as_mut_slice()[..expected_a]
+            .iter_mut()
+            .zip(a_mk.iter().copied())
+        {
+            *dst = src as u8;
+        }
+        scratch.input.fini()?;
+        let input_stage_ns = input_stage_start.elapsed().as_nanos();
+
+        let regcmd_stage_start = Instant::now();
+        let ops = encode_int8_mtile(
+            M,
+            Int8DecodeDesc::new(
+                weights.k,
+                weights.n,
+                scratch.input.dma_address(),
+                weights.bo.dma_address(),
+                scratch.output.dma_address(),
+            ),
+        )?;
+        scratch.regcmd.prep_relative(0)?;
+        scratch.regcmd.as_mut_slice()[..REGCMD_BYTES].fill(0);
+        write_regcmd_bytes(scratch.regcmd.as_mut_slice(), 0, &ops)?;
+        scratch.regcmd.fini()?;
+        let regcmd_stage_ns = regcmd_stage_start.elapsed().as_nanos();
+
+        let reg_addr = scratch.regcmd.dma_address();
+        let task = Task {
+            regcmd: u32::try_from(reg_addr)
+                .map_err(|_| Int8DecodeError::AddressAbove32Bit(reg_addr))?,
+            regcmd_count: u32::try_from(ops.len()).map_err(|_| Int8DecodeError::SizeOverflow)?,
+        };
+        let submit_wait_start = Instant::now();
+        let submit_start = Instant::now();
+        self.device.submit(
+            &[task],
+            &[
+                scratch.input.handle(),
+                weights.bo.handle(),
+                scratch.regcmd.handle(),
+            ],
+            &[scratch.output.handle()],
+        )?;
+        let submit_ns = submit_start.elapsed().as_nanos();
+        let wait_start = Instant::now();
+        scratch.output.prep_relative(WAIT_NS)?;
+        let wait_ns = wait_start.elapsed().as_nanos();
+        let submit_wait_ns = submit_wait_start.elapsed().as_nanos();
+
+        let mut values = Vec::with_capacity(output_values);
+        for i in 0..output_values {
+            values.push(read_i32(scratch.output.as_slice(), i));
+        }
+        let output_fini_start = Instant::now();
+        scratch.output.fini()?;
+        let output_fini_ns = output_fini_start.elapsed().as_nanos();
+
+        Ok(Int8DecodeOutput {
+            values,
+            stats: Int8DecodeStats {
+                k_slices: 1,
+                npu_tasks: 1,
+                pack_ns: input_stage_ns + regcmd_stage_ns,
+                alloc_ns,
+                input_stage_ns,
+                partial_stage_ns: 0,
+                regcmd_stage_ns,
+                output_fini_ns,
+                submit_ns,
+                wait_ns,
+                submit_wait_ns,
+                host_accum_ns: 0,
+                total_ns: total_start.elapsed().as_nanos(),
+            },
+        })
+    }
+
+    /// Original single-slice M=16 fast path. Keep this separate from the later K-split
+    /// experiment so K<=4096 model routing does not pay partial-buffer/host-accumulation overhead.
+    pub fn execute_prepared_m16_single(
+        &self,
+        a_mk: &[i8],
+        weights: &Int8PreparedWeights,
+    ) -> Result<Int8DecodeOutput, Int8DecodeError> {
+        const M: usize = 16;
+        let total_start = Instant::now();
+        if self.device.fd() != weights.device_fd {
+            return Err(Int8DecodeError::InvalidInput(
+                "prepared weights belong to a different Rocket device",
+            ));
+        }
+        if weights.slices != 1 || weights.k > SINGLE_SUBMIT_K_MAX {
+            return Err(Int8DecodeError::InvalidInput(
+                "single-slice M=16 path requires one full-K prepared weight slice",
+            ));
+        }
+        let expected_a = M
+            .checked_mul(weights.k)
+            .ok_or(Int8DecodeError::SizeOverflow)?;
+        if a_mk.len() != expected_a {
+            return Err(Int8DecodeError::InvalidInput("A length must equal 16*K"));
+        }
+        let output_values = M
+            .checked_mul(weights.n)
+            .ok_or(Int8DecodeError::SizeOverflow)?;
+        let output_bytes = output_values
+            .checked_mul(4)
+            .ok_or(Int8DecodeError::SizeOverflow)?;
+
+        let alloc_start = Instant::now();
+        let mut regcmd = self.device.alloc_buffer(REGCMD_BYTES)?;
+        let mut input = self.device.alloc_buffer(expected_a)?;
+        let output = self.device.alloc_buffer(output_bytes)?;
+        for bo in [&regcmd, &input, &output] {
+            check_dma32_range(bo.dma_address(), bo.len())?;
+        }
+        let alloc_ns = alloc_start.elapsed().as_nanos();
+
+        let input_stage_start = Instant::now();
+        input.prep_relative(0)?;
+        for (dst, src) in input.as_mut_slice().iter_mut().zip(a_mk.iter().copied()) {
+            *dst = src as u8;
+        }
+        input.fini()?;
+        let input_stage_ns = input_stage_start.elapsed().as_nanos();
+
+        let regcmd_stage_start = Instant::now();
+        let ops = encode_int8_mtile(
+            M,
+            Int8DecodeDesc::new(
+                weights.k,
+                weights.n,
+                input.dma_address(),
+                weights.bo.dma_address(),
+                output.dma_address(),
+            ),
+        )?;
+        regcmd.prep_relative(0)?;
+        regcmd.as_mut_slice().fill(0);
+        write_regcmd_at(&mut regcmd, 0, &ops)?;
+        regcmd.fini()?;
+        let regcmd_stage_ns = regcmd_stage_start.elapsed().as_nanos();
+
+        let reg_addr = regcmd.dma_address();
+        let task = Task {
+            regcmd: u32::try_from(reg_addr)
+                .map_err(|_| Int8DecodeError::AddressAbove32Bit(reg_addr))?,
+            regcmd_count: u32::try_from(ops.len()).map_err(|_| Int8DecodeError::SizeOverflow)?,
+        };
+        let submit_wait_start = Instant::now();
+        let submit_start = Instant::now();
+        self.device.submit(
+            &[task],
+            &[input.handle(), weights.bo.handle(), regcmd.handle()],
+            &[output.handle()],
+        )?;
+        let submit_ns = submit_start.elapsed().as_nanos();
+        let wait_start = Instant::now();
+        output.prep_relative(WAIT_NS)?;
+        let wait_ns = wait_start.elapsed().as_nanos();
+        let submit_wait_ns = submit_wait_start.elapsed().as_nanos();
+
+        let mut values = Vec::with_capacity(output_values);
+        for i in 0..output_values {
+            values.push(read_i32(output.as_slice(), i));
+        }
+        let output_fini_start = Instant::now();
+        output.fini()?;
+        let output_fini_ns = output_fini_start.elapsed().as_nanos();
+
+        Ok(Int8DecodeOutput {
+            values,
+            stats: Int8DecodeStats {
+                k_slices: 1,
+                npu_tasks: 1,
+                pack_ns: input_stage_ns + regcmd_stage_ns,
+                alloc_ns,
+                input_stage_ns,
+                partial_stage_ns: 0,
+                regcmd_stage_ns,
+                output_fini_ns,
+                submit_ns,
+                wait_ns,
+                submit_wait_ns,
+                host_accum_ns: 0,
+                total_ns: total_start.elapsed().as_nanos(),
+            },
+        })
+    }
+
+    /// Execute the hardware-proven research M=16 W8A8 tile against resident weights.
+    /// K<=4096 is one full-K task. Wider K reuses the production 1024/512 K-slice
+    /// packing, submits one M=16 task per slice, and accumulates int32 partials exactly.
+    pub fn execute_prepared_m16(
+        &self,
+        a_mk: &[i8],
+        weights: &Int8PreparedWeights,
+    ) -> Result<Int8DecodeOutput, Int8DecodeError> {
+        const M: usize = 16;
+        let total_start = Instant::now();
+        if self.device.fd() != weights.device_fd {
+            return Err(Int8DecodeError::InvalidInput(
+                "prepared weights belong to a different Rocket device",
+            ));
+        }
+        if weights.offsets.len() != weights.slices || weights.slices == 0 {
+            return Err(Int8DecodeError::InvalidInput(
+                "prepared weight slice metadata mismatch",
+            ));
+        }
+        let expected_a = M
+            .checked_mul(weights.k)
+            .ok_or(Int8DecodeError::SizeOverflow)?;
+        if a_mk.len() != expected_a {
+            return Err(Int8DecodeError::InvalidInput("A length must equal 16*K"));
+        }
+
+        let slices = weights.slices;
+        let output_values = M
+            .checked_mul(weights.n)
+            .ok_or(Int8DecodeError::SizeOverflow)?;
+        let partial_values = slices
+            .checked_mul(output_values)
+            .ok_or(Int8DecodeError::SizeOverflow)?;
+        let partial_bytes = partial_values
+            .checked_mul(4)
+            .ok_or(Int8DecodeError::SizeOverflow)?;
+        let regcmd_bytes = slices
+            .checked_mul(REGCMD_BYTES)
+            .ok_or(Int8DecodeError::SizeOverflow)?;
+
+        let alloc_start = Instant::now();
+        let mut regcmd = self.device.alloc_buffer(regcmd_bytes)?;
+        let mut input = self.device.alloc_buffer(expected_a)?;
+        let output = self.device.alloc_buffer(partial_bytes)?;
+        for bo in [&regcmd, &input, &output] {
+            check_dma32_range(bo.dma_address(), bo.len())?;
+        }
+        let alloc_ns = alloc_start.elapsed().as_nanos();
+
+        let input_stage_start = Instant::now();
+        input.prep_relative(0)?;
+        let mut input_offsets = Vec::with_capacity(slices);
+        let mut input_offset = 0usize;
+        for slice in 0..slices {
+            input_offsets.push(input_offset);
+            let k0 = slice_k0(slices, slice);
+            let kp = slice_kp(weights.k, slices, slice);
+            for row in 0..M {
+                let src_start = row
+                    .checked_mul(weights.k)
+                    .and_then(|v| v.checked_add(k0))
+                    .ok_or(Int8DecodeError::SizeOverflow)?;
+                let src_end = src_start
+                    .checked_add(kp)
+                    .ok_or(Int8DecodeError::SizeOverflow)?;
+                let dst_start = input_offset
+                    .checked_add(
+                        row.checked_mul(kp)
+                            .ok_or(Int8DecodeError::SizeOverflow)?,
+                    )
+                    .ok_or(Int8DecodeError::SizeOverflow)?;
+                let dst_end = dst_start
+                    .checked_add(kp)
+                    .ok_or(Int8DecodeError::SizeOverflow)?;
+                for (dst, &src) in input.as_mut_slice()[dst_start..dst_end]
+                    .iter_mut()
+                    .zip(&a_mk[src_start..src_end])
+                {
+                    *dst = src as u8;
+                }
+            }
+            input_offset = input_offset
+                .checked_add(M.checked_mul(kp).ok_or(Int8DecodeError::SizeOverflow)?)
+                .ok_or(Int8DecodeError::SizeOverflow)?;
+        }
+        input.fini()?;
+        let input_stage_ns = input_stage_start.elapsed().as_nanos();
+
+        let regcmd_stage_start = Instant::now();
+        regcmd.prep_relative(0)?;
+        regcmd.as_mut_slice().fill(0);
+        let mut tasks = Vec::with_capacity(slices);
+        for slice in 0..slices {
+            let kp = slice_kp(weights.k, slices, slice);
+            let weight_dma = weights
+                .bo
+                .dma_address()
+                .checked_add(
+                    u64::try_from(weights.offsets[slice])
+                        .map_err(|_| Int8DecodeError::SizeOverflow)?,
+                )
+                .ok_or(Int8DecodeError::SizeOverflow)?;
+            let input_dma = input
+                .dma_address()
+                .checked_add(
+                    u64::try_from(input_offsets[slice])
+                        .map_err(|_| Int8DecodeError::SizeOverflow)?,
+                )
+                .ok_or(Int8DecodeError::SizeOverflow)?;
+            let partial_offset = slice
+                .checked_mul(output_values)
+                .and_then(|v| v.checked_mul(4))
+                .ok_or(Int8DecodeError::SizeOverflow)?;
+            let output_dma = output
+                .dma_address()
+                .checked_add(
+                    u64::try_from(partial_offset)
+                        .map_err(|_| Int8DecodeError::SizeOverflow)?,
+                )
+                .ok_or(Int8DecodeError::SizeOverflow)?;
+            let ops = encode_int8_mtile(
+                M,
+                Int8DecodeDesc::new(kp, weights.n, input_dma, weight_dma, output_dma),
+            )?;
+            let reg_offset = slice
+                .checked_mul(REGCMD_BYTES)
+                .ok_or(Int8DecodeError::SizeOverflow)?;
+            write_regcmd_at(&mut regcmd, reg_offset, &ops)?;
+            let reg_addr = regcmd
+                .dma_address()
+                .checked_add(
+                    u64::try_from(reg_offset).map_err(|_| Int8DecodeError::SizeOverflow)?,
+                )
+                .ok_or(Int8DecodeError::SizeOverflow)?;
+            tasks.push(Task {
+                regcmd: u32::try_from(reg_addr)
+                    .map_err(|_| Int8DecodeError::AddressAbove32Bit(reg_addr))?,
+                regcmd_count: u32::try_from(ops.len())
+                    .map_err(|_| Int8DecodeError::SizeOverflow)?,
+            });
+        }
+        regcmd.fini()?;
+        let regcmd_stage_ns = regcmd_stage_start.elapsed().as_nanos();
+
+        let submit_wait_start = Instant::now();
+        let submit_start = Instant::now();
+        self.device.submit(
+            &tasks,
+            &[input.handle(), weights.bo.handle(), regcmd.handle()],
+            &[output.handle()],
+        )?;
+        let submit_ns = submit_start.elapsed().as_nanos();
+        let wait_start = Instant::now();
+        output.prep_relative(WAIT_NS)?;
+        let wait_ns = wait_start.elapsed().as_nanos();
+        let submit_wait_ns = submit_wait_start.elapsed().as_nanos();
+
+        let accum_start = Instant::now();
+        let mut values = vec![0i32; output_values];
+        for slice in 0..slices {
+            let base = slice
+                .checked_mul(output_values)
+                .ok_or(Int8DecodeError::SizeOverflow)?;
+            for (index, sum) in values.iter_mut().enumerate() {
+                *sum = sum
+                    .checked_add(read_i32(output.as_slice(), base + index))
+                    .ok_or(Int8DecodeError::InvalidInput("int32 accumulation overflow"))?;
+            }
+        }
+        let host_accum_ns = accum_start.elapsed().as_nanos();
+        let output_fini_start = Instant::now();
+        output.fini()?;
+        let output_fini_ns = output_fini_start.elapsed().as_nanos();
+
+        Ok(Int8DecodeOutput {
+            values,
+            stats: Int8DecodeStats {
+                k_slices: slices,
+                npu_tasks: tasks.len(),
+                pack_ns: input_stage_ns + regcmd_stage_ns,
+                alloc_ns,
+                input_stage_ns,
+                partial_stage_ns: 0,
+                regcmd_stage_ns,
+                output_fini_ns,
+                submit_ns,
+                wait_ns,
+                submit_wait_ns,
+                host_accum_ns,
+                total_ns: total_start.elapsed().as_nanos(),
+            },
+        })
     }
 
     /// Compatibility one-shot path. Prefer `prepare_weights` +

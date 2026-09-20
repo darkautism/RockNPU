@@ -94,6 +94,98 @@ pub fn weight_i8_fullk_index(k: usize, n: usize, k_index: usize, n_index: usize)
     nt * kt * 32 * 32 + kb * 32 * 32 + nl * 32 + kk
 }
 
+/// Encode the hardware-proven W8A8 M=16 research tile.
+/// This remains separate from the production M=1 API; larger M values are rejected until
+/// they have their own Rocket correctness gate (M=32 currently wraps at row 16).
+pub fn encode_int8_mtile(
+    m: usize,
+    desc: Int8DecodeDesc,
+) -> Result<[u64; INT8_REGCMD_COUNT], Int8EncodeError> {
+    if m != 16 || desc.k == 0 || desc.n == 0 {
+        return Err(Int8EncodeError::InvalidShape {
+            k: desc.k,
+            n: desc.n,
+            reason: "research M-tile is hardware-proven only for M=16 and non-zero K/N",
+        });
+    }
+    if !desc.k.is_multiple_of(512) || desc.k > 4096 {
+        return Err(Int8EncodeError::InvalidShape {
+            k: desc.k,
+            n: desc.n,
+            reason: "M-tile full-K gate requires K%512==0 and K<=4096",
+        });
+    }
+    if !desc.n.is_multiple_of(32) || desc.n > RK3588_NMAX {
+        return Err(Int8EncodeError::InvalidShape {
+            k: desc.k,
+            n: desc.n,
+            reason: "M-tile requires N%32==0 and N<=8192",
+        });
+    }
+
+    let input_dma = address32(desc.input_dma)?;
+    let weights_dma = address32(desc.weights_dma)?;
+    let output_dma = address32(desc.output_dma)?;
+    let m_u32 = u32::try_from(m).map_err(|_| Int8EncodeError::SizeOverflow)?;
+    let k = u32::try_from(desc.k).map_err(|_| Int8EncodeError::SizeOverflow)?;
+    let n = u32::try_from(desc.n).map_err(|_| Int8EncodeError::SizeOverflow)?;
+    let weight_elems = u32::try_from(
+        desc.k.checked_mul(desc.n).ok_or(Int8EncodeError::SizeOverflow)?,
+    )
+    .map_err(|_| Int8EncodeError::SizeOverflow)?;
+
+    let mut ops = ork_isc::INT8_TEMPLATE;
+    patch_register(&mut ops, 0x1024, ((k - 1) << 16) | k);
+    patch_register(&mut ops, 0x1030, weight_elems);
+    patch_register(&mut ops, 0x1034, k);
+    patch_register(&mut ops, 0x1044, k.div_ceil(64));
+    patch_register(&mut ops, 0x107c, k / 16);
+    patch_register(&mut ops, 0x1084, 0x0001_0000 | m_u32);
+    patch_register(&mut ops, 0x1088, k);
+    patch_register(&mut ops, 0x1020, 0x0001_0000 | m_u32);
+    patch_register(&mut ops, 0x102c, m_u32);
+
+    patch_register(&mut ops, 0x1038, 0x0101_0000 | n);
+    patch_register(&mut ops, 0x3018, n - 1);
+    patch_register(&mut ops, 0x403c, ((n - 1) << 16) | (n - 1));
+    patch_register(&mut ops, 0x4058, n - 1);
+    patch_register(&mut ops, 0x4038, (((n / 4) - 1) << 16) | ((n / 4) - 1));
+
+    let mut r = (2 * RK3588_CBUF_ELEMS) / desc.k;
+    r = r.max(1);
+    let mut r_pow2 = 1usize;
+    while r_pow2.saturating_mul(2) <= r {
+        r_pow2 *= 2;
+    }
+    let rows = (m + 1).min(r_pow2);
+    patch_register(
+        &mut ops,
+        0x1010,
+        u32::try_from(16 * rows).map_err(|_| Int8EncodeError::SizeOverflow)?,
+    );
+
+    let scale = desc.k / 512;
+    let base = 177i32
+        - 15i32 * (i32::try_from(scale).map_err(|_| Int8EncodeError::SizeOverflow)? - 1);
+    let slope = 15i32 * i32::try_from(scale).map_err(|_| Int8EncodeError::SizeOverflow)?;
+    let mg = m.div_ceil(64).max(1);
+    let v = (base
+        - slope * (i32::try_from(mg).map_err(|_| Int8EncodeError::SizeOverflow)? - 1))
+        .max(0x1b) as u32;
+    patch_register(&mut ops, 0x1040, v);
+
+    patch_register(&mut ops, 0x1070, input_dma);
+    patch_register(&mut ops, 0x1110, weights_dma);
+    patch_register(&mut ops, 0x4020, output_dma);
+
+    let m_minus_1 = m_u32 - 1;
+    patch_register(&mut ops, 0x4034, m_minus_1);
+    patch_register(&mut ops, 0x405c, m_minus_1 << 16);
+    patch_register(&mut ops, 0x3014, m_minus_1 << 16);
+    Ok(ops)
+}
+
+
 /// Encode the current production-style W8A8 decode primitive:
 /// `C[1,N] i32 = A[1,K] i8 x B[K,N] i8`.
 ///
