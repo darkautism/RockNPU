@@ -65,9 +65,47 @@ For context, the old M>1 FP16 bridge measured only about `3.91 tok/s` at pp16. T
 - M16 persistent scratch without resident fallback was misleadingly slow because the remaining FP16 fallback dominated the request. The final performant configuration requires resident prefill cache for the unsupported down projection.
 - Batched M=1 K-split PC-chain is a useful enabling primitive but reversed whole-model A/B showed no material throughput gain by itself.
 
+## Independent o16 reproduction
+
+Exact candidate: `d6497fa67dfdb3bef51c112f53b381685aaf161e` in detached `/build/rocknpu-w8-mtile-validator`.
+
+Metadata:
+
+- model SHA256 identical: `5c66751b61537f9e55177b1b67e06af88e0e2df88f86de4909f5bf87fb1ae583`
+- NPU: 700 MHz
+- llama.cpp: same `391fac164...` commit
+
+Hardware gates independently passed:
+
+- `M=16 K=2048 N=2048`: exact row oracle PASS, submit/wait `517.991, 505.741, 517.699, 477.741, 426.118 us`.
+- `M=16 K=5632 N=64`: six-slice M16-vs-M1 differential PASS, `m16_us=821.027`, `submit_wait_us=178.206`, `host_accum_us=60.374`.
+
+Clean sequential pp16 comparison (an earlier CPU run overlapped the candidate and is discarded):
+
+- CPU r=5: mean `73.674390 tok/s`; samples `73.8521, 73.7054, 73.5859, 73.6230, 73.6056`.
+- M16 candidate r=5: mean `86.478190 tok/s`; samples `88.6623, 87.9665, 86.6163, 82.4952, 86.6507`.
+- Independent speedup: about `1.174x` / `+17.4%` throughput.
+
+## Model-level 16-token quality gate
+
+Prompt:
+
+```text
+The capital of France is Paris, and the capital of Germany is Berlin.
+```
+
+Pinned llama.cpp reports this prompt as exactly 16 tokens. With temperature 0:
+
+- pure CPU and the same RockNPU candidate with `ROCKNPU_W8_MTILE=0` produced the same 24-token continuation through `Washington, D.C.` and continued with `3. The capital of ...`;
+- `ROCKNPU_W8_MTILE=1` shared the same prefix through `Washington, D.C.` but then diverged and continued with `and the capital of Canada is Ott...`.
+
+The candidate output remained semantically coherent, but the deterministic continuation is **not byte-exact** once the M16 W8 prompt path is enabled. Therefore the M16 path has a real model-level numerical effect even though integer matmul hardware gates are exact. This is consistent with row-wise activation/weight quantization changing logits, not a broken Rocket matmul.
+
 ## Verdict
 
-**KEEP EXPERIMENTAL pending independent o16 reproduction and a model-level quality gate that exercises an actual 16-token batch.**
+**KEEP EXPERIMENTAL.**
 
-The performance mechanism is strong: `M=16` W8A8 changes NPU utilization enough to exceed same-board CPU pp16 throughput by about 8.7%. The next architectural use is speculative/batched target verification, not further M=1 micro-optimization.
+Performance and hardware correctness are independently reproduced on two RK3588 boards, including a clean o16 speedup of about 17.4% over same-board CPU pp16. However the exact 16-token deterministic model gate diverges after a substantial shared prefix. Do not merge/promote the M16 model route until the quantization-error bridge is improved or a quality metric demonstrates that the divergence is acceptable for the intended workload.
+
+The next high-value work is therefore M16 quantization-error reduction (while preserving the demonstrated batched-W8 speed), followed by speculative/batched target verification. Further M=1 micro-optimization is lower priority.
 
