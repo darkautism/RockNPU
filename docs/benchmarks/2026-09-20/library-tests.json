@@ -1,0 +1,18 @@
+{
+  "command": "cargo test --manifest-path /build/rocknpu-direct-scratch/Cargo.toml --release -p rocknpu-matmul -p rocknpu-capi --lib",
+  "execution_task_id": "task_6b2d13d9d866e950",
+  "exit_code": 0,
+  "finished_at": "2026-09-20T04:51:11.300579371Z",
+  "log_truncated": false,
+  "outcome": "succeeded",
+  "pid": 178051,
+  "runtime_ms": 7300,
+  "status": "exited",
+  "stderr": "   Compiling rocknpu-matmul v0.1.0 (/build/rocknpu-direct-scratch/crates/rocknpu-matmul)\n   Compiling rocknpu-capi v0.1.0 (/build/rocknpu-direct-scratch/crates/rocknpu-capi)\n    Finished `release` profile [optimized] target(s) in 7.01s\n     Running unittests src/lib.rs (rocknpu-direct-scratch/target/release/deps/rocknpu_capi-23b03ad5145086bd)\n     Running unittests src/lib.rs (rocknpu-direct-scratch/target/release/deps/rocknpu_matmul-bd519f3c7b948982)\n",
+  "stderr_next_offset": 456,
+  "stderr_offset": 0,
+  "stdout": "\nrunning 8 tests\ntest tests::decode_worker_selector_accepts_material_three_worker_gain ... ok\ntest tests::decode_worker_selector_ignores_noise_level_gain ... ok\ntest tests::decode_worker_selector_accepts_material_two_worker_gain ... ok\ntest tests::decode_worker_selector_requires_nonempty_samples ... ok\ntest tests::matmul_rejects_null_context_before_pointer_access ... ok\ntest tests::normalized_fwht_preserves_dot_product ... ok\ntest tests::q4_k_block_size_matches_ggml_abi ... ok\ntest tests::q6_k_block_size_matches_ggml_abi ... ok\n\ntest result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 20 tests\ntest int4_decode::tests::accepts_tinyllama_decode_shapes ... ok\ntest int4_decode_pool::tests::three_way_tinyllama_ffn_split_is_aligned_and_complete ... ok\ntest int4_decode::tests::rejects_outside_native_single_program_envelope ... ok\ntest int4_decode_pool::tests::requested_workers_are_capped_by_channel_blocks ... ok\ntest int8_decode::tests::wide_k_slicing_matches_tinyllama_down_projection ... ok\ntest int8_decode::tests::rejects_non_decode_shapes ... ok\ntest int8_decode_pool::tests::requested_workers_are_capped_by_channel_blocks ... ok\ntest int8_decode_pool::tests::three_way_tinyllama_gate_split_is_aligned_and_complete ... ok\ntest int8_decode_pool::tests::three_way_wide_k_split_is_aligned_and_complete ... ok\ntest prepacked::tests::m_tiling_deduplicates_resident_weight_tiles ... ok\ntest prepacked::tests::mnk_tiling_deduplicates_only_m_dimension ... ok\ntest tests::block_input_packing_matches_feature_data_reference ... ok\ntest tests::input_lengths_are_checked ... ok\ntest tests::fp32_cpu_reference_uses_f64_accumulation_contract ... ok\ntest tests::tiny_m_k_split_uses_host_accumulation_contract ... ok\ntest prepacked::tests::fp32_cube_gather_matches_feature_addressing_and_accumulates ... ok\ntest tests::multicore_n_split_is_aligned_and_complete ... ok\ntest tests::block_weight_packing_matches_weight_fp16_reference ... ok\ntest tests::cpu_executor_oracle_matches_math_when_no_k_split ... ok\ntest tests::cpu_executor_oracle_handles_m_n_and_k_tiles ... ok\n\ntest result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s\n\n",
+  "stdout_next_offset": 2209,
+  "stdout_offset": 0,
+  "workspace": "root"
+}

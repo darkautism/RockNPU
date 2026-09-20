@@ -733,6 +733,7 @@ pub struct PoolPreparedWeightStats {
 
 pub struct Fp16MatmulPoolPreparedWeights {
     weight_id: u64,
+    exact_m: Option<usize>,
     k: usize,
     n: usize,
     slices: Vec<(usize, usize)>,
@@ -771,6 +772,7 @@ enum PoolCommand {
         nsub: usize,
     },
     Prepare {
+        exact_m: Option<usize>,
         request_id: u64,
         weight_id: u64,
         b: Arc<[f16]>,
@@ -779,6 +781,15 @@ enum PoolCommand {
         nsub: usize,
     },
     RunPrepared {
+        request_id: u64,
+        weight_id: u64,
+        a: Arc<[f16]>,
+        m: usize,
+        k: usize,
+        n0: usize,
+        nsub: usize,
+    },
+    RunPreparedF32 {
         request_id: u64,
         weight_id: u64,
         a: Arc<[f16]>,
@@ -926,6 +937,7 @@ impl Fp16MatmulPool {
                             }
                         }
                         PoolCommand::Prepare {
+                            exact_m,
                             request_id,
                             weight_id,
                             b,
@@ -940,8 +952,15 @@ impl Fp16MatmulPool {
                             } else if end > b.len() {
                                 Err(format!("worker {worker}: B slice out of range"))
                             } else {
-                                match executor.prepack_weights_compatible_m(&b[begin..end], k, nsub)
-                                {
+                                let packed = match exact_m {
+                                    Some(m) => executor.prepack_weights(&b[begin..end], m, k, nsub),
+                                    None => executor.prepack_weights_compatible_m(
+                                        &b[begin..end],
+                                        k,
+                                        nsub,
+                                    ),
+                                };
+                                match packed {
                                     Ok(weights) => {
                                         let stats = weights.stats();
                                         resident.insert(weight_id, weights);
@@ -993,6 +1012,46 @@ impl Fp16MatmulPool {
                                     n0,
                                     nsub,
                                     response: PoolWorkerResponse::Ran { output, scratch },
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        PoolCommand::RunPreparedF32 {
+                            request_id,
+                            weight_id,
+                            a,
+                            m,
+                            k,
+                            n0,
+                            nsub,
+                        } => {
+                            let output = match resident.get(&weight_id) {
+                                Some(weights)
+                                    if weights.k() == k
+                                        && weights.n() == nsub
+                                        && weights.m() == m =>
+                                {
+                                    executor
+                                        .execute_prepacked_f32(&a, weights)
+                                        .map_err(|e| format!("worker {worker}: {e}"))
+                                }
+                                Some(_) => {
+                                    Err(format!("worker {worker}: resident weight shape mismatch"))
+                                }
+                                None => {
+                                    Err(format!("worker {worker}: resident weight id not found"))
+                                }
+                            };
+                            let scratch = executor.scratch_stats();
+                            if result_tx
+                                .send(PoolWorkerResult {
+                                    request_id,
+                                    worker,
+                                    n0,
+                                    nsub,
+                                    response: PoolWorkerResponse::RanF32 { output, scratch },
                                 })
                                 .is_err()
                             {
@@ -1202,6 +1261,32 @@ impl Fp16MatmulPool {
         k: usize,
         n: usize,
     ) -> Result<Fp16MatmulPoolPreparedWeights, MatmulPoolError> {
+        self.prepare_weights_impl(b, None, k, n)
+    }
+
+    /// Prepare resident weights for the exact FP32 execution plan at M.
+    pub fn prepare_weights_f32(
+        &mut self,
+        b: Arc<[f16]>,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Fp16MatmulPoolPreparedWeights, MatmulPoolError> {
+        if m == 0 || m % 4 != 0 {
+            return Err(MatmulPoolError::InvalidInput(
+                "FP32 prepared M must be a positive multiple of four",
+            ));
+        }
+        self.prepare_weights_impl(b, Some(m), k, n)
+    }
+
+    fn prepare_weights_impl(
+        &mut self,
+        b: Arc<[f16]>,
+        exact_m: Option<usize>,
+        k: usize,
+        n: usize,
+    ) -> Result<Fp16MatmulPoolPreparedWeights, MatmulPoolError> {
         if k == 0 || n == 0 || k % 32 != 0 || n % 16 != 0 || b.len() != n.saturating_mul(k) {
             return Err(MatmulPoolError::InvalidInput(
                 "prepared pool B requires exact N*K length, K%32==0, N%16==0",
@@ -1215,6 +1300,7 @@ impl Fp16MatmulPool {
         for (worker, &(n0, nsub)) in slices.iter().enumerate() {
             self.senders[worker]
                 .send(PoolCommand::Prepare {
+                    exact_m,
                     request_id,
                     weight_id,
                     b: Arc::clone(&b),
@@ -1255,6 +1341,7 @@ impl Fp16MatmulPool {
             return Err(MatmulPoolError::Worker(e));
         }
         Ok(Fp16MatmulPoolPreparedWeights {
+            exact_m,
             weight_id,
             k,
             n,
@@ -1290,6 +1377,39 @@ impl Fp16MatmulPool {
                 .map_err(|_| MatmulPoolError::ChannelClosed)?;
         }
         self.gather_run(request_id, &weights.slices, m, weights.n, start)
+    }
+
+    pub fn execute_prepared_f32(
+        &mut self,
+        a: Arc<[f16]>,
+        m: usize,
+        weights: &Fp16MatmulPoolPreparedWeights,
+    ) -> Result<Fp32MatmulPoolOutput, MatmulPoolError> {
+        if weights.exact_m != Some(m)
+            || m == 0
+            || m % 4 != 0
+            || a.len() != m.saturating_mul(weights.k)
+        {
+            return Err(MatmulPoolError::InvalidInput(
+                "prepared pool A requires exact M*K length and M%4==0",
+            ));
+        }
+        let request_id = self.allocate_request_id();
+        let start = Instant::now();
+        for (worker, &(n0, nsub)) in weights.slices.iter().enumerate() {
+            self.senders[worker]
+                .send(PoolCommand::RunPreparedF32 {
+                    request_id,
+                    weight_id: weights.weight_id,
+                    a: Arc::clone(&a),
+                    m,
+                    k: weights.k,
+                    n0,
+                    nsub,
+                })
+                .map_err(|_| MatmulPoolError::ChannelClosed)?;
+        }
+        self.gather_run_f32(request_id, &weights.slices, m, weights.n, start)
     }
 
     pub fn release_prepared(
@@ -1338,23 +1458,30 @@ impl Fp16MatmulPool {
         let mut jobs = 0usize;
         let mut worker_timings = vec![ExecutionTiming::default(); slices.len()];
         let mut worker_scratch = vec![ScratchStats::default(); slices.len()];
+        let mut first_error = None;
         for _ in 0..slices.len() {
             let result = self.recv_result(request_id, slices.len())?;
             let (output, scratch) = match result.response {
-                PoolWorkerResponse::Ran { output, scratch } => {
-                    (output.map_err(MatmulPoolError::Worker)?, scratch)
-                }
+                PoolWorkerResponse::Ran { output, scratch } => match output {
+                    Ok(output) => (output, scratch),
+                    Err(error) => {
+                        first_error.get_or_insert(MatmulPoolError::Worker(error));
+                        continue;
+                    }
+                },
                 _ => {
-                    return Err(MatmulPoolError::Worker(
+                    first_error.get_or_insert(MatmulPoolError::Worker(
                         "unexpected response while gathering run".to_string(),
                     ));
+                    continue;
                 }
             };
             if output.values.len() != m * result.nsub {
-                return Err(MatmulPoolError::Worker(format!(
+                first_error.get_or_insert(MatmulPoolError::Worker(format!(
                     "worker {} returned wrong output length",
                     result.worker
                 )));
+                continue;
             }
             for row in 0..m {
                 let src = &output.values[row * result.nsub..(row + 1) * result.nsub];
@@ -1364,6 +1491,11 @@ impl Fp16MatmulPool {
             jobs += output.stats.jobs_submitted;
             worker_timings[result.worker] = output.stats.timing;
             worker_scratch[result.worker] = scratch;
+        }
+        // Drain every submitted worker response before returning an error so
+        // the next request cannot consume leftovers from this request.
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(Fp16MatmulPoolOutput {
             values,
@@ -1389,23 +1521,30 @@ impl Fp16MatmulPool {
         let mut jobs = 0usize;
         let mut worker_timings = vec![ExecutionTiming::default(); slices.len()];
         let mut worker_scratch = vec![ScratchStats::default(); slices.len()];
+        let mut first_error = None;
         for _ in 0..slices.len() {
             let result = self.recv_result(request_id, slices.len())?;
             let (output, scratch) = match result.response {
-                PoolWorkerResponse::RanF32 { output, scratch } => {
-                    (output.map_err(MatmulPoolError::Worker)?, scratch)
-                }
+                PoolWorkerResponse::RanF32 { output, scratch } => match output {
+                    Ok(output) => (output, scratch),
+                    Err(error) => {
+                        first_error.get_or_insert(MatmulPoolError::Worker(error));
+                        continue;
+                    }
+                },
                 _ => {
-                    return Err(MatmulPoolError::Worker(
+                    first_error.get_or_insert(MatmulPoolError::Worker(
                         "unexpected response while gathering FP32 run".to_string(),
                     ));
+                    continue;
                 }
             };
             if output.values.len() != m * result.nsub {
-                return Err(MatmulPoolError::Worker(format!(
+                first_error.get_or_insert(MatmulPoolError::Worker(format!(
                     "worker {} returned wrong FP32 output length",
                     result.worker
                 )));
+                continue;
             }
             for row in 0..m {
                 let src = &output.values[row * result.nsub..(row + 1) * result.nsub];
@@ -1415,6 +1554,11 @@ impl Fp16MatmulPool {
             jobs += output.stats.jobs_submitted;
             worker_timings[result.worker] = output.stats.timing;
             worker_scratch[result.worker] = scratch;
+        }
+        // Drain every submitted worker response before returning an error so
+        // the next request cannot consume leftovers from this request.
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(Fp32MatmulPoolOutput {
             values,

@@ -1,0 +1,18 @@
+{
+  "command": "env -u GGML_BACKEND_PATH -u ROCKNPU_W8_SIDECAR_DIR -u ROCKNPU_GGML_TRACE -u ROCKNPU_W8_DIRECT_SUBMIT -u ROCKNPU_EXPERIMENT_DIRECT_SCRATCH taskset -c 4-7 /build/llama.cpp-reference/build-native-0920/bin/llama-bench -m /build/rocknpu/artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf -p 512 -n 0 -r 3 -t 4 -fa on -dev none -nopo 1 -o json",
+  "execution_task_id": "task_396a6c54cbe4e1d7",
+  "exit_code": 0,
+  "finished_at": "2026-09-20T04:46:12.008803968Z",
+  "log_truncated": false,
+  "outcome": "succeeded",
+  "pid": 1450731,
+  "runtime_ms": 31705,
+  "status": "exited",
+  "stderr": "load_backend: loaded CPU backend from /build/llama.cpp-reference/build-native-0920/bin/libggml-cpu.so\n",
+  "stderr_next_offset": 102,
+  "stderr_offset": 0,
+  "stdout": "[\n  {\n    \"build_commit\": \"391fac1\",\n    \"build_number\": 1,\n    \"cpu_info\": \"CPU\",\n    \"gpu_info\": \"\",\n    \"backends\": \"CPU\",\n    \"model_filename\": \"/build/rocknpu/artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf\",\n    \"model_type\": \"llama 1B Q4_K - Medium\",\n    \"model_size\": 667078656,\n    \"model_n_params\": 1100048384,\n    \"n_batch\": 2048,\n    \"n_ubatch\": 512,\n    \"n_threads\": 4,\n    \"cpu_mask\": \"0x0\",\n    \"cpu_strict\": false,\n    \"poll\": 50,\n    \"type_k\": \"f16\",\n    \"type_v\": \"f16\",\n    \"n_gpu_layers\": -1,\n    \"n_cpu_moe\": 0,\n    \"split_mode\": \"layer\",\n    \"main_gpu\": 0,\n    \"no_kv_offload\": false,\n    \"flash_attn\": 1,\n    \"devices\": \"none\",\n    \"tensor_split\": \"0.00\",\n    \"tensor_buft_overrides\": \"none\",\n    \"load_mode\": \"auto\",\n    \"lazy_mode\": \"auto\",\n    \"embeddings\": false,\n    \"no_op_offload\": 1,\n    \"no_host\": false,\n    \"fit_target\": 0,\n    \"fit_min_ctx\": 0,\n    \"n_prompt\": 512,\n    \"n_gen\": 0,\n    \"n_depth\": 0,\n    \"test_time\": \"2026-09-20T04:45:42Z\",\n    \"avg_ns\": 7370918857,\n    \"stddev_ns\": 10797849,\n    \"avg_ts\": 69.462267,\n    \"stddev_ts\": 0.101780,\n    \"samples_ns\": [ 7359468587, 7372372309, 7380915677 ],\n    \"samples_ts\": [ 69.5702, 69.4485, 69.3681 ]\n  }\n]\n",
+  "stdout_next_offset": 1192,
+  "stdout_offset": 0,
+  "workspace": "root"
+}

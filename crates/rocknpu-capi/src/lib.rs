@@ -5,9 +5,9 @@ use half::f16;
 use llama_gguf::tensor::quant::{BlockQ4K, BlockQ6K, dequantize_q4_k, dequantize_q6_k};
 use rocket_runtime::RocketDevice;
 use rocknpu_matmul::{
-    Fp16MatmulExecutor, Int4DecodeExecutor, Int4DecodePool, Int4DecodePoolPreparedWeights,
-    Int4GroupedPreparedWeights, Int4PreparedWeights, Int8DecodePool, Int8DecodePoolPreparedWeights,
-    Int8DecodeSplit,
+    Fp16MatmulExecutor, Fp16MatmulPool, Fp16MatmulPoolPreparedWeights, Int4DecodeExecutor,
+    Int4DecodePool, Int4DecodePoolPreparedWeights, Int4GroupedPreparedWeights, Int4PreparedWeights,
+    Int8DecodePool, Int8DecodePoolPreparedWeights, Int8DecodeSplit,
 };
 use std::collections::{HashMap, hash_map::Entry};
 use std::env;
@@ -79,6 +79,8 @@ struct CachedPoolW4A4Weight {
 
 pub struct RockNpuContext {
     device: RocketDevice,
+    prefill_pool: Option<Fp16MatmulPool>,
+    prefill_weights: HashMap<DecodeWeightKey, (usize, Fp16MatmulPoolPreparedWeights)>,
     decode_pool: Int8DecodePool,
     decode_worker_cache: HashMap<(usize, usize), DecodeChoice>,
     decode_weights: HashMap<DecodeWeightKey, CachedW8A8Weight>,
@@ -946,7 +948,29 @@ where
             };
             let weights: Arc<[i8]> = Arc::from(weights_i8);
             let shape = (key.k, key.n);
-            let (choice, prepared) = if let Some(&choice) = decode_worker_cache.get(&shape) {
+            // Persistent direct-submit changed the relative split cost: for the
+            // TinyLlama down projection, K3 is consistently slightly faster
+            // than N3 but the generic 5% tuner hysteresis rejects that small
+            // win. Scope this override to the scratch path that was measured.
+            let prefer_down_k3 =
+                env_enabled("ROCKNPU_EXPERIMENT_DIRECT_SCRATCH") && key.k == 5632 && key.n == 2048;
+            let (choice, prepared) = if prefer_down_k3 {
+                let choice = DecodeChoice {
+                    split: Int8DecodeSplit::K,
+                    workers: decode_pool.workers().min(3),
+                };
+                let prepared = match decode_pool.prepare_weights_with_split(
+                    Arc::clone(&weights),
+                    key.k,
+                    key.n,
+                    choice.workers,
+                    choice.split,
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(_) => return STATUS_EXECUTION_ERROR,
+                };
+                (choice, prepared)
+            } else if let Some(&choice) = decode_worker_cache.get(&shape) {
                 let prepared = match decode_pool.prepare_weights_with_split(
                     Arc::clone(&weights),
                     key.k,
@@ -1305,6 +1329,57 @@ where
     STATUS_OK
 }
 
+// Cache one exact-M packed layout per immutable GGML weight. A new batch size
+// replaces the previous layout so changing prompt lengths cannot multiply the
+// model's resident footprint. Handles belong to the context-owned worker pool.
+fn execute_cached_prefill<F>(
+    context: &mut RockNpuContext,
+    key: DecodeWeightKey,
+    m: usize,
+    activations: &[f32],
+    output: &mut [f32],
+    decode: F,
+) -> i32
+where
+    F: FnOnce() -> Vec<f16>,
+{
+    if context.prefill_pool.is_none() {
+        context.prefill_pool = match Fp16MatmulPool::new(3) {
+            Ok(pool) => Some(pool),
+            Err(_) => return STATUS_EXECUTION_ERROR,
+        };
+    }
+    let pool = context.prefill_pool.as_mut().unwrap();
+    if context
+        .prefill_weights
+        .get(&key)
+        .is_some_and(|(old_m, _)| *old_m != m)
+    {
+        let (_, old) = context.prefill_weights.remove(&key).unwrap();
+        if pool.release_prepared(&old).is_err() {
+            return STATUS_EXECUTION_ERROR;
+        }
+    }
+    if let Entry::Vacant(entry) = context.prefill_weights.entry(key) {
+        let weights = decode();
+        if weights.len() != key.k.saturating_mul(key.n) {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let prepared = match pool.prepare_weights_f32(Arc::from(weights), m, key.k, key.n) {
+            Ok(prepared) => prepared,
+            Err(_) => return STATUS_EXECUTION_ERROR,
+        };
+        entry.insert((m, prepared));
+    }
+    let a: Arc<[f16]> = activations.iter().copied().map(f16::from_f32).collect();
+    let result = match pool.execute_prepared_f32(a, m, &context.prefill_weights[&key].1) {
+        Ok(result) => result,
+        Err(_) => return STATUS_EXECUTION_ERROR,
+    };
+    output.copy_from_slice(&result.values);
+    STATUS_OK
+}
+
 /// Return the number of RockNPU devices currently usable by the runtime.
 ///
 /// The initial RK3588 backend exposes one default Rocket device at
@@ -1326,6 +1401,8 @@ pub extern "C" fn rocknpu_context_create() -> *mut RockNpuContext {
     match (RocketDevice::open(), Int8DecodePool::new(3)) {
         (Ok(device), Ok(decode_pool)) => Box::into_raw(Box::new(RockNpuContext {
             device,
+            prefill_pool: None,
+            prefill_weights: HashMap::new(),
             decode_pool,
             decode_worker_cache: HashMap::new(),
             decode_weights: HashMap::new(),
@@ -1536,6 +1613,237 @@ pub unsafe extern "C" fn rocknpu_matmul_f16_f32_f32(
 /// # Safety
 /// All pointers must satisfy their documented byte/element lengths for the
 /// duration of this synchronous call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rocknpu_matmul_w8a8_f32_f32_m1(
+    context: *mut RockNpuContext,
+    weights_nk_i8: *const i8,
+    weight_scales_n_f32: *const f32,
+    activations_k_f32: *const f32,
+    output_n_f32: *mut f32,
+    k: usize,
+    n: usize,
+) -> i32 {
+    if context.is_null()
+        || weights_nk_i8.is_null()
+        || weight_scales_n_f32.is_null()
+        || activations_k_f32.is_null()
+        || output_n_f32.is_null()
+        || k == 0
+        || n == 0
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let Some(weight_len) = k.checked_mul(n) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let (weights, scales, activations, output, context) = unsafe {
+        (
+            slice::from_raw_parts(weights_nk_i8, weight_len),
+            slice::from_raw_parts(weight_scales_n_f32, n),
+            slice::from_raw_parts(activations_k_f32, k),
+            slice::from_raw_parts_mut(output_n_f32, n),
+            &mut *context,
+        )
+    };
+    if scales.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let key = DecodeWeightKey {
+        address: weights.as_ptr() as usize,
+        bytes: weight_len,
+        k,
+        n,
+        kind: DecodeWeightKind::Q4K,
+    };
+    execute_cached_w8a8_m1(context, key, activations, output, || {
+        Some((weights.to_vec(), scales.to_vec()))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rocknpu_matmul_w8a8_pair_f32_f32_m1(
+    context: *mut RockNpuContext,
+    first_weights_nk_i8: *const i8,
+    first_scales_n_f32: *const f32,
+    first_n: usize,
+    second_weights_nk_i8: *const i8,
+    second_scales_n_f32: *const f32,
+    second_n: usize,
+    activations_k_f32: *const f32,
+    first_output_f32: *mut f32,
+    second_output_f32: *mut f32,
+    k: usize,
+) -> i32 {
+    if context.is_null()
+        || first_weights_nk_i8.is_null()
+        || first_scales_n_f32.is_null()
+        || second_weights_nk_i8.is_null()
+        || second_scales_n_f32.is_null()
+        || activations_k_f32.is_null()
+        || first_output_f32.is_null()
+        || second_output_f32.is_null()
+        || k == 0
+        || first_n == 0
+        || second_n == 0
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let Some(first_len) = k.checked_mul(first_n) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let Some(second_len) = k.checked_mul(second_n) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let (first_w, first_s, second_w, second_s, a, out1, out2, context) = unsafe {
+        (
+            slice::from_raw_parts(first_weights_nk_i8, first_len),
+            slice::from_raw_parts(first_scales_n_f32, first_n),
+            slice::from_raw_parts(second_weights_nk_i8, second_len),
+            slice::from_raw_parts(second_scales_n_f32, second_n),
+            slice::from_raw_parts(activations_k_f32, k),
+            slice::from_raw_parts_mut(first_output_f32, first_n),
+            slice::from_raw_parts_mut(second_output_f32, second_n),
+            &mut *context,
+        )
+    };
+    if first_s
+        .iter()
+        .chain(second_s)
+        .any(|v| !v.is_finite() || *v <= 0.0)
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let key = DecodePairKey {
+        first: DecodeWeightKey {
+            address: first_w.as_ptr() as usize,
+            bytes: first_len,
+            k,
+            n: first_n,
+            kind: DecodeWeightKind::Q4K,
+        },
+        second: DecodeWeightKey {
+            address: second_w.as_ptr() as usize,
+            bytes: second_len,
+            k,
+            n: second_n,
+            kind: DecodeWeightKind::Q4K,
+        },
+    };
+    execute_cached_w8a8_pair_m1(context, key, a, out1, out2, || {
+        let mut w = Vec::with_capacity(first_len + second_len);
+        w.extend_from_slice(first_w);
+        w.extend_from_slice(second_w);
+        let mut sc = Vec::with_capacity(first_n + second_n);
+        sc.extend_from_slice(first_s);
+        sc.extend_from_slice(second_s);
+        Some((w, sc))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rocknpu_matmul_w8a8_triple_f32_f32_m1(
+    context: *mut RockNpuContext,
+    first_weights_nk_i8: *const i8,
+    first_scales_n_f32: *const f32,
+    first_n: usize,
+    second_weights_nk_i8: *const i8,
+    second_scales_n_f32: *const f32,
+    second_n: usize,
+    third_weights_nk_i8: *const i8,
+    third_scales_n_f32: *const f32,
+    third_n: usize,
+    activations_k_f32: *const f32,
+    first_output_f32: *mut f32,
+    second_output_f32: *mut f32,
+    third_output_f32: *mut f32,
+    k: usize,
+) -> i32 {
+    if context.is_null()
+        || first_weights_nk_i8.is_null()
+        || first_scales_n_f32.is_null()
+        || second_weights_nk_i8.is_null()
+        || second_scales_n_f32.is_null()
+        || third_weights_nk_i8.is_null()
+        || third_scales_n_f32.is_null()
+        || activations_k_f32.is_null()
+        || first_output_f32.is_null()
+        || second_output_f32.is_null()
+        || third_output_f32.is_null()
+        || k == 0
+        || first_n == 0
+        || second_n == 0
+        || third_n == 0
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let Some(first_len) = k.checked_mul(first_n) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let Some(second_len) = k.checked_mul(second_n) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let Some(third_len) = k.checked_mul(third_n) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let (w1, s1, w2, s2, w3, s3, a, o1, o2, o3, context) = unsafe {
+        (
+            slice::from_raw_parts(first_weights_nk_i8, first_len),
+            slice::from_raw_parts(first_scales_n_f32, first_n),
+            slice::from_raw_parts(second_weights_nk_i8, second_len),
+            slice::from_raw_parts(second_scales_n_f32, second_n),
+            slice::from_raw_parts(third_weights_nk_i8, third_len),
+            slice::from_raw_parts(third_scales_n_f32, third_n),
+            slice::from_raw_parts(activations_k_f32, k),
+            slice::from_raw_parts_mut(first_output_f32, first_n),
+            slice::from_raw_parts_mut(second_output_f32, second_n),
+            slice::from_raw_parts_mut(third_output_f32, third_n),
+            &mut *context,
+        )
+    };
+    if s1
+        .iter()
+        .chain(s2)
+        .chain(s3)
+        .any(|v| !v.is_finite() || *v <= 0.0)
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let key = DecodeTripleKey {
+        first: DecodeWeightKey {
+            address: w1.as_ptr() as usize,
+            bytes: first_len,
+            k,
+            n: first_n,
+            kind: DecodeWeightKind::Q4K,
+        },
+        second: DecodeWeightKey {
+            address: w2.as_ptr() as usize,
+            bytes: second_len,
+            k,
+            n: second_n,
+            kind: DecodeWeightKind::Q4K,
+        },
+        third: DecodeWeightKey {
+            address: w3.as_ptr() as usize,
+            bytes: third_len,
+            k,
+            n: third_n,
+            kind: DecodeWeightKind::Q4K,
+        },
+    };
+    execute_cached_w8a8_triple_m1(context, key, a, o1, o2, o3, || {
+        let mut w = Vec::with_capacity(first_len + second_len + third_len);
+        w.extend_from_slice(w1);
+        w.extend_from_slice(w2);
+        w.extend_from_slice(w3);
+        let mut sc = Vec::with_capacity(first_n + second_n + third_n);
+        sc.extend_from_slice(s1);
+        sc.extend_from_slice(s2);
+        sc.extend_from_slice(s3);
+        Some((w, sc))
+    })
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rocknpu_matmul_q_pair_f32_f32_m1(
     context: *mut RockNpuContext,
@@ -1841,6 +2149,26 @@ pub unsafe extern "C" fn rocknpu_matmul_q4_k_f32_f32(
         });
     }
 
+    if env_enabled("ROCKNPU_PREFILL_CACHE") {
+        let key = DecodeWeightKey {
+            address: weight_bytes.as_ptr() as usize,
+            bytes: weight_bytes.len(),
+            k,
+            n,
+            kind: DecodeWeightKind::Q4K,
+        };
+        return execute_cached_prefill(context, key, m, activations, output, || {
+            let mut weights = Vec::with_capacity(weight_values);
+            let mut decoded = [0.0f32; Q4_K_VALUES_PER_BLOCK];
+            for bytes in weight_bytes.chunks_exact(size_of::<BlockQ4K>()) {
+                let block: BlockQ4K = pod_read_unaligned(bytes);
+                dequantize_q4_k(&block, &mut decoded);
+                weights.extend(decoded.iter().copied().map(f16::from_f32));
+            }
+            weights
+        });
+    }
+
     let mut weights = Vec::with_capacity(weight_values);
     let mut decoded = [0.0f32; Q4_K_VALUES_PER_BLOCK];
     for bytes in weight_bytes.chunks_exact(size_of::<BlockQ4K>()) {
@@ -1946,6 +2274,26 @@ pub unsafe extern "C" fn rocknpu_matmul_q6_k_f32_f32(
         };
         return execute_cached_w8a8_m1(context, key, activations, output, || {
             prepare_q6_k_w8a8(weight_bytes, k, n)
+        });
+    }
+
+    if env_enabled("ROCKNPU_PREFILL_CACHE") {
+        let key = DecodeWeightKey {
+            address: weight_bytes.as_ptr() as usize,
+            bytes: weight_bytes.len(),
+            k,
+            n,
+            kind: DecodeWeightKind::Q6K,
+        };
+        return execute_cached_prefill(context, key, m, activations, output, || {
+            let mut weights = Vec::with_capacity(weight_values);
+            let mut decoded = [0.0f32; Q6_K_VALUES_PER_BLOCK];
+            for bytes in weight_bytes.chunks_exact(size_of::<BlockQ6K>()) {
+                let block: BlockQ6K = pod_read_unaligned(bytes);
+                dequantize_q6_k(&block, &mut decoded);
+                weights.extend(decoded.iter().copied().map(f16::from_f32));
+            }
+            weights
         });
     }
 

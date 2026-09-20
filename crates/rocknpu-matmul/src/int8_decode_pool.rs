@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: MIT
 
-use crate::{Int8DecodeExecutor, Int8DecodeOutput, Int8PreparedWeightStats, Int8PreparedWeights};
-use rocket_runtime::RocketDevice;
+use crate::int8_decode::Int8OwnedScratch;
+use crate::{
+    Int8DecodeExecutor, Int8DecodeOutput, Int8DecodeStats, Int8PreparedWeightStats,
+    Int8PreparedWeights,
+};
+use rocket_runtime::{RocketDevice, RocketOwnedBuffer};
 use std::collections::HashMap;
+use std::env;
 use std::fmt;
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
@@ -65,6 +70,7 @@ pub struct Int8DecodePoolPreparedWeights {
     split: Int8DecodeSplit,
     slices: Vec<WorkerSlice>,
     stats: Int8DecodePoolPreparedStats,
+    direct_prepared: Option<Vec<Int8PreparedWeights>>,
 }
 
 impl Int8DecodePoolPreparedWeights {
@@ -96,6 +102,7 @@ pub struct Int8DecodePoolStats {
     pub npu_tasks: usize,
     pub wall_ns: u128,
     pub worker_total_ns: Vec<u128>,
+    pub worker_stats: Vec<Int8DecodeStats>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,10 +146,17 @@ struct WorkerResult {
     response: WorkerResponse,
 }
 
+struct DirectWorker {
+    device: RocketDevice,
+    _guard: RocketOwnedBuffer,
+    scratch: HashMap<(usize, usize), Option<Int8OwnedScratch>>,
+}
+
 pub struct Int8DecodePool {
     senders: Vec<mpsc::Sender<WorkerCommand>>,
     result_rx: mpsc::Receiver<WorkerResult>,
     handles: Vec<JoinHandle<()>>,
+    direct_workers: Option<Vec<DirectWorker>>,
     next_request_id: u64,
     next_weight_id: u64,
 }
@@ -294,17 +308,40 @@ impl Int8DecodePool {
             }
         }
 
+        let direct_workers = if env::var_os("ROCKNPU_W8_DIRECT_SUBMIT").is_some() {
+            let mut direct = Vec::with_capacity(workers);
+            for worker in 0..workers {
+                let device = RocketDevice::open().map_err(|err| {
+                    Int8DecodePoolError::Worker(format!("direct worker {worker} open: {err}"))
+                })?;
+                let guard = device.alloc_owned_buffer(4096).map_err(|err| {
+                    Int8DecodePoolError::Worker(format!("direct worker {worker} guard: {err}"))
+                })?;
+                direct.push(DirectWorker {
+                    device,
+                    _guard: guard,
+                    scratch: HashMap::new(),
+                });
+            }
+            Some(direct)
+        } else {
+            None
+        };
+
         Ok(Self {
             senders,
             result_rx,
             handles,
+            direct_workers,
             next_request_id: 1,
             next_weight_id: 1,
         })
     }
 
     pub fn workers(&self) -> usize {
-        self.senders.len()
+        self.direct_workers
+            .as_ref()
+            .map_or(self.senders.len(), Vec::len)
     }
 
     pub fn effective_workers_for_n(
@@ -350,6 +387,43 @@ impl Int8DecodePool {
         }
         self.validate_requested_workers(workers)?;
         let slices = worker_slices(k, n, workers, split)?;
+
+        if let Some(direct_workers) = self.direct_workers.as_ref() {
+            let start = Instant::now();
+            let mut direct_prepared = Vec::with_capacity(slices.len());
+            let mut stats = Int8DecodePoolPreparedStats {
+                workers: slices.len(),
+                ..Int8DecodePoolPreparedStats::default()
+            };
+            for (worker, &slice) in slices.iter().enumerate() {
+                let executor = Int8DecodeExecutor::from_externally_guarded_device(
+                    &direct_workers[worker].device,
+                );
+                let prepared =
+                    prepare_worker_weights(&executor, &weights, k, slice).map_err(|err| {
+                        Int8DecodePoolError::Worker(format!("direct worker {worker}: {err}"))
+                    })?;
+                let worker_stats = prepared.stats();
+                stats.resident_bytes = stats
+                    .resident_bytes
+                    .saturating_add(worker_stats.resident_bytes);
+                stats.k_slices = stats.k_slices.saturating_add(worker_stats.k_slices);
+                stats.pack_ns_sum = stats.pack_ns_sum.saturating_add(worker_stats.pack_ns);
+                stats.pack_ns_max = stats.pack_ns_max.max(worker_stats.pack_ns);
+                direct_prepared.push(prepared);
+            }
+            stats.prepare_wall_ns = start.elapsed().as_nanos();
+            return Ok(Int8DecodePoolPreparedWeights {
+                weight_id: 0,
+                k,
+                n,
+                split,
+                slices,
+                stats,
+                direct_prepared: Some(direct_prepared),
+            });
+        }
+
         let request_id = self.allocate_request_id();
         let weight_id = self.next_weight_id;
         self.next_weight_id = self.next_weight_id.wrapping_add(1);
@@ -406,6 +480,7 @@ impl Int8DecodePool {
             split,
             slices,
             stats,
+            direct_prepared: None,
         })
     }
 
@@ -418,6 +493,12 @@ impl Int8DecodePool {
             return Err(Int8DecodePoolError::InvalidInput(
                 "activation length must equal prepared K",
             ));
+        }
+        if self.direct_workers.is_some() {
+            if env::var_os("ROCKNPU_EXPERIMENT_DIRECT_SCRATCH").is_some() {
+                return self.execute_prepared_direct_scratch(&activation, weights);
+            }
+            return self.execute_prepared_direct(&activation, weights);
         }
         let request_id = self.allocate_request_id();
         let start = Instant::now();
@@ -435,6 +516,7 @@ impl Int8DecodePool {
         let mut values = vec![0i32; weights.n];
         let mut npu_tasks = 0usize;
         let mut worker_total_ns = vec![0u128; weights.slices.len()];
+        let mut worker_stats = vec![Int8DecodeStats::default(); weights.slices.len()];
         for _ in 0..weights.slices.len() {
             let result = self.recv_result(request_id, weights.slices.len())?;
             let output = match result.response {
@@ -471,6 +553,7 @@ impl Int8DecodePool {
             }
             npu_tasks = npu_tasks.saturating_add(output.stats.npu_tasks);
             worker_total_ns[result.worker] = output.stats.total_ns;
+            worker_stats[result.worker] = output.stats;
         }
 
         Ok(Int8DecodePoolOutput {
@@ -481,6 +564,189 @@ impl Int8DecodePool {
                 npu_tasks,
                 wall_ns: start.elapsed().as_nanos(),
                 worker_total_ns,
+                worker_stats,
+            },
+        })
+    }
+
+    fn execute_prepared_direct(
+        &self,
+        activation: &[i8],
+        weights: &Int8DecodePoolPreparedWeights,
+    ) -> Result<Int8DecodePoolOutput, Int8DecodePoolError> {
+        let direct_workers = self
+            .direct_workers
+            .as_ref()
+            .ok_or_else(|| Int8DecodePoolError::Worker("direct workers missing".to_string()))?;
+        let prepared = weights.direct_prepared.as_ref().ok_or_else(|| {
+            Int8DecodePoolError::Worker("direct prepared weights missing".to_string())
+        })?;
+        if prepared.len() != weights.slices.len() || prepared.len() > direct_workers.len() {
+            return Err(Int8DecodePoolError::Worker(
+                "direct prepared worker geometry mismatch".to_string(),
+            ));
+        }
+
+        let start = Instant::now();
+        let mut pendings = Vec::with_capacity(prepared.len());
+        for (worker, (&slice, prepared_worker)) in
+            weights.slices.iter().zip(prepared.iter()).enumerate()
+        {
+            let end = slice.k0.saturating_add(slice.ksub);
+            if end > activation.len() {
+                return Err(Int8DecodePoolError::InvalidInput(
+                    "activation slice out of range",
+                ));
+            }
+            let executor =
+                Int8DecodeExecutor::from_externally_guarded_device(&direct_workers[worker].device);
+            let pending = executor
+                .begin_execute_prepared(&activation[slice.k0..end], prepared_worker)
+                .map_err(|err| {
+                    Int8DecodePoolError::Worker(format!("direct worker {worker} begin: {err}"))
+                })?;
+            pendings.push((worker, slice, pending));
+        }
+
+        let mut values = vec![0i32; weights.n];
+        let mut npu_tasks = 0usize;
+        let mut worker_total_ns = vec![0u128; prepared.len()];
+        let mut worker_stats = vec![Int8DecodeStats::default(); prepared.len()];
+        for (worker, slice, pending) in pendings {
+            let executor =
+                Int8DecodeExecutor::from_externally_guarded_device(&direct_workers[worker].device);
+            let output = executor.finish_execute_prepared(pending).map_err(|err| {
+                Int8DecodePoolError::Worker(format!("direct worker {worker} finish: {err}"))
+            })?;
+            if output.values.len() != slice.nsub || slice.n0.saturating_add(slice.nsub) > weights.n
+            {
+                return Err(Int8DecodePoolError::Worker(format!(
+                    "direct worker {worker} returned invalid output geometry"
+                )));
+            }
+            match weights.split {
+                Int8DecodeSplit::N => {
+                    values[slice.n0..slice.n0 + slice.nsub].copy_from_slice(&output.values);
+                }
+                Int8DecodeSplit::K => {
+                    for (sum, partial) in values.iter_mut().zip(output.values) {
+                        *sum = sum.checked_add(partial).ok_or_else(|| {
+                            Int8DecodePoolError::Worker(
+                                "direct K-split host int32 accumulation overflow".to_string(),
+                            )
+                        })?;
+                    }
+                }
+            }
+            npu_tasks = npu_tasks.saturating_add(output.stats.npu_tasks);
+            worker_total_ns[worker] = output.stats.total_ns;
+            worker_stats[worker] = output.stats;
+        }
+
+        Ok(Int8DecodePoolOutput {
+            values,
+            stats: Int8DecodePoolStats {
+                split: weights.split,
+                workers_used: weights.slices.len(),
+                npu_tasks,
+                wall_ns: start.elapsed().as_nanos(),
+                worker_total_ns,
+                worker_stats,
+            },
+        })
+    }
+
+    fn execute_prepared_direct_scratch(
+        &mut self,
+        activation: &[i8],
+        weights: &Int8DecodePoolPreparedWeights,
+    ) -> Result<Int8DecodePoolOutput, Int8DecodePoolError> {
+        let direct_workers = self
+            .direct_workers
+            .as_mut()
+            .ok_or_else(|| Int8DecodePoolError::Worker("direct workers missing".to_string()))?;
+        let prepared = weights.direct_prepared.as_ref().ok_or_else(|| {
+            Int8DecodePoolError::Worker("direct prepared weights missing".to_string())
+        })?;
+        if prepared.len() != weights.slices.len() || prepared.len() > direct_workers.len() {
+            return Err(Int8DecodePoolError::Worker(
+                "direct prepared worker geometry mismatch".to_string(),
+            ));
+        }
+
+        let start = Instant::now();
+        let mut pendings = Vec::with_capacity(prepared.len());
+        for (worker, (&slice, prepared_worker)) in
+            weights.slices.iter().zip(prepared.iter()).enumerate()
+        {
+            let end = slice.k0.saturating_add(slice.ksub);
+            if end > activation.len() {
+                return Err(Int8DecodePoolError::InvalidInput(
+                    "activation slice out of range",
+                ));
+            }
+            let worker_state = &mut direct_workers[worker];
+            let key = (prepared_worker.k(), prepared_worker.n());
+            let scratch_slot = worker_state.scratch.entry(key).or_insert(None);
+            let executor = Int8DecodeExecutor::from_externally_guarded_device(&worker_state.device);
+            let pending = executor
+                .begin_execute_prepared_owned(
+                    &activation[slice.k0..end],
+                    prepared_worker,
+                    scratch_slot,
+                )
+                .map_err(|err| {
+                    Int8DecodePoolError::Worker(format!(
+                        "direct scratch worker {worker} begin: {err}"
+                    ))
+                })?;
+            pendings.push((worker, slice, key, pending));
+        }
+
+        let mut values = vec![0i32; weights.n];
+        let mut npu_tasks = 0usize;
+        let mut worker_total_ns = vec![0u128; prepared.len()];
+        let mut worker_stats = vec![Int8DecodeStats::default(); prepared.len()];
+        for (worker, slice, key, pending) in pendings {
+            let worker_state = &mut direct_workers[worker];
+            let scratch_slot = worker_state.scratch.get_mut(&key).ok_or_else(|| {
+                Int8DecodePoolError::Worker(format!(
+                    "direct scratch worker {worker} missing shape cache"
+                ))
+            })?;
+            if slice.n0.saturating_add(slice.nsub) > weights.n {
+                return Err(Int8DecodePoolError::Worker(format!(
+                    "direct scratch worker {worker} returned invalid output geometry"
+                )));
+            }
+            let executor = Int8DecodeExecutor::from_externally_guarded_device(&worker_state.device);
+            let stats = match weights.split {
+                Int8DecodeSplit::N => executor.finish_execute_prepared_owned_into(
+                    pending,
+                    scratch_slot,
+                    &mut values[slice.n0..slice.n0 + slice.nsub],
+                ),
+                Int8DecodeSplit::K => {
+                    executor.finish_execute_prepared_owned_into(pending, scratch_slot, &mut values)
+                }
+            }
+            .map_err(|err| {
+                Int8DecodePoolError::Worker(format!("direct scratch worker {worker} finish: {err}"))
+            })?;
+            npu_tasks = npu_tasks.saturating_add(stats.npu_tasks);
+            worker_total_ns[worker] = stats.total_ns;
+            worker_stats[worker] = stats;
+        }
+
+        Ok(Int8DecodePoolOutput {
+            values,
+            stats: Int8DecodePoolStats {
+                split: weights.split,
+                workers_used: weights.slices.len(),
+                npu_tasks,
+                wall_ns: start.elapsed().as_nanos(),
+                worker_total_ns,
+                worker_stats,
             },
         })
     }
@@ -489,11 +755,14 @@ impl Int8DecodePool {
         &mut self,
         weights: &Int8DecodePoolPreparedWeights,
     ) -> Result<(), Int8DecodePoolError> {
+        if weights.direct_prepared.is_some() {
+            return Ok(());
+        }
         self.release_weight_id(weights.weight_id, &weights.slices)
     }
 
     fn validate_requested_workers(&self, workers: usize) -> Result<(), Int8DecodePoolError> {
-        if workers == 0 || workers > self.senders.len() {
+        if workers == 0 || workers > self.workers() {
             return Err(Int8DecodePoolError::InvalidWorkerCount(workers));
         }
         Ok(())

@@ -47,6 +47,37 @@ int rocknpu_matmul_f16_f32_f32(
     size_t k,
     size_t n);
 
+int rocknpu_matmul_w8a8_f32_f32_m1(
+    rocknpu_context * context,
+    const int8_t * weights_nk_i8,
+    const float * weight_scales_n_f32,
+    const float * activations_k_f32,
+    float * output_n_f32,
+    size_t k,
+    size_t n);
+
+int rocknpu_matmul_w8a8_pair_f32_f32_m1(
+    rocknpu_context * context,
+    const int8_t * first_weights_nk_i8,
+    const float * first_scales_n_f32,
+    size_t first_n,
+    const int8_t * second_weights_nk_i8,
+    const float * second_scales_n_f32,
+    size_t second_n,
+    const float * activations_k_f32,
+    float * first_output_f32,
+    float * second_output_f32,
+    size_t k);
+
+int rocknpu_matmul_w8a8_triple_f32_f32_m1(
+    rocknpu_context * context,
+    const int8_t * first_weights_nk_i8, const float * first_scales_n_f32, size_t first_n,
+    const int8_t * second_weights_nk_i8, const float * second_scales_n_f32, size_t second_n,
+    const int8_t * third_weights_nk_i8, const float * third_scales_n_f32, size_t third_n,
+    const float * activations_k_f32,
+    float * first_output_f32, float * second_output_f32, float * third_output_f32,
+    size_t k);
+
 int rocknpu_matmul_q_pair_f32_f32_m1(
     rocknpu_context * context,
     const uint8_t * first_weights,

@@ -1,0 +1,2 @@
+# Preserve byte-exact generated output used by recorded SHA-256 comparisons.
+docs/benchmarks/**/*.stdout -text whitespace=-blank-at-eof

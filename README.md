@@ -25,6 +25,15 @@ RockNPU does **not** depend on Rockchip's proprietary `librknnrt.so`, `librkllmr
 
 > **Status: developer preview.** Real pretrained models already run on real RK3588 hardware, but operator coverage and the high-level end-user CLI/API are still under active development.
 
+For TinyLlama on native ARM llama.cpp, try the opt-in **NPU prompt processing +
+CPU generation** mode: `ROCKNPU_PREFILL_CACHE=1 ROCKNPU_DECODE=0`. It retains
+prompt weights on the NPU and uses FP32 partial outputs with f64 K accumulation.
+On the controlled RK3588 test, two CPU/NPU ABBA blocks measured **12.16% higher
+throughput** for a 512-token prompt plus 128 generated tokens; all 24 requests succeeded.
+See the [build and usage instructions](adapters/ggml-rocknpu/README.md#npu-prompt-processing-with-cpu-generation)
+and [same-machine CPU comparison, raw results and limits](docs/benchmarks/2026-09-20/README.md).
+This mode does not claim faster NPU-only decode or CPU-identical generated tokens.
+
 
 ## RK3588 performance setup: 700 MHz NPU benchmark mode
 
