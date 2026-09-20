@@ -95,9 +95,27 @@ No-profile pp16 r=5 averaged `78.247307 tok/s`, statistically indistinguishable 
 
 This is expected: the current host hotspot performs reduction/quantization, not INT8 dot products. `dotprod`/SDOT remains interesting for future CPU-routed small matmuls, but it does not improve this NPU-front-end path.
 
+## Independent o16 reproduction
+
+Exact candidate `401d22538ca198187471e84be5add78f7db4501f` was validated independently on o16.
+
+- direct NEON max-abs/finite differential: PASS
+- direct NEON quantize byte-for-byte differential: PASS
+- known France/Germany exact-16-token deterministic model gate: identical CPU continuation
+- grouped-M16 + host-NEON pp16 r=5: `88.4580, 84.8920, 91.0175, 93.0577, 92.1631 tok/s`
+- mean: `89.917679 tok/s`
+
+The pre-NEON grouped-Q/O candidate on o16 averaged `84.051609 tok/s`, so host NEON adds about `+7.0%` independently on the second board. Against the o16 CPU mean `73.917624 tok/s`, the combined grouped-M16 + host-NEON path is about `+21.6%`.
+
+## Default-on policy
+
+After cross-board reproduction, AArch64 builds now enable the host NEON path by default when `is_aarch64_feature_detected!("neon")` succeeds. `ROCKNPU_HOST_NEON=0` remains an explicit scalar opt-out for diagnostics/nonstandard hosts.
+
+An o8 pp16 run with no `ROCKNPU_HOST_NEON` variable set averaged `79.205144 tok/s` (`79.7357, 76.8097, 81.0700`), confirming runtime feature detection selected the fast path automatically.
+
 ## Verdict
 
-**PROMOTE AS AN OPT-IN RK3588 HOST PRIMITIVE, pending independent o16 reproduction.**
+**PROMOTE.**
 
-The useful mechanism is explicit NEON max-abs/finite reduction, not generic Cortex-A76/dotprod compiler tuning and not explicit NEON rescale. Keep `ROCKNPU_HOST_NEON` opt-in until the second board reproduces the result.
+The useful mechanism is explicit NEON max-abs/finite reduction, not generic Cortex-A76/dotprod compiler tuning and not explicit NEON rescale. It is bit-exact against the scalar quantizer, preserves the grouped-M16 model quality gate, and produces reproducible whole-model pp16 gains on both RK3588 boards.
 

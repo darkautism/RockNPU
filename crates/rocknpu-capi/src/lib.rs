@@ -186,6 +186,20 @@ fn env_enabled(name: &str) -> bool {
     env_enabled_default(name, false)
 }
 
+fn host_neon_enabled() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        env_enabled_default(
+            "ROCKNPU_HOST_NEON",
+            std::arch::is_aarch64_feature_detected!("neon"),
+        )
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
+    }
+}
+
 fn mtile_qo_group_size(k: usize, n: usize) -> Option<usize> {
     if k != 2048 || n != 2048 {
         return None;
@@ -364,7 +378,7 @@ unsafe fn quantize_symmetric_neon_second_pass(values: &[f32], scale: f32) -> Vec
 
 fn quantize_symmetric(values: &[f32]) -> Option<(Vec<i8>, f32)> {
     #[cfg(target_arch = "aarch64")]
-    let max_abs = if env_enabled("ROCKNPU_HOST_NEON") {
+    let max_abs = if host_neon_enabled() {
         // SAFETY: RK3588 is AArch64/ASIMD; the helper handles arbitrary tails.
         unsafe { max_abs_finite_neon(values)? }
     } else {
@@ -393,7 +407,7 @@ fn quantize_symmetric(values: &[f32]) -> Option<(Vec<i8>, f32)> {
     }
     let scale = max_abs / 127.0;
     #[cfg(target_arch = "aarch64")]
-    if env_enabled("ROCKNPU_HOST_NEON") {
+    if host_neon_enabled() {
         // SAFETY: RK3588 is AArch64/ASIMD; the helper handles arbitrary slice tails.
         let quantized = unsafe { quantize_symmetric_neon_second_pass(values, scale) };
         return Some((quantized, scale));
