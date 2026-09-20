@@ -164,3 +164,76 @@ Formal tracing-off fresh-process `pp512+tg128`, `--no-warmup`, reversed order B/
 **PROMOTE.** H1-B passes correctness, mechanism, o8g gain, o16g reproduction, whole-request gain above noise, and introduces no model-format/license change. It specifically improves cold first-use preparation; warmed resident-cache behavior should remain unchanged after preparation.
 
 One measured cold cost remains conspicuous after parallel dequant: converting the decoded `Vec<f16>` into `Arc<[f16]>` still costs roughly `0.7-0.8 s` per model load. A follow-up child experiment may remove that copy by borrowing the decoded Vec synchronously while the persistent workers pack resident BOs. Keep `7e3c162` as the validated fallback candidate if that extra optimization does not reproduce.
+
+## H1-B child result: reuse the dequantized Vec allocation
+
+Candidate commit: `970c80069ee0896c353f271b31144fefba3ce0a7`.
+
+The validated H1-B path still spent roughly 0.7-0.8 seconds converting each freshly decoded `Vec<f16>` collection into `Arc<[f16]>`. This child keeps the decoded allocation intact by sharing `Arc<Vec<f16>>` with the resident preparation workers instead of bulk-copying into a new Arc slice. No tensor values, GGUF parsing, NPU kernel, scheduling policy, model format, or driver code changes.
+
+Correctness passed independently on both boards:
+
+- o8g: `rocknpu-capi` 10/10 and `rocknpu-matmul` 20/20;
+- o16g: `rocknpu-capi` 10/10 and `rocknpu-matmul` 20/20;
+- o16g documented TinyLlama deterministic 24-token continuation exactly matched the 82-byte contract, SHA-256 `08730f9092a465cc9915db41d7ba8f999504c968e4937d73b6d9f068dcae8f8d`.
+
+### Mechanism diagnostic
+
+Fresh-process o8g `pp512 --no-warmup` with profiling enabled measured:
+
+- dequant: `1009.966 ms`;
+- `host_to_arc`: **`0.125 ms`**;
+- resident prepare call: `889.945 ms`;
+- prepare-pool wall: `887.607 ms`;
+- outer prepare-call overhead: **`2.338 ms`**;
+- diagnostic pp512 wall: `7.766798 s`.
+
+The former host materialization cost is therefore effectively eliminated rather than hidden in another phase.
+
+### Whole-request adjacent A/B
+
+Tracing/profile disabled, fresh process, `pp512+tg128`, `--no-warmup`, H1-B (`7e3c162`) versus the Arc/Vec child (`970c800`):
+
+**o8g, A/B/B/A**
+
+- H1-B A: `13.981163`, `14.169145` s;
+- Arc/Vec B: `12.701498`, `12.742539` s;
+- H1-B mean: `14.075154 s`, population stddev `0.093991 s`;
+- Arc/Vec mean: `12.722019 s`, population stddev `0.020520 s`;
+- absolute delta: `1.353135 s/request`;
+- latency reduction: **9.61%**;
+- speedup: **1.106x**.
+
+**o16g, A/B/B/A**
+
+- H1-B A: `13.507430`, `13.741281` s;
+- Arc/Vec B: `12.266595`, `12.335495` s;
+- H1-B mean: `13.624355 s`, population stddev `0.116926 s`;
+- Arc/Vec mean: `12.301045 s`, population stddev `0.034450 s`;
+- absolute delta: `1.323310 s/request`;
+- latency reduction: **9.71%**;
+- speedup: **1.108x**.
+
+**Verdict: PROMOTE.** The mechanism is directly measured, both boards independently reproduce a whole-request gain far above run-to-run noise, and correctness is unchanged.
+
+## H1-A result: load-time eager prepare is not a useful cold-throughput candidate at the current GGML boundary
+
+H1-A proposed moving resident prefill preparation out of the first user request and into initialization. It was intentionally lower priority because it does not remove work; it only changes when the work is paid.
+
+The current stock-GGML integration boundary makes a true model-load eager implementation materially different from the hypothesis:
+
+- RockNPU is loaded as an out-of-tree dynamic backend and deliberately returns the stock CPU host buffer type;
+- the GGML backend/device callbacks provide graph execution, op support, buffer, copy and synchronization surfaces, but no model-loaded/preload lifecycle callback;
+- because RockNPU does not own a custom model buffer, it does not receive model-weight `set_tensor` callbacks during normal llama.cpp loading;
+- the first point where the adapter has the complete weight pointer, activation geometry and exact prompt M for the existing exact-M resident plan is request graph scheduling/execution, i.e. the latency path H1-A intended to avoid.
+
+A custom RockNPU buffer type could in principle take ownership of model tensors and perform partial work during load, but that is a new memory/lifecycle architecture, not a minimal eager-policy experiment. It would also need to solve unknown exact-M planning and could duplicate host model residency. Patching llama.cpp to add a RockNPU-specific model-load hook would violate the project's non-invasive stock-frontend boundary.
+
+**Verdict: REJECT as a cold-throughput hypothesis for the current GGML backend.** No production code is added. If a future upstream-neutral backend lifecycle/preparation hook appears, eager preparation may be reconsidered strictly as a latency-placement policy, with startup time and memory reported separately; it should not be credited as reducing process-total cold work.
+
+## H1 family final status
+
+- H1-C raw persistent FP16 representation: **REJECT** — storage/page-fault cost dominates and disk footprint regresses.
+- H1-B parallel Q4_K/Q6_K dequant: **PROMOTE** — large mechanism and whole-request gains reproduced on two boards.
+- H1-B child Arc/Vec allocation reuse: **PROMOTE** — removes the remaining host bulk copy and yields an additional ~9.6-9.7% cold full-request latency reduction on two boards.
+- H1-A load-time eager prepare: **REJECT for current stock-GGML integration** — shifts rather than removes work and lacks a non-invasive model-load hook with the current host-buffer design.
