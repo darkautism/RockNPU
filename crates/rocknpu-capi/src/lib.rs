@@ -68,6 +68,11 @@ struct CachedW8MtileWeight {
     scales: Vec<f32>,
 }
 
+struct CachedGroupedW8MtileWeight {
+    prepared: Vec<Int8PreparedWeights>,
+    scales: Vec<f32>,
+}
+
 struct CachedW4A4Weight {
     prepared: Int4PreparedWeights,
     scales: Vec<f32>,
@@ -134,6 +139,7 @@ pub struct RockNpuContext {
     decode_worker_cache: HashMap<(usize, usize), DecodeChoice>,
     decode_weights: HashMap<DecodeWeightKey, CachedW8A8Weight>,
     decode_mtile_weights: HashMap<DecodeWeightKey, CachedW8MtileWeight>,
+    decode_grouped_mtile_weights: HashMap<(DecodeWeightKey, usize), CachedGroupedW8MtileWeight>,
     decode_mtile_scratch: HashMap<(usize, usize), Option<Int8MtileScratch>>,
     decode_pair_weights: HashMap<DecodePairKey, CachedW8A8Weight>,
     decode_triple_weights: HashMap<DecodeTripleKey, CachedW8A8Weight>,
@@ -178,6 +184,31 @@ fn env_enabled_default(name: &str, default: bool) -> bool {
 
 fn env_enabled(name: &str) -> bool {
     env_enabled_default(name, false)
+}
+
+fn mtile_qo_group_size(k: usize, n: usize) -> Option<usize> {
+    if k != 2048 || n != 2048 {
+        return None;
+    }
+    let group = env::var("ROCKNPU_MTILE_QO_GROUP").ok()?.parse::<usize>().ok()?;
+    (group >= 512 && group <= k && group.is_multiple_of(512) && k.is_multiple_of(group))
+        .then_some(group)
+}
+
+fn mtile_shape_enabled(k: usize, n: usize) -> bool {
+    if !env_enabled("ROCKNPU_W8_MTILE") {
+        return false;
+    }
+    match env::var("ROCKNPU_W8_MTILE_SCOPE").ok().as_deref() {
+        None | Some("") | Some("all") => true,
+        Some("kv") => k == 2048 && n == 256,
+        Some("qo") => k == 2048 && n == 2048,
+        Some("ffn") => k == 2048 && n == 5632,
+        Some("attn") => k == 2048 && (n == 256 || n == 2048),
+        Some("safe") => k == 2048 && (n == 256 || n == 5632),
+        Some("none") => false,
+        Some(_) => false,
+    }
 }
 
 fn ns_to_ms(value: u128) -> f64 {
@@ -343,6 +374,45 @@ fn prepare_q4_k_w8a8(weight_bytes: &[u8], k: usize, n: usize) -> Option<(Vec<i8>
     (weights.len() == n.checked_mul(k)? && scales.len() == n).then_some((weights, scales))
 }
 
+fn prepare_q4_k_grouped_w8a8(
+    weight_bytes: &[u8],
+    k: usize,
+    n: usize,
+    group_size: usize,
+) -> Option<(Vec<i8>, Vec<f32>)> {
+    const VALUES: usize = 256;
+    if group_size == 0 || !group_size.is_multiple_of(512) || !k.is_multiple_of(group_size) {
+        return None;
+    }
+    let groups = k / group_size;
+    let row_bytes = (k / VALUES).checked_mul(size_of::<BlockQ4K>())?;
+    if weight_bytes.len() != n.checked_mul(row_bytes)? {
+        return None;
+    }
+    let total = n.checked_mul(k)?;
+    let mut weights = vec![0i8; total];
+    let mut scales = vec![0.0f32; groups.checked_mul(n)?];
+    let mut row = Vec::with_capacity(k);
+    let mut decoded = [0.0f32; VALUES];
+    let mut quantized = Vec::with_capacity(group_size);
+    for (output_channel, encoded_row) in weight_bytes.chunks_exact(row_bytes).enumerate() {
+        row.clear();
+        for bytes in encoded_row.chunks_exact(size_of::<BlockQ4K>()) {
+            let block: BlockQ4K = pod_read_unaligned(bytes);
+            dequantize_q4_k(&block, &mut decoded);
+            row.extend_from_slice(&decoded);
+        }
+        for (group_index, group) in row.chunks_exact(group_size).enumerate() {
+            quantized.clear();
+            scales[group_index * n + output_channel] =
+                append_quantized_symmetric(group, &mut quantized)?;
+            let start = (group_index * n + output_channel).checked_mul(group_size)?;
+            weights[start..start + group_size].copy_from_slice(&quantized);
+        }
+    }
+    Some((weights, scales))
+}
+
 fn fwht_norm_in_place(values: &mut [f32]) -> bool {
     if values.is_empty() || !values.len().is_power_of_two() {
         return false;
@@ -490,6 +560,45 @@ fn prepare_q6_k_w8a8(weight_bytes: &[u8], k: usize, n: usize) -> Option<(Vec<i8>
         scales.push(append_quantized_symmetric(&row, &mut weights)?);
     }
     (weights.len() == n.checked_mul(k)? && scales.len() == n).then_some((weights, scales))
+}
+
+fn prepare_q6_k_grouped_w8a8(
+    weight_bytes: &[u8],
+    k: usize,
+    n: usize,
+    group_size: usize,
+) -> Option<(Vec<i8>, Vec<f32>)> {
+    const VALUES: usize = 256;
+    if group_size == 0 || !group_size.is_multiple_of(512) || !k.is_multiple_of(group_size) {
+        return None;
+    }
+    let groups = k / group_size;
+    let row_bytes = (k / VALUES).checked_mul(size_of::<BlockQ6K>())?;
+    if weight_bytes.len() != n.checked_mul(row_bytes)? {
+        return None;
+    }
+    let total = n.checked_mul(k)?;
+    let mut weights = vec![0i8; total];
+    let mut scales = vec![0.0f32; groups.checked_mul(n)?];
+    let mut row = Vec::with_capacity(k);
+    let mut decoded = [0.0f32; VALUES];
+    let mut quantized = Vec::with_capacity(group_size);
+    for (output_channel, encoded_row) in weight_bytes.chunks_exact(row_bytes).enumerate() {
+        row.clear();
+        for bytes in encoded_row.chunks_exact(size_of::<BlockQ6K>()) {
+            let block: BlockQ6K = pod_read_unaligned(bytes);
+            dequantize_q6_k(&block, &mut decoded);
+            row.extend_from_slice(&decoded);
+        }
+        for (group_index, group) in row.chunks_exact(group_size).enumerate() {
+            quantized.clear();
+            scales[group_index * n + output_channel] =
+                append_quantized_symmetric(group, &mut quantized)?;
+            let start = (group_index * n + output_channel).checked_mul(group_size)?;
+            weights[start..start + group_size].copy_from_slice(&quantized);
+        }
+    }
+    Some((weights, scales))
 }
 
 fn decode_worker_candidates(
@@ -1265,6 +1374,126 @@ where
     STATUS_OK
 }
 
+fn execute_cached_grouped_w8a8_m16<F>(
+    context: &mut RockNpuContext,
+    key: DecodeWeightKey,
+    group_size: usize,
+    activations_mk_f32: &[f32],
+    output_mn_f32: &mut [f32],
+    prepare: F,
+) -> i32
+where
+    F: FnOnce() -> Option<(Vec<i8>, Vec<f32>)>,
+{
+    const M: usize = 16;
+    let groups = key.k / group_size;
+    let Some(expected_a) = M.checked_mul(key.k) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let Some(expected_out) = M.checked_mul(key.n) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    if groups < 2
+        || !group_size.is_multiple_of(512)
+        || !key.k.is_multiple_of(group_size)
+        || group_size > 4096
+        || activations_mk_f32.len() != expected_a
+        || output_mn_f32.len() != expected_out
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    let mut grouped_activations = (0..groups)
+        .map(|_| Vec::with_capacity(M * group_size))
+        .collect::<Vec<_>>();
+    let mut activation_scales = vec![0.0f32; groups * M];
+    for (row_index, row) in activations_mk_f32.chunks_exact(key.k).enumerate() {
+        for (group_index, group) in row.chunks_exact(group_size).enumerate() {
+            let Some((q, scale)) = quantize_symmetric(group) else {
+                return STATUS_INVALID_ARGUMENT;
+            };
+            grouped_activations[group_index].extend_from_slice(&q);
+            activation_scales[group_index * M + row_index] = scale;
+        }
+    }
+
+    let persistent = env_enabled("ROCKNPU_MTILE_PERSIST");
+    let RockNpuContext {
+        device,
+        decode_grouped_mtile_weights,
+        decode_mtile_scratch,
+        ..
+    } = context;
+    let executor = Int8DecodeExecutor::from_externally_guarded_device(device);
+    let cache_key = (key, group_size);
+    let cached = match decode_grouped_mtile_weights.entry(cache_key) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => {
+            let Some((weights_i8, scales)) = prepare() else {
+                return STATUS_INVALID_ARGUMENT;
+            };
+            if weights_i8.len() != key.n.saturating_mul(key.k)
+                || scales.len() != groups.saturating_mul(key.n)
+            {
+                return STATUS_INVALID_ARGUMENT;
+            }
+            let group_matrix = key.n.saturating_mul(group_size);
+            let mut prepared = Vec::with_capacity(groups);
+            for group_index in 0..groups {
+                let start = group_index.saturating_mul(group_matrix);
+                let end = start.saturating_add(group_matrix);
+                let Some(group_weights) = weights_i8.get(start..end) else {
+                    return STATUS_INVALID_ARGUMENT;
+                };
+                match executor.prepare_weights(group_weights, group_size, key.n) {
+                    Ok(group_prepared) => prepared.push(group_prepared),
+                    Err(_) => return STATUS_EXECUTION_ERROR,
+                }
+            }
+            entry.insert(CachedGroupedW8MtileWeight { prepared, scales })
+        }
+    };
+
+    if cached.prepared.len() != groups {
+        return STATUS_EXECUTION_ERROR;
+    }
+    output_mn_f32.fill(0.0);
+    for group_index in 0..groups {
+        let result = if persistent {
+            let scratch_slot = decode_mtile_scratch
+                .entry((group_size, key.n))
+                .or_insert(None);
+            match executor.execute_prepared_m16_persistent(
+                &grouped_activations[group_index],
+                &cached.prepared[group_index],
+                scratch_slot,
+            ) {
+                Ok(result) => result,
+                Err(_) => return STATUS_EXECUTION_ERROR,
+            }
+        } else {
+            match executor.execute_prepared_m16_single(
+                &grouped_activations[group_index],
+                &cached.prepared[group_index],
+            ) {
+                Ok(result) => result,
+                Err(_) => return STATUS_EXECUTION_ERROR,
+            }
+        };
+        let weight_scales =
+            &cached.scales[group_index * key.n..(group_index + 1) * key.n];
+        for row in 0..M {
+            let activation_scale = activation_scales[group_index * M + row];
+            for col in 0..key.n {
+                output_mn_f32[row * key.n + col] += result.values[row * key.n + col] as f32
+                    * activation_scale
+                    * weight_scales[col];
+            }
+        }
+    }
+    STATUS_OK
+}
+
 fn execute_cached_w8a8_pair_m1<F>(
     context: &mut RockNpuContext,
     key: DecodePairKey,
@@ -1704,6 +1933,7 @@ pub extern "C" fn rocknpu_context_create() -> *mut RockNpuContext {
             decode_worker_cache: HashMap::new(),
             decode_weights: HashMap::new(),
             decode_mtile_weights: HashMap::new(),
+            decode_grouped_mtile_weights: HashMap::new(),
             decode_mtile_scratch: HashMap::new(),
             decode_pair_weights: HashMap::new(),
             decode_triple_weights: HashMap::new(),
@@ -2551,7 +2781,7 @@ pub unsafe extern "C" fn rocknpu_matmul_q4_k_f32_f32(
         && k.is_multiple_of(512)
         && n.is_multiple_of(32)
         && n <= 8192
-        && env_enabled("ROCKNPU_W8_MTILE")
+        && mtile_shape_enabled(k, n)
     {
         let key = DecodeWeightKey {
             address: weight_bytes.as_ptr() as usize,
@@ -2560,6 +2790,16 @@ pub unsafe extern "C" fn rocknpu_matmul_q4_k_f32_f32(
             n,
             kind: DecodeWeightKind::Q4K,
         };
+        if let Some(group_size) = mtile_qo_group_size(k, n) {
+            return execute_cached_grouped_w8a8_m16(
+                context,
+                key,
+                group_size,
+                activations,
+                output,
+                || prepare_q4_k_grouped_w8a8(weight_bytes, k, n, group_size),
+            );
+        }
         return execute_cached_w8a8_m16(context, key, activations, output, || {
             prepare_q4_k_w8a8(weight_bytes, k, n)
         });
@@ -2695,7 +2935,7 @@ pub unsafe extern "C" fn rocknpu_matmul_q6_k_f32_f32(
         && k.is_multiple_of(512)
         && n.is_multiple_of(32)
         && n <= 8192
-        && env_enabled("ROCKNPU_W8_MTILE")
+        && mtile_shape_enabled(k, n)
     {
         let key = DecodeWeightKey {
             address: weight_bytes.as_ptr() as usize,
@@ -2704,6 +2944,16 @@ pub unsafe extern "C" fn rocknpu_matmul_q6_k_f32_f32(
             n,
             kind: DecodeWeightKind::Q6K,
         };
+        if let Some(group_size) = mtile_qo_group_size(k, n) {
+            return execute_cached_grouped_w8a8_m16(
+                context,
+                key,
+                group_size,
+                activations,
+                output,
+                || prepare_q6_k_grouped_w8a8(weight_bytes, k, n, group_size),
+            );
+        }
         return execute_cached_w8a8_m16(context, key, activations, output, || {
             prepare_q6_k_w8a8(weight_bytes, k, n)
         });

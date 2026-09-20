@@ -101,11 +101,26 @@ Pinned llama.cpp reports this prompt as exactly 16 tokens. With temperature 0:
 
 The candidate output remained semantically coherent, but the deterministic continuation is **not byte-exact** once the M16 W8 prompt path is enabled. Therefore the M16 path has a real model-level numerical effect even though integer matmul hardware gates are exact. This is consistent with row-wise activation/weight quantization changing logits, not a broken Rocket matmul.
 
+## Projection-scope diagnosis and groupwise Q/O recovery
+
+The known divergent 16-token France/Germany prompt was used to isolate M16 W8 quantization sensitivity by projection shape:
+
+- `kv` only (`K=2048,N=256`): matched the CPU continuation; 44 M16 calls.
+- `qo` only (`K=2048,N=2048`): reproduced the `Canada is Ott...` divergence; Q/O is a clear sensitive class.
+- `ffn` only (`K=2048,N=5632` gate/up): matched the CPU continuation; 42 M16 calls, but pp16 averaged only `44.685219 tok/s`, so simply falling sensitive projections back to FP16 loses too much throughput.
+- `safe` (`kv+ffn`, Q/O on FP16): still diverged. Individually tolerable quantization errors can accumulate across projection classes; a simple shape allowlist is not a complete quality bridge.
+
+A new opt-in Q/O groupwise W8 path therefore splits `K=2048` into two `K=1024` groups. Each group has independent activation and per-output-channel weight scales, runs the same exact M16 INT8 primitive, and the scaled partials are accumulated in FP32. `ROCKNPU_MTILE_QO_GROUP=1024` enables this research path.
+
+With all other eligible projections still using M16 W8, the 2-way Q/O path restored the previously divergent France/Germany continuation exactly to the CPU output. It also preserved the second exact-16-token France/China continuation that already matched CPU.
+
+On o8, before grouped persistent scratch, pp16 r=3 averaged `72.132268 tok/s` (`71.7717, 72.0200, 72.6051`), already slightly above the same-board CPU baseline. After reusing persistent M16 scratch across the two Q/O groups, pp16 r=5 averaged `75.989331 tok/s` (`75.1190, 74.9143, 74.9151, 77.7588, 77.2395`), approximately `+6.5%` over the o8 CPU mean `71.344361 tok/s` while retaining both deterministic 16-token quality gates.
+
 ## Verdict
 
-**KEEP EXPERIMENTAL.**
+**KEEP EXPERIMENTAL, but the quality/performance blocker now has a viable mechanism.**
 
-Performance and hardware correctness are independently reproduced on two RK3588 boards, including a clean o16 speedup of about 17.4% over same-board CPU pp16. However the exact 16-token deterministic model gate diverges after a substantial shared prefix. Do not merge/promote the M16 model route until the quantization-error bridge is improved or a quality metric demonstrates that the divergence is acceptable for the intended workload.
+The original ungrouped M16 path remains unsuitable for promotion because model-level divergence is real. The 2-way Q/O groupwise path restores both current deterministic M16 quality gates while remaining faster than CPU on o8. It still needs independent o16 reproduction and broader numerical/quality coverage before promotion.
 
-The next high-value work is therefore M16 quantization-error reduction (while preserving the demonstrated batched-W8 speed), followed by speculative/batched target verification. Further M=1 micro-optimization is lower priority.
+The next gate is exact-commit o16 validation of the Q/O-grouped path, followed by speculative/batched target verification if cross-board quality and speed hold. Further M=1 micro-optimization is lower priority.
 
