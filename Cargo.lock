@@ -623,6 +623,7 @@ dependencies = [
  "bytemuck",
  "half",
  "llama-gguf",
+ "rayon",
  "rocket-runtime",
  "rocknpu-matmul",
 ]

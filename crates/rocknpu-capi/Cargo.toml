@@ -11,5 +11,6 @@ crate-type = ["cdylib"]
 bytemuck = "1"
 half = "2"
 llama-gguf = { version = "0.14", default-features = false }
+rayon = "1"
 rocket-runtime = { path = "../rocket-runtime" }
 rocknpu-matmul = { path = "../rocknpu-matmul" }

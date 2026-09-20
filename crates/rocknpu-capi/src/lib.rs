@@ -3,6 +3,7 @@
 use bytemuck::pod_read_unaligned;
 use half::f16;
 use llama_gguf::tensor::quant::{BlockQ4K, BlockQ6K, dequantize_q4_k, dequantize_q6_k};
+use rayon::prelude::*;
 use rocket_runtime::RocketDevice;
 use rocknpu_matmul::{
     Fp16MatmulExecutor, Fp16MatmulPool, Fp16MatmulPoolPreparedWeights, Int4DecodeExecutor,
@@ -153,6 +154,72 @@ fn env_enabled(name: &str) -> bool {
 
 fn ns_to_ms(value: u128) -> f64 {
     value as f64 / 1.0e6
+}
+
+const PARALLEL_DEQUANT_MIN_VALUES: usize = 1 << 20;
+
+fn dequantize_q4_k_prefill_f16(
+    weight_bytes: &[u8],
+    weight_values: usize,
+    parallel: bool,
+) -> Vec<f16> {
+    const VALUES_PER_BLOCK: usize = 256;
+    if parallel && weight_values >= PARALLEL_DEQUANT_MIN_VALUES {
+        let mut weights = vec![f16::from_bits(0); weight_values];
+        weight_bytes
+            .par_chunks_exact(size_of::<BlockQ4K>())
+            .zip(weights.par_chunks_mut(VALUES_PER_BLOCK))
+            .for_each(|(bytes, dst)| {
+                let block: BlockQ4K = pod_read_unaligned(bytes);
+                let mut decoded = [0.0f32; VALUES_PER_BLOCK];
+                dequantize_q4_k(&block, &mut decoded);
+                for (out, value) in dst.iter_mut().zip(decoded) {
+                    *out = f16::from_f32(value);
+                }
+            });
+        weights
+    } else {
+        let mut weights = Vec::with_capacity(weight_values);
+        let mut decoded = [0.0f32; VALUES_PER_BLOCK];
+        for bytes in weight_bytes.chunks_exact(size_of::<BlockQ4K>()) {
+            let block: BlockQ4K = pod_read_unaligned(bytes);
+            dequantize_q4_k(&block, &mut decoded);
+            weights.extend(decoded.iter().copied().map(f16::from_f32));
+        }
+        weights
+    }
+}
+
+fn dequantize_q6_k_prefill_f16(
+    weight_bytes: &[u8],
+    weight_values: usize,
+    parallel: bool,
+) -> Vec<f16> {
+    const VALUES_PER_BLOCK: usize = 256;
+    if parallel && weight_values >= PARALLEL_DEQUANT_MIN_VALUES {
+        let mut weights = vec![f16::from_bits(0); weight_values];
+        weight_bytes
+            .par_chunks_exact(size_of::<BlockQ6K>())
+            .zip(weights.par_chunks_mut(VALUES_PER_BLOCK))
+            .for_each(|(bytes, dst)| {
+                let block: BlockQ6K = pod_read_unaligned(bytes);
+                let mut decoded = [0.0f32; VALUES_PER_BLOCK];
+                dequantize_q6_k(&block, &mut decoded);
+                for (out, value) in dst.iter_mut().zip(decoded) {
+                    *out = f16::from_f32(value);
+                }
+            });
+        weights
+    } else {
+        let mut weights = Vec::with_capacity(weight_values);
+        let mut decoded = [0.0f32; VALUES_PER_BLOCK];
+        for bytes in weight_bytes.chunks_exact(size_of::<BlockQ6K>()) {
+            let block: BlockQ6K = pod_read_unaligned(bytes);
+            dequantize_q6_k(&block, &mut decoded);
+            weights.extend(decoded.iter().copied().map(f16::from_f32));
+        }
+        weights
+    }
 }
 
 fn w4a4_shape_enabled(k: usize, n: usize) -> bool {
@@ -2281,14 +2348,11 @@ pub unsafe extern "C" fn rocknpu_matmul_q4_k_f32_f32(
             kind: DecodeWeightKind::Q4K,
         };
         return execute_cached_prefill(context, key, m, activations, output, || {
-            let mut weights = Vec::with_capacity(weight_values);
-            let mut decoded = [0.0f32; Q4_K_VALUES_PER_BLOCK];
-            for bytes in weight_bytes.chunks_exact(size_of::<BlockQ4K>()) {
-                let block: BlockQ4K = pod_read_unaligned(bytes);
-                dequantize_q4_k(&block, &mut decoded);
-                weights.extend(decoded.iter().copied().map(f16::from_f32));
-            }
-            weights
+            dequantize_q4_k_prefill_f16(
+                weight_bytes,
+                weight_values,
+                env_enabled("ROCKNPU_PREFILL_PARALLEL_DEQUANT"),
+            )
         });
     }
 
@@ -2409,14 +2473,11 @@ pub unsafe extern "C" fn rocknpu_matmul_q6_k_f32_f32(
             kind: DecodeWeightKind::Q6K,
         };
         return execute_cached_prefill(context, key, m, activations, output, || {
-            let mut weights = Vec::with_capacity(weight_values);
-            let mut decoded = [0.0f32; Q6_K_VALUES_PER_BLOCK];
-            for bytes in weight_bytes.chunks_exact(size_of::<BlockQ6K>()) {
-                let block: BlockQ6K = pod_read_unaligned(bytes);
-                dequantize_q6_k(&block, &mut decoded);
-                weights.extend(decoded.iter().copied().map(f16::from_f32));
-            }
-            weights
+            dequantize_q6_k_prefill_f16(
+                weight_bytes,
+                weight_values,
+                env_enabled("ROCKNPU_PREFILL_PARALLEL_DEQUANT"),
+            )
         });
     }
 
@@ -2460,6 +2521,24 @@ mod tests {
     #[test]
     fn q6_k_block_size_matches_ggml_abi() {
         assert_eq!(size_of::<BlockQ6K>(), 210);
+    }
+
+    #[test]
+    fn parallel_q4_k_prefill_dequant_matches_serial() {
+        let blocks = PARALLEL_DEQUANT_MIN_VALUES / 256;
+        let bytes = vec![0u8; blocks * size_of::<BlockQ4K>()];
+        let serial = dequantize_q4_k_prefill_f16(&bytes, PARALLEL_DEQUANT_MIN_VALUES, false);
+        let parallel = dequantize_q4_k_prefill_f16(&bytes, PARALLEL_DEQUANT_MIN_VALUES, true);
+        assert_eq!(parallel, serial);
+    }
+
+    #[test]
+    fn parallel_q6_k_prefill_dequant_matches_serial() {
+        let blocks = PARALLEL_DEQUANT_MIN_VALUES / 256;
+        let bytes = vec![0u8; blocks * size_of::<BlockQ6K>()];
+        let serial = dequantize_q6_k_prefill_f16(&bytes, PARALLEL_DEQUANT_MIN_VALUES, false);
+        let parallel = dequantize_q6_k_prefill_f16(&bytes, PARALLEL_DEQUANT_MIN_VALUES, true);
+        assert_eq!(parallel, serial);
     }
 
     #[test]
