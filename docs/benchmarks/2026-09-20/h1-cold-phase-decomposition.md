@@ -79,3 +79,24 @@ If that succeeds, measure the remaining ~1 s resident prepare separately before 
 **H1-B parallel preparation is second priority.** It can attack some of the remaining preparation/dequant wall time, but the current dominant work is memory-heavy and may be bandwidth-limited.
 
 **H1-A eager prepare is third priority for performance.** It can improve first-user-request latency by moving the cost into initialization, but it does not reduce process-total cold startup and must report that trade explicitly.
+
+## H1-C result: raw FP16 persistence is a dead end on this board/storage
+
+A minimal provenance-bound FP16 sidecar was prototyped from the exact GGUF. It contained all 154 projection tensors, recorded the source GGUF size/SHA-256 and per-tensor source fingerprint, and occupied about **1.9 GiB** on disk. Runtime fingerprint mismatch or missing files fell back to the normal quantized path. No model weights were altered.
+
+Two loading mechanisms were tested on o8g with fresh-process `pp512`, `--no-warmup`:
+
+| H1-C variant | pp512 time | dominant new cost | verdict |
+| --- | ---: | ---: | --- |
+| heap-resident FP16 sidecar | 72.007 s | 64.583 s reading 1782 MiB sidecar | REJECT |
+| per-tensor mmap -> pack -> munmap | 72.601 s | 65.680 s worker tile-pack/page-fault path | REJECT |
+
+The heap-resident version successfully removed runtime GGUF dequantization (`0.008 ms`) and the Vec-to-Arc copy, while resident prepare itself remained about `0.908 s`. However, retaining roughly 1.78 GiB of host FP16 beside roughly 1.78 GiB of resident BOs caused severe memory pressure on the 7.7 GiB board; during the run only about 238 MiB was free and swap usage was about 922 MiB.
+
+The mmap version removed that host residency and its mmap/open setup was only `3.380 ms`, but this did **not** remove storage traffic. The workers faulted/read the FP16 pages while packing: `prepare_call=66.208 s`, `worker_critical=66.186 s`, `tile_pack_critical=65.680 s`. `/proc/<pid>/io` near completion showed roughly 1.46 GiB of physical reads. Thus mmap merely moved the raw-FP16 read cost into the resident packing phase.
+
+Mechanistically, the existing runtime conversion is better matched to this system: it reads the compact ~668 MB quantized GGUF and spends about 3 seconds dequantizing it while expanding toward resident form. Persisting the expanded FP16 representation nearly triples storage bytes and trades a few seconds of CPU conversion for tens of seconds of storage/page-fault traffic. The 1.9 GiB disk footprint is also a material regression.
+
+**H1-C is therefore rejected.** Do not retry raw row-major FP16 persistence unless the storage/memory mechanism changes materially (for example a genuinely device-ready compact representation with evidence that total bytes read are lower). The failed production prototype should not be promoted or retained in main.
+
+The next useful experiment is **H1-B**, specifically parallelizing the stable ~3 second Q4/Q6 dequant phase while leaving the already-parallel resident worker packing unchanged.
