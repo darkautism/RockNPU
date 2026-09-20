@@ -116,11 +116,13 @@ With all other eligible projections still using M16 W8, the 2-way Q/O path resto
 
 On o8, before grouped persistent scratch, pp16 r=3 averaged `72.132268 tok/s` (`71.7717, 72.0200, 72.6051`), already slightly above the same-board CPU baseline. After reusing persistent M16 scratch across the two Q/O groups, pp16 r=5 averaged `75.989331 tok/s` (`75.1190, 74.9143, 74.9151, 77.7588, 77.2395`), approximately `+6.5%` over the o8 CPU mean `71.344361 tok/s` while retaining both deterministic 16-token quality gates.
 
+Independent o16 validation used exact follow-up commit `38ae896a792efdd311f377e9b45aaaf3af538d86`. The previously divergent France/Germany prompt again matched the CPU continuation exactly with 2-way Q/O grouping. Same-board pp16 r=5 averaged `84.051609 tok/s` (`84.5751, 84.4015, 83.2001, 83.1550, 84.9263`) versus the established o16 CPU mean `73.917624 tok/s`, approximately `+13.7%` throughput. The quality-restoring mechanism and performance gain therefore reproduce independently on both RK3588 boards.
+
 ## Verdict
 
 **KEEP EXPERIMENTAL, but the quality/performance blocker now has a viable mechanism.**
 
-The original ungrouped M16 path remains unsuitable for promotion because model-level divergence is real. The 2-way Q/O groupwise path restores both current deterministic M16 quality gates while remaining faster than CPU on o8. It still needs independent o16 reproduction and broader numerical/quality coverage before promotion.
+The original ungrouped M16 path remains unsuitable for promotion because model-level divergence is real. The 2-way Q/O groupwise path now restores the known divergent deterministic gate on both o8 and o16, preserves the second o8 deterministic gate, and remains faster than CPU on both boards. Broader numerical/quality coverage is still required before promoting the model route as a default.
 
-The next gate is exact-commit o16 validation of the Q/O-grouped path, followed by speculative/batched target verification if cross-board quality and speed hold. Further M=1 micro-optimization is lower priority.
+The next high-value gate is broader M16 numerical/quality coverage, followed by speculative/batched target verification. Further M=1 micro-optimization is lower priority.
 
