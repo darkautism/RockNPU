@@ -760,6 +760,25 @@ impl Fp16MatmulPoolPreparedWeights {
     }
 }
 
+#[derive(Clone)]
+enum PoolPreparedWeightSource {
+    Slice(Arc<[f16]>),
+    Vec(Arc<Vec<f16>>),
+}
+
+impl PoolPreparedWeightSource {
+    fn as_slice(&self) -> &[f16] {
+        match self {
+            Self::Slice(values) => values,
+            Self::Vec(values) => values.as_slice(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+}
+
 enum PoolCommand {
     Run {
         request_id: u64,
@@ -783,7 +802,7 @@ enum PoolCommand {
         exact_m: Option<usize>,
         request_id: u64,
         weight_id: u64,
-        b: Arc<[f16]>,
+        b: PoolPreparedWeightSource,
         k: usize,
         n0: usize,
         nsub: usize,
@@ -960,6 +979,7 @@ impl Fp16MatmulPool {
                             } else if end > b.len() {
                                 Err(format!("worker {worker}: B slice out of range"))
                             } else {
+                                let b = b.as_slice();
                                 let packed = match exact_m {
                                     Some(m) => executor.prepack_weights(&b[begin..end], m, k, nsub),
                                     None => executor.prepack_weights_compatible_m(
@@ -1269,7 +1289,7 @@ impl Fp16MatmulPool {
         k: usize,
         n: usize,
     ) -> Result<Fp16MatmulPoolPreparedWeights, MatmulPoolError> {
-        self.prepare_weights_impl(b, None, k, n)
+        self.prepare_weights_impl(PoolPreparedWeightSource::Slice(b), None, k, n)
     }
 
     /// Prepare resident weights for the exact FP32 execution plan at M.
@@ -1285,12 +1305,30 @@ impl Fp16MatmulPool {
                 "FP32 prepared M must be a positive multiple of four",
             ));
         }
-        self.prepare_weights_impl(b, Some(m), k, n)
+        self.prepare_weights_impl(PoolPreparedWeightSource::Slice(b), Some(m), k, n)
+    }
+
+    /// Prepare resident exact-M FP32 weights from an existing Vec allocation.
+    /// `Arc::new(Vec)` moves only the Vec header, so workers share the original
+    /// f16 allocation without the bulk copy required by Arc<[f16]>.
+    pub fn prepare_weights_f32_vec(
+        &mut self,
+        b: Arc<Vec<f16>>,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Fp16MatmulPoolPreparedWeights, MatmulPoolError> {
+        if m == 0 || m % 4 != 0 {
+            return Err(MatmulPoolError::InvalidInput(
+                "FP32 prepared M must be a positive multiple of four",
+            ));
+        }
+        self.prepare_weights_impl(PoolPreparedWeightSource::Vec(b), Some(m), k, n)
     }
 
     fn prepare_weights_impl(
         &mut self,
-        b: Arc<[f16]>,
+        b: PoolPreparedWeightSource,
         exact_m: Option<usize>,
         k: usize,
         n: usize,
@@ -1311,7 +1349,7 @@ impl Fp16MatmulPool {
                     exact_m,
                     request_id,
                     weight_id,
-                    b: Arc::clone(&b),
+                    b: b.clone(),
                     k,
                     n0,
                     nsub,

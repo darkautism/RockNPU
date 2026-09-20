@@ -1479,7 +1479,7 @@ where
             return STATUS_INVALID_ARGUMENT;
         }
         let started = context.prefill_profile.as_ref().map(|_| Instant::now());
-        let weights: Arc<[f16]> = Arc::from(weights);
+        let weights = Arc::new(weights);
         if let (Some(profile), Some(started)) = (context.prefill_profile.as_mut(), started) {
             profile.host_to_arc_ns += started.elapsed().as_nanos();
         }
@@ -1488,7 +1488,7 @@ where
             .prefill_pool
             .as_mut()
             .unwrap()
-            .prepare_weights_f32(weights, m, key.k, key.n)
+            .prepare_weights_f32_vec(weights, m, key.k, key.n)
         {
             Ok(prepared) => prepared,
             Err(_) => return STATUS_EXECUTION_ERROR,
