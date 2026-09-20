@@ -2,7 +2,7 @@
 
 本輪使用兩台 RK3588：o16 探索程式修改及硬體正確性，o8 驗證原生 ARM CPU 與完整請求。LLM 與 NPU 測試都在 ARM 板子執行；Windows x86 僅編輯程式、整理證據。
 
-## 結果：完整請求穩定快於原生 CPU
+## 結果：steady-state 完整請求穩定快於原生 CPU
 
 正式測量兩輪 `CPU,NPU,NPU,CPU`，每個 process 三次請求；共八個 process、24 次請求，每端 12 個樣本，全部 exit 0。
 
@@ -24,7 +24,20 @@
 - CPU process 清除 `GGML_BACKEND_PATH` 與所有 `ROCKNPU_*`，指定 `-dev none -nopo 1` 並核對 CPU-only loader。載入 ACCEL plugin 時單獨 `-dev none` 不足以隔離 CPU。
 - 混合模式為 `ROCKNPU_PREFILL_CACHE=1 ROCKNPU_DECODE=0`：NPU 執行對齊的 prompt matmul，CPU 逐字生成。無 W8 sidecar、無額外 W8A8 量化。權重與啟動值在 prefill 轉為 FP16，NPU partial 為 FP32，K 累加使用 host f64。
 
-`-pg512,128` 的 tok/s 是 **640 個總 token ÷ 整段請求秒數**，包含 prompt 處理及生成；不是 decode tok/s。模型載入及 llama-bench warmup 不在計時內；實際 workload 中發生的 cache 準備仍算入計時。
+`-pg512,128` 的 tok/s 是 **640 個總 token ÷ 整段請求秒數**，包含 prompt 處理及生成；不是 decode tok/s。正式 ABBA 使用 llama-bench 預設 warmup；該 warmup 在同一 context 先執行完整 prompt，因此會建立 context-owned resident prefill cache。模型載入與 warmup 都不在正式計時內，所以 **12.164% 是 warmed / steady-state request 優勢，不包含首次 resident-cache 建立成本**。需要 cold first-request 數字時，使用 benchmark script 的 `--no-warmup`，讓第一次 timed repetition 承擔首次準備成本。
+
+### Cold first-request reviewer check
+
+為修正上述量測語意，o16 以更新後腳本執行一個小型 `CPU,NPU,NPU,CPU` block，每個 process 僅一個 `pp512+tg128` request，並指定 `--no-warmup`。這不是 24-request 正式穩定性測試，只用來確認首次 resident-cache 建立成本的方向：
+
+| cold request | tok/s |
+| --- | ---: |
+| CPU #1 | 54.738693 |
+| NPU prefill + CPU generation #1 | 41.510793 |
+| NPU prefill + CPU generation #2 | 41.100443 |
+| CPU #2 | 50.780161 |
+
+以平均 request time 計算，CPU 為 `12.147630 s`，hybrid 為 `15.494643 s`，hybrid/CPU speedup `0.783989×`；也就是這個 cold check 中 **首次 request 約慢 21.6%**。因此本輪不能宣稱 cold-start 勝過 CPU；目前證據支持的是 context 常駐後的 steady-state 加速。完整小型證據保存在 [`cold-abba-o16/`](cold-abba-o16/)；metadata 明確記錄 `warmup_policy=disabled`。
 
 ## 方向判斷與原始資料
 

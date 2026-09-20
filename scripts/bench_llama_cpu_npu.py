@@ -55,6 +55,8 @@ def main():
     parser.add_argument("--npu-threads", type=int, default=4)
     parser.add_argument("--frequency", type=int, default=700000000)
     parser.add_argument("--allow-generic-cpu", action="store_true")
+    parser.add_argument("--no-warmup", action="store_true",
+                        help="disable llama-bench warmup so first-use resident-cache setup is timed")
     args = parser.parse_args()
     if platform.machine() not in ("aarch64", "arm64"):
         parser.error("run on the RK3588, not an x86 host")
@@ -97,7 +99,16 @@ def main():
                           "capi": sha256(args.plugin.parent / "librocknpu_capi.so"),
                           "cpu_backend": sha256(args.bench.parent / "libggml-cpu.so")},
         "cpu_native": native, "initial_environment": initial,
-        "timing_scope": "llama-bench workload; model loading and warmup excluded",
+        "warmup_policy": (
+            "disabled; first timed repetition includes first-use backend/cache setup"
+            if args.no_warmup else
+            "llama-bench default warmup runs before timing; context-owned resident caches are therefore warm"
+        ),
+        "timing_scope": (
+            "llama-bench timed workload; model loading excluded; warmup disabled"
+            if args.no_warmup else
+            "llama-bench timed workload; model loading and default warmup excluded; resident caches are warm"
+        ),
     }
     (args.output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     for index, kind in enumerate(["cpu", "npu", "npu", "cpu"] * args.blocks, 1):
@@ -115,6 +126,8 @@ def main():
                    *workload, "-r", str(args.reps), "-t", str(threads), "-fa", "on",
                    "-dev", "none" if kind == "cpu" else "ROCKNPU0",
                    "-nopo", "1" if kind == "cpu" else "0", "-o", "json"]
+        if args.no_warmup:
+            command.append("--no-warmup")
         before = snapshot()
         if before.get("/sys/class/devfreq/fdab0000.npu/cur_freq") != str(args.frequency):
             raise RuntimeError("NPU frequency changed during the experiment")

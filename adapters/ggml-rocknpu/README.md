@@ -66,7 +66,11 @@ produce identical logits or tokens. `scripts/check_llama_prefill.py` records sho
 and long deterministic comparisons and actual dispatch traces.
 Use `scripts/bench_llama_cpu_npu.py --mode request --prefill-cache --npu-decode off`
 with explicit artifact paths to collect isolated CPU/NPU ABBA measurements, hashes,
-raw samples and environment snapshots. See [the measurement record](../../docs/benchmarks/2026-09-20/README.md).
+raw samples and environment snapshots. By default llama-bench performs a prompt warmup in the same
+context, so resident prefill weights are warm before timed repetitions; add `--no-warmup` when the
+first timed request must include resident-cache preparation. The recorded `pp512+tg128` cold check
+was slower than native CPU while the warmed ABBA was faster, so do not present the steady-state
+result as a cold-start claim. See [the measurement record](../../docs/benchmarks/2026-09-20/README.md).
 
 ### Direct-submit decode
 

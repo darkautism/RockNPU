@@ -45,5 +45,6 @@
     "/sys/class/thermal/thermal_zone6/temp": "46230",
     "/sys/class/thermal/thermal_zone4/temp": "47153"
   },
-  "timing_scope": "llama-bench workload; model loading and warmup excluded"
+  "warmup_policy": "llama-bench default warmup ran before timing; the same context therefore entered timed repetitions with resident prefill weights already prepared",
+  "timing_scope": "llama-bench timed workload; model loading and default warmup excluded; steady-state resident-cache measurement"
 }
