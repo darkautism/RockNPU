@@ -297,18 +297,107 @@ fn w4a4_group_size(k: usize) -> Option<usize> {
     (group != 0 && group.is_multiple_of(32) && k.is_multiple_of(group)).then_some(group)
 }
 
-fn quantize_symmetric(values: &[f32]) -> Option<(Vec<i8>, f32)> {
-    let mut max_abs = 0.0f32;
-    for &value in values {
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn max_abs_finite_neon(values: &[f32]) -> Option<f32> {
+    use std::arch::aarch64::*;
+
+    let mut i = 0usize;
+    let mut max_abs;
+    unsafe {
+        let finite_limit = vdupq_n_f32(f32::MAX);
+        let mut max_v = vdupq_n_f32(0.0);
+        let mut finite_v = vdupq_n_u32(u32::MAX);
+        while i + 4 <= values.len() {
+            let value = vld1q_f32(values.as_ptr().add(i));
+            let abs = vabsq_f32(value);
+            finite_v = vandq_u32(finite_v, vcleq_f32(abs, finite_limit));
+            max_v = vmaxq_f32(max_v, abs);
+            i += 4;
+        }
+        if vminvq_u32(finite_v) != u32::MAX {
+            return None;
+        }
+        max_abs = vmaxvq_f32(max_v);
+    }
+    while i < values.len() {
+        let value = values[i];
         if !value.is_finite() {
             return None;
         }
         max_abs = max_abs.max(value.abs());
+        i += 1;
     }
+    Some(max_abs)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn quantize_symmetric_neon_second_pass(values: &[f32], scale: f32) -> Vec<i8> {
+    use std::arch::aarch64::*;
+
+    let mut out = vec![0i8; values.len()];
+    let mut i = 0usize;
+    unsafe {
+        let scale_v = vdupq_n_f32(scale);
+        let min_v = vdupq_n_f32(-127.0);
+        let max_v = vdupq_n_f32(127.0);
+        while i + 8 <= values.len() {
+            let a = vld1q_f32(values.as_ptr().add(i));
+            let b = vld1q_f32(values.as_ptr().add(i + 4));
+            let a = vmaxq_f32(min_v, vminq_f32(max_v, vrndaq_f32(vdivq_f32(a, scale_v))));
+            let b = vmaxq_f32(min_v, vminq_f32(max_v, vrndaq_f32(vdivq_f32(b, scale_v))));
+            let a32 = vcvtq_s32_f32(a);
+            let b32 = vcvtq_s32_f32(b);
+            let packed16 = vcombine_s16(vqmovn_s32(a32), vqmovn_s32(b32));
+            let packed8 = vqmovn_s16(packed16);
+            vst1_s8(out.as_mut_ptr().add(i), packed8);
+            i += 8;
+        }
+    }
+    while i < values.len() {
+        out[i] = (values[i] / scale).round().clamp(-127.0, 127.0) as i8;
+        i += 1;
+    }
+    out
+}
+
+fn quantize_symmetric(values: &[f32]) -> Option<(Vec<i8>, f32)> {
+    #[cfg(target_arch = "aarch64")]
+    let max_abs = if env_enabled("ROCKNPU_HOST_NEON") {
+        // SAFETY: RK3588 is AArch64/ASIMD; the helper handles arbitrary tails.
+        unsafe { max_abs_finite_neon(values)? }
+    } else {
+        let mut max_abs = 0.0f32;
+        for &value in values {
+            if !value.is_finite() {
+                return None;
+            }
+            max_abs = max_abs.max(value.abs());
+        }
+        max_abs
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let max_abs = {
+        let mut max_abs = 0.0f32;
+        for &value in values {
+            if !value.is_finite() {
+                return None;
+            }
+            max_abs = max_abs.max(value.abs());
+        }
+        max_abs
+    };
     if max_abs == 0.0 {
         return Some((vec![0; values.len()], 1.0));
     }
     let scale = max_abs / 127.0;
+    #[cfg(target_arch = "aarch64")]
+    if env_enabled("ROCKNPU_HOST_NEON") {
+        // SAFETY: RK3588 is AArch64/ASIMD; the helper handles arbitrary slice tails.
+        let quantized = unsafe { quantize_symmetric_neon_second_pass(values, scale) };
+        return Some((quantized, scale));
+    }
     let quantized = values
         .iter()
         .map(|&value| (value / scale).round().clamp(-127.0, 127.0) as i8)
@@ -1403,6 +1492,7 @@ where
         return STATUS_INVALID_ARGUMENT;
     }
 
+    let quant_started = context.mtile_profile.as_ref().map(|_| Instant::now());
     let mut grouped_activations = (0..groups)
         .map(|_| Vec::with_capacity(M * group_size))
         .collect::<Vec<_>>();
@@ -1415,6 +1505,9 @@ where
             grouped_activations[group_index].extend_from_slice(&q);
             activation_scales[group_index * M + row_index] = scale;
         }
+    }
+    if let (Some(profile), Some(started)) = (context.mtile_profile.as_mut(), quant_started) {
+        profile.quant_ns += started.elapsed().as_nanos();
     }
 
     let persistent = env_enabled("ROCKNPU_MTILE_PERSIST");
@@ -1480,15 +1573,31 @@ where
                 Err(_) => return STATUS_EXECUTION_ERROR,
             }
         };
+        if let Some(profile) = context.mtile_profile.as_mut() {
+            profile.calls += 1;
+            profile.ksplit_calls += usize::from(result.stats.k_slices > 1);
+            profile.alloc_ns += result.stats.alloc_ns;
+            profile.input_stage_ns += result.stats.input_stage_ns;
+            profile.regcmd_stage_ns += result.stats.regcmd_stage_ns;
+            profile.submit_ns += result.stats.submit_ns;
+            profile.wait_ns += result.stats.wait_ns;
+            profile.host_accum_ns += result.stats.host_accum_ns;
+            profile.execute_total_ns += result.stats.total_ns;
+        }
+        let rescale_started = context.mtile_profile.as_ref().map(|_| Instant::now());
         let weight_scales =
             &cached.scales[group_index * key.n..(group_index + 1) * key.n];
         for row in 0..M {
             let activation_scale = activation_scales[group_index * M + row];
+            let row_start = row * key.n;
             for col in 0..key.n {
-                output_mn_f32[row * key.n + col] += result.values[row * key.n + col] as f32
+                output_mn_f32[row_start + col] += result.values[row_start + col] as f32
                     * activation_scale
                     * weight_scales[col];
             }
+        }
+        if let (Some(profile), Some(started)) = (context.mtile_profile.as_mut(), rescale_started) {
+            profile.rescale_ns += started.elapsed().as_nanos();
         }
     }
     STATUS_OK
@@ -3007,6 +3116,46 @@ pub unsafe extern "C" fn rocknpu_matmul_q6_k_f32_f32(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_quantize_second_pass_matches_scalar_bits() {
+        let mut values = vec![
+            -12.75f32, -7.5, -3.5, -1.5, -0.5, -0.499_999_97, 0.0, 0.499_999_97,
+            0.5, 1.5, 3.5, 7.5, 12.75,
+        ];
+        let mut state = 0x1234_5678u32;
+        for _ in 0..2051 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let unit = (state >> 8) as f32 / ((1u32 << 24) - 1) as f32;
+            values.push((unit * 2.0 - 1.0) * 17.0);
+        }
+        let max_abs = values.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let scale = max_abs / 127.0;
+        let scalar = values
+            .iter()
+            .map(|&value| (value / scale).round().clamp(-127.0, 127.0) as i8)
+            .collect::<Vec<_>>();
+        // SAFETY: the test runs only on AArch64 and the helper supports arbitrary tails.
+        let neon = unsafe { quantize_symmetric_neon_second_pass(&values, scale) };
+        assert_eq!(neon, scalar);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_max_abs_matches_scalar_and_rejects_nonfinite() {
+        let mut values = (0..2051)
+            .map(|i| (((i * 7_919) % 65_521) as f32 - 32_760.0) * 0.001)
+            .collect::<Vec<_>>();
+        let scalar = values.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        // SAFETY: the test runs only on AArch64 and the helper handles arbitrary tails.
+        let neon = unsafe { max_abs_finite_neon(&values) }.expect("finite input");
+        assert_eq!(neon.to_bits(), scalar.to_bits());
+        values[1024] = f32::INFINITY;
+        assert!(unsafe { max_abs_finite_neon(&values) }.is_none());
+        values[1024] = f32::NAN;
+        assert!(unsafe { max_abs_finite_neon(&values) }.is_none());
+    }
 
     #[test]
     fn q4_k_block_size_matches_ggml_abi() {
