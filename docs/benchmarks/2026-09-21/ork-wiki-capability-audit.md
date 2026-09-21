@@ -111,28 +111,24 @@ The live stock Rocket UAPI/kernel headers expose no Rocket/RKNPU NONBLOCK submit
 - zero-copy-style reuse of owned Rocket buffers inside the process;
 - register-command probes and hardware smoke tests.
 
-## Capability gaps still to evaluate
+## Remaining architecture-level gaps and disposition
 
-The current ork-driver matrix exposes several mechanisms RockNPU does not yet have as complete production surfaces:
+The remaining ork-driver matrix differences are real, but most are no longer ambiguous "small missing features":
 
-- resident KV on the NPU;
-- general hardware PC-chain / M-fold chain;
-- NONBLOCK doorbell at the driver level; userspace begin/finish overlap already exists;
-- general batched GEMM surface;
-- fused nonlinear activation output stage;
-- standalone SDP activation path;
-- standalone NPU elementwise add and multiply beyond the validated fused residual-add path;
-- per-channel multiply;
-- general zero-copy dma-buf import/adopt;
-- persistent serialized packed-weight format / streaming pool;
-- output zero-copy into caller-provided GGML storage.
+- **Resident KV on NPU:** current `rocknpu-llm` keeps K/V in host `Vec<f16>`, and its QK^T / softmax / AV consumer is also CPU-side. Adding only an NPU KV mirror would add a copy without removing CPU work. Treat resident KV as part of a future NPU-attention subsystem, not as a standalone optimization.
+- **Hardware PC-chain / M-fold:** RockNPU already has a PC trailer encoder, and historical prototypes were run. Production o16g exposes no `rocket_batch_submit` capability; stock Rocket per-task kicking does not satisfy the true chained-job contract. Earlier whole-model A/B found no material gain. Keep this blocked on an explicit driver capability rather than retrying self-linked chains on stock UAPI.
+- **NONBLOCK doorbell:** driver capability missing on the production kernel. Userspace begin/finish overlap already exists.
+- **Batched GEMM:** no dedicated production surface today, but current TinyLlama/llama.cpp execution has no direct hot BMM replacement. Attention is handled by CPU/llama.cpp flash-attention rather than a missing generic BMM call.
+- **Fused nonlinear activation / standalone SDP / EW mul / per-channel multiply:** hardware primitives have been explored. Fused SiLU is locally fast but conflicts with the current per-output-channel quantization semantics; standalone pure-SDP completion incurs the stock Rocket ~500 ms fence timeout; naive fused SwiGLU and RMSNorm-boundary experiments were rejected. Revisit only with a new quality-equivalent scaling domain or a safe chained completion contract.
+- **Zero-copy dma-buf import/adopt:** stock DRM/RKNPU can import foreign dma-bufs, but the active Rocket accel UAPI exposes no corresponding import ioctl. Existing staging measurements are sub-ms versus the tens-of-ms NPU wait path, so a kernel/UAPI change is not justified by the present bottleneck.
+- **Persistent serialized native-packed weights:** useful only for cold start. Steady-state already uses resident prepared weights; prior large FP16 sidecar/mmap approaches were dominated by storage traffic or memory pressure. The provenance-bound W8 sidecar already removes much of the model-format conversion cost without changing the steady-state kernel.
+- **Output zero-copy into GGML storage:** still absent, but it targets a copy-sized cost rather than the dominant submit/wait cost. Do not redesign GGML buffer ownership until profiling shows this copy has become material.
 
-These are not all equally valuable for TinyLlama. The next audit order is:
-1. resident KV and attention data movement;
-2. elementwise/add/multiply and residual/RMSNorm boundary reduction;
-3. hardware chain / M-fold, especially gate+up / FFN glue;
-4. NONBLOCK/async only where it removes a real host wait;
-5. zero-copy import/output and persistent packed-weight load;
-6. batched GEMM where a real model graph exposes a matching workload.
+### Current priority after this audit
+
+1. Keep the validated wide full-K M=1, M128, fused residual, and WEIGHT_REUSE primitives.
+2. Do **not** route WEIGHT_REUSE through forced N64 colsplit for current TinyLlama shapes; measured N256/N2048 cases regress badly.
+3. Do not resurrect stock-kernel PC-chain, pure-SDP completion, fused-int8 SwiGLU, RMSNorm-boundary, or zero-copy-driver work without new contradictory evidence.
+4. The next genuinely new high-upside direction is an end-to-end NPU attention subsystem (resident KV + QK^T + softmax + AV) or a new quality-equivalent fused FFN scale domain, not another isolated transport flag.
 
 Kernel/module changes remain out of scope unless explicitly approved. GPL driver code must not be copied into this MIT repository.
