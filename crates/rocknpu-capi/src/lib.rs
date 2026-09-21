@@ -369,14 +369,14 @@ unsafe fn quantize_symmetric_neon_into(values: &[f32], scale: f32, out: &mut [i8
     debug_assert_eq!(values.len(), out.len());
     let mut i = 0usize;
     unsafe {
-        let scale_v = vdupq_n_f32(scale);
+        let inv_scale_v = vdupq_n_f32(1.0 / scale);
         let min_v = vdupq_n_f32(-127.0);
         let max_v = vdupq_n_f32(127.0);
         while i + 8 <= values.len() {
             let a = vld1q_f32(values.as_ptr().add(i));
             let b = vld1q_f32(values.as_ptr().add(i + 4));
-            let a = vmaxq_f32(min_v, vminq_f32(max_v, vrndaq_f32(vdivq_f32(a, scale_v))));
-            let b = vmaxq_f32(min_v, vminq_f32(max_v, vrndaq_f32(vdivq_f32(b, scale_v))));
+            let a = vmaxq_f32(min_v, vminq_f32(max_v, vrndaq_f32(vmulq_f32(a, inv_scale_v))));
+            let b = vmaxq_f32(min_v, vminq_f32(max_v, vrndaq_f32(vmulq_f32(b, inv_scale_v))));
             let a32 = vcvtq_s32_f32(a);
             let b32 = vcvtq_s32_f32(b);
             let packed16 = vcombine_s16(vqmovn_s32(a32), vqmovn_s32(b32));
