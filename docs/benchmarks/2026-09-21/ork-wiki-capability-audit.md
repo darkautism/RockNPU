@@ -84,7 +84,14 @@ For the immediately useful M256 case (2 x M128, K2048/N64), controlled ABBA medi
 - baseline 771.2 / 753.7 us;
 - WEIGHT_REUSE 694.4 / 701.7 us.
 
-That is about 8.4% lower latency, or roughly 9.2% higher throughput, while remaining bit-exact. The next production step is to lower M>128 verifier batches into same-job M128 tasks and enable WEIGHT_REUSE after the first task.
+That is about 8.4% lower latency, or roughly 9.2% higher throughput, while remaining bit-exact.
+
+A production follow-up tested whether TinyLlama's real wider projections could profit by first column-splitting them into reuse-safe N64 segments. They do not:
+
+- M256/K2048/N2048: two ordinary full-N M128 tasks = 6.491 ms median; N64 colsplit + WEIGHT_REUSE = 16.248 ms median (about 2.5x slower).
+- M256/K2048/N256: two ordinary full-N M128 tasks = 1.313 ms median; N64 colsplit + WEIGHT_REUSE = 2.265 ms median (about 1.73x slower).
+
+The extra task/scheduler cost overwhelms the saved weight DMA on these RockNPU int8 shapes. Therefore WEIGHT_REUSE remains a validated primitive for naturally segmented narrow-N workloads, but it is **not** routed into current TinyLlama Q/K/V/O/FFN production paths. Revisit only if another mechanism already forces compatible column segmentation, or if batched/PC-chain dispatch reduces per-task overhead enough to change this cost model.
 
 ### NONBLOCK doorbell status
 
