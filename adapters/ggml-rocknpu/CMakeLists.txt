@@ -8,6 +8,7 @@ if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
 endif()
 
 set(GGML_SOURCE_DIR "" CACHE PATH "Path to a llama.cpp ggml directory")
+set(GGML_CPU_LIBRARY "" CACHE FILEPATH "Optional path to llama.cpp libggml-cpu.so for runtime CPU fallback experiments")
 if(NOT GGML_SOURCE_DIR)
     message(FATAL_ERROR "Set GGML_SOURCE_DIR to <llama.cpp>/ggml")
 endif()
@@ -35,6 +36,9 @@ target_include_directories(ggml-rocknpu PRIVATE
 )
 target_link_directories(ggml-rocknpu PRIVATE "${ROCKNPU_CAPI_TARGET_DIR}/release")
 target_link_libraries(ggml-rocknpu PRIVATE rocknpu_capi)
+if(GGML_CPU_LIBRARY)
+    target_link_libraries(ggml-rocknpu PRIVATE "${GGML_CPU_LIBRARY}")
+endif()
 set_target_properties(ggml-rocknpu PROPERTIES
     OUTPUT_NAME "ggml-rocknpu"
     BUILD_RPATH "$ORIGIN"
