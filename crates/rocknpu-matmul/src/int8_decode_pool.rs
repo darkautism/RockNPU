@@ -118,6 +118,7 @@ enum WorkerCommand {
         weights: Arc<[i8]>,
         full_k: usize,
         slice: WorkerSlice,
+        m1_fullk: bool,
     },
     RunPrepared {
         request_id: u64,
@@ -214,11 +215,18 @@ impl Int8DecodePool {
                             weights,
                             full_k,
                             slice,
+                            m1_fullk,
                         } => {
                             let prepared = if resident.contains_key(&weight_id) {
                                 Err(format!("worker {worker}: duplicate resident weight id"))
                             } else {
-                                prepare_worker_weights(&executor, &weights, full_k, slice)
+                                prepare_worker_weights(
+                                    &executor,
+                                    &weights,
+                                    full_k,
+                                    slice,
+                                    m1_fullk,
+                                )
                                     .map(|prepared| {
                                         let stats = prepared.stats();
                                         resident.insert(weight_id, prepared);
@@ -285,7 +293,7 @@ impl Int8DecodePool {
                         } => {
                             let output = match resident.get(&weight_id) {
                                 Some(prepared)
-                                    if matches!(m, 16 | 32 | 48 | 64)
+                                    if matches!(m, 16 | 32 | 48 | 64 | 128)
                                         && prepared.k() == slice.ksub
                                         && prepared.n() == slice.nsub
                                         && m != 0
@@ -463,6 +471,29 @@ impl Int8DecodePool {
         workers: usize,
         split: Int8DecodeSplit,
     ) -> Result<Int8DecodePoolPreparedWeights, Int8DecodePoolError> {
+        self.prepare_weights_with_split_mode(weights, k, n, workers, split, false)
+    }
+
+    pub fn prepare_weights_m1_with_split(
+        &mut self,
+        weights: Arc<[i8]>,
+        k: usize,
+        n: usize,
+        workers: usize,
+        split: Int8DecodeSplit,
+    ) -> Result<Int8DecodePoolPreparedWeights, Int8DecodePoolError> {
+        self.prepare_weights_with_split_mode(weights, k, n, workers, split, true)
+    }
+
+    fn prepare_weights_with_split_mode(
+        &mut self,
+        weights: Arc<[i8]>,
+        k: usize,
+        n: usize,
+        workers: usize,
+        split: Int8DecodeSplit,
+        m1_fullk: bool,
+    ) -> Result<Int8DecodePoolPreparedWeights, Int8DecodePoolError> {
         if weights.len() != n.saturating_mul(k) {
             return Err(Int8DecodePoolError::InvalidInput(
                 "weights must contain exactly N*K elements",
@@ -483,7 +514,7 @@ impl Int8DecodePool {
                     &direct_workers[worker].device,
                 );
                 let prepared =
-                    prepare_worker_weights(&executor, &weights, k, slice).map_err(|err| {
+                    prepare_worker_weights(&executor, &weights, k, slice, m1_fullk).map_err(|err| {
                         Int8DecodePoolError::Worker(format!("direct worker {worker}: {err}"))
                     })?;
                 let worker_stats = prepared.stats();
@@ -520,6 +551,7 @@ impl Int8DecodePool {
                     weights: Arc::clone(&weights),
                     full_k: k,
                     slice,
+                    m1_fullk,
                 })
                 .map_err(|_| Int8DecodePoolError::ChannelClosed)?;
         }
@@ -573,9 +605,9 @@ impl Int8DecodePool {
         activation: Arc<[i8]>,
         weights: &Int8DecodePoolPreparedWeights,
     ) -> Result<Int8DecodePoolOutput, Int8DecodePoolError> {
-        if !matches!(m, 16 | 32 | 48 | 64) {
+        if !matches!(m, 16 | 32 | 48 | 64 | 128) {
             return Err(Int8DecodePoolError::InvalidInput(
-                "M-tile pool path requires M in {16,32,48,64}",
+                "M-tile pool path requires M in {16,32,48,64,128}",
             ));
         }
         if activation.len() != m.saturating_mul(weights.k) {
@@ -1037,6 +1069,7 @@ fn prepare_worker_weights(
     weights: &[i8],
     full_k: usize,
     slice: WorkerSlice,
+    m1_fullk: bool,
 ) -> Result<Int8PreparedWeights, crate::Int8DecodeError> {
     if slice.k0 == 0 && slice.ksub == full_k {
         let begin = slice.n0.saturating_mul(full_k);
@@ -1046,7 +1079,11 @@ fn prepare_worker_weights(
                 "weight slice out of range",
             ));
         }
-        return executor.prepare_weights(&weights[begin..end], slice.ksub, slice.nsub);
+        return if m1_fullk {
+            executor.prepare_weights_m1_fullk(&weights[begin..end], slice.ksub, slice.nsub)
+        } else {
+            executor.prepare_weights(&weights[begin..end], slice.ksub, slice.nsub)
+        };
     }
 
     let mut sliced = Vec::with_capacity(slice.nsub.saturating_mul(slice.ksub));

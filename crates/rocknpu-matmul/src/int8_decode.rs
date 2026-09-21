@@ -13,6 +13,7 @@ const WAIT_NS: i64 = 2_000_000_000;
 const REGCMD_BYTES: usize = 4096;
 const WIDE_K_SLICE: usize = 1024;
 const SINGLE_SUBMIT_K_MAX: usize = 4096;
+const M1_FULLK_K_MAX: usize = 10_752;
 const N_MAX: usize = 8192;
 
 #[derive(Debug)]
@@ -187,9 +188,9 @@ impl<'a> Int8DecodeExecutor<'a> {
         weights: &Int8PreparedWeights,
         scratch_slot: &mut Option<Int8MtileScratch>,
     ) -> Result<Int8DecodeOutput, Int8DecodeError> {
-        if !matches!(m, 16 | 32 | 48 | 64) {
+        if !matches!(m, 16 | 32 | 48 | 64 | 128) {
             return Err(Int8DecodeError::InvalidInput(
-                "persistent M-tile path requires M in {16,32,48,64}",
+                "persistent M-tile path requires M in {16,32,48,64,128}",
             ));
         }
         let total_start = Instant::now();
@@ -712,6 +713,61 @@ impl<'a> Int8DecodeExecutor<'a> {
             offsets,
             stats: Int8PreparedWeightStats {
                 k_slices: slices,
+                resident_bytes: weight_bytes,
+                pack_ns,
+            },
+        })
+    }
+
+    /// Prepare the M=1 full-K resident layout without changing the M-tile/K-split
+    /// preparation contract. This is intentionally separate because M16/M32/M48/M64
+    /// still use the validated K<=4096 full-K envelope and K-split above it.
+    pub fn prepare_weights_m1_fullk(
+        &self,
+        b_nk: &[i8],
+        k: usize,
+        n: usize,
+    ) -> Result<Int8PreparedWeights, Int8DecodeError> {
+        validate_weights(b_nk, k, n)?;
+        if k > M1_FULLK_K_MAX {
+            return Err(Int8DecodeError::InvalidInput(
+                "M=1 full-K preparation requires K<=10752",
+            ));
+        }
+
+        let weight_bytes = k.checked_mul(n).ok_or(Int8DecodeError::SizeOverflow)?;
+        let mut bo = self.device.alloc_owned_buffer(weight_bytes)?;
+        check_dma32_range(bo.dma_address(), bo.len())?;
+
+        let pack_start = Instant::now();
+        bo.prep_relative(0)?;
+        let b_bytes: &[u8] = bytemuck::cast_slice(b_nk);
+        {
+            let packed = bo.as_mut_slice();
+            let kt = k / 32;
+            for nt in 0..n / 32 {
+                for kb in 0..kt {
+                    for nl in 0..32 {
+                        let col = nt * 32 + nl;
+                        let src = col * k + kb * 32;
+                        let dst = nt * kt * 32 * 32 + kb * 32 * 32 + nl * 32;
+                        packed[dst..dst + 32].copy_from_slice(&b_bytes[src..src + 32]);
+                    }
+                }
+            }
+        }
+        bo.fini()?;
+        let pack_ns = pack_start.elapsed().as_nanos();
+
+        Ok(Int8PreparedWeights {
+            device_fd: self.device.fd(),
+            k,
+            n,
+            slices: 1,
+            bo,
+            offsets: vec![0],
+            stats: Int8PreparedWeightStats {
+                k_slices: 1,
                 resident_bytes: weight_bytes,
                 pack_ns,
             },

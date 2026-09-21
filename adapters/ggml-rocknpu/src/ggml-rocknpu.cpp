@@ -467,7 +467,7 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                 }
             }
             const bool native_batch = native_mtile && quantized && activations != nullptr &&
-                activations->ne[1] >= 32 && activations->ne[1] <= 64 && activations->ne[1] % 16 == 0;
+                activations->ne[1] >= 32 && activations->ne[1] <= 128 && activations->ne[1] % 16 == 0;
             const bool supported_batch = activations != nullptr &&
                 (activations->ne[1] == 16 || native_batch ||
                  (split_m32 && activations->ne[1] == 32) ||
@@ -793,7 +793,7 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                         m == 1 ? (w4a4_m1 ? "w4a4_m1" : "w8a8_m1") : "fp16_bridge");
                 }
                 int status;
-                const bool native_mtile = m >= 32 && m <= 64 && m % 16 == 0 &&
+                const bool native_mtile = m >= 32 && m <= 128 && m % 16 == 0 &&
                     rocknpu_env_enabled("ROCKNPU_NATIVE_MTILE") &&
                     (weights->type == GGML_TYPE_Q4_K || weights->type == GGML_TYPE_Q6_K);
                 const bool split_m32 = !native_mtile && m == 32 && rocknpu_env_enabled("ROCKNPU_M32_AS_2X16");

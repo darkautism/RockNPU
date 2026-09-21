@@ -113,18 +113,18 @@ pub fn encode_int8_mtile(
     m: usize,
     desc: Int8DecodeDesc,
 ) -> Result<[u64; INT8_REGCMD_COUNT], Int8EncodeError> {
-    if !matches!(m, 16 | 32 | 48 | 64) || desc.k == 0 || desc.n == 0 {
+    if !matches!(m, 16 | 32 | 48 | 64 | 128) || desc.k == 0 || desc.n == 0 {
         return Err(Int8EncodeError::InvalidShape {
             k: desc.k,
             n: desc.n,
-            reason: "research M-tile requires M in {16,32,48,64} and non-zero K/N",
+            reason: "research M-tile requires M in {16,32,48,64,128} and non-zero K/N",
         });
     }
-    if !desc.k.is_multiple_of(512) || desc.k > 4096 {
+    if !desc.k.is_multiple_of(512) || desc.k > 4096 || (m == 128 && desc.k > 2048) {
         return Err(Int8EncodeError::InvalidShape {
             k: desc.k,
             n: desc.n,
-            reason: "M-tile full-K gate requires K%512==0 and K<=4096",
+            reason: "M-tile full-K gate requires K%512==0, K<=4096, and M128 requires K<=2048",
         });
     }
     if !desc.n.is_multiple_of(32) || desc.n > RK3588_NMAX {
@@ -214,11 +214,11 @@ pub fn encode_int8_decode_m1(
             reason: "dimensions must be non-zero",
         });
     }
-    if !desc.k.is_multiple_of(256) || desc.k > 4096 {
+    if !desc.k.is_multiple_of(256) || desc.k > 10_752 {
         return Err(Int8EncodeError::InvalidShape {
             k: desc.k,
             n: desc.n,
-            reason: "M=1 full-K Rocket gate requires K%256==0 and K<=4096",
+            reason: "M=1 full-K Rocket gate requires K%256==0 and K<=10752",
         });
     }
     if !desc.n.is_multiple_of(32) || desc.n > RK3588_NMAX {
@@ -276,10 +276,16 @@ pub fn encode_int8_decode_m1(
         u32::try_from(16 * rows).map_err(|_| Int8EncodeError::SizeOverflow)?,
     );
 
-    let scale = desc.k / 512;
-    let base =
-        177i32 - 15i32 * (i32::try_from(scale).map_err(|_| Int8EncodeError::SizeOverflow)? - 1);
-    let v = base.max(0x1b) as u32;
+    let v = if desc.k > 4096 {
+        // RK3588 M=1 wide full-K schedule: one decode row, raw K <= 10752.
+        // Keep the already-validated <=4096 schedule unchanged.
+        0xb1
+    } else {
+        let scale = desc.k / 512;
+        let base =
+            177i32 - 15i32 * (i32::try_from(scale).map_err(|_| Int8EncodeError::SizeOverflow)? - 1);
+        base.max(0x1b) as u32
+    };
     patch_register(&mut ops, 0x1040, v);
 
     patch_register(&mut ops, 0x1070, input_dma);
@@ -363,8 +369,38 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unproven_fullk_shapes() {
-        for (k, n) in [(5632, 2048), (2048, 2047), (2048, 8224), (1500, 2048)] {
+    fn m1_k5632_n2048_uses_wide_fullk_schedule() {
+        let ops = encode_int8_decode_m1(Int8DecodeDesc::new(
+            5632,
+            2048,
+            0x1111_1000,
+            0x2222_2000,
+            0x3333_3000,
+        ))
+        .unwrap();
+        assert_eq!(ops.len(), INT8_REGCMD_COUNT);
+        assert_eq!(reg_value(&ops, 0x1010), 0x20);
+        assert_eq!(reg_value(&ops, 0x1040), 0xb1);
+    }
+
+    #[test]
+    fn mtile_m128_k2048_is_encodable() {
+        let ops = encode_int8_mtile(
+            128,
+            Int8DecodeDesc::new(2048, 2048, 0x1111_1000, 0x2222_2000, 0x3333_3000),
+        )
+        .unwrap();
+        assert_eq!(ops.len(), INT8_REGCMD_COUNT);
+        assert!(encode_int8_mtile(
+            128,
+            Int8DecodeDesc::new(2560, 2048, 0x1111_1000, 0x2222_2000, 0x3333_3000),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_fullk_shapes() {
+        for (k, n) in [(10784, 2048), (2048, 2047), (2048, 8224), (1500, 2048)] {
             assert!(encode_int8_decode_m1(Int8DecodeDesc::new(k, n, 1, 2, 3)).is_err());
         }
     }

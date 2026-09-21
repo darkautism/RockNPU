@@ -142,7 +142,11 @@ fn spawn_workers(
                     return;
                 }
             };
-            let weights = match executor.prepare_weights(&b[begin..end], k, nsub) {
+            let weights = match if k > 4096 {
+                executor.prepare_weights_m1_fullk(&b[begin..end], k, nsub)
+            } else {
+                executor.prepare_weights(&b[begin..end], k, nsub)
+            } {
                 Ok(weights) => weights,
                 Err(err) => {
                     let _ = init_tx.send(Err(format!("worker {worker}: prepare: {err}")));
@@ -239,7 +243,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let single_device = RocketDevice::open()?;
     let single_executor = Int8DecodeExecutor::new(&single_device)?;
-    let single_weights = single_executor.prepare_weights(&b, k, n)?;
+    let single_weights = if k > 4096 {
+        single_executor.prepare_weights_m1_fullk(&b, k, n)?
+    } else {
+        single_executor.prepare_weights(&b, k, n)?
+    };
 
     let (mut workers, result_rx, multicore_prepare) = spawn_workers(Arc::clone(&b), k, &slices)?;
 

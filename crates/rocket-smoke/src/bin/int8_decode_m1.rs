@@ -44,7 +44,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reference[col] = sum;
     }
 
-    let prepared = executor.prepare_weights(&b, k, n)?;
+    let prepared = if k > 4096 {
+        executor.prepare_weights_m1_fullk(&b, k, n)?
+    } else {
+        executor.prepare_weights(&b, k, n)?
+    };
     let prepare = prepared.stats();
 
     // Judge both the first use and a second reuse of the exact same resident

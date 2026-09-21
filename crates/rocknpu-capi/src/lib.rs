@@ -907,7 +907,7 @@ fn tune_decode_workers(
     let candidates = decode_worker_candidates(pool, k, n)?;
     let mut prepared = Vec::with_capacity(candidates.len());
     for &choice in &candidates {
-        match pool.prepare_weights_with_split(
+        match pool.prepare_weights_m1_with_split(
             Arc::clone(&weights),
             k,
             n,
@@ -1425,30 +1425,8 @@ where
             };
             let weights: Arc<[i8]> = Arc::from(weights_i8);
             let shape = (key.k, key.n);
-            // Persistent direct-submit changed the relative split cost: for the
-            // TinyLlama down projection, K3 is consistently slightly faster
-            // than N3 but the generic 5% tuner hysteresis rejects that small
-            // win. Scope this override to the scratch path that was measured.
-            let prefer_down_k3 =
-                env_enabled("ROCKNPU_EXPERIMENT_DIRECT_SCRATCH") && key.k == 5632 && key.n == 2048;
-            let (choice, prepared) = if prefer_down_k3 {
-                let choice = DecodeChoice {
-                    split: Int8DecodeSplit::K,
-                    workers: decode_pool.workers().min(3),
-                };
-                let prepared = match decode_pool.prepare_weights_with_split(
-                    Arc::clone(&weights),
-                    key.k,
-                    key.n,
-                    choice.workers,
-                    choice.split,
-                ) {
-                    Ok(prepared) => prepared,
-                    Err(_) => return STATUS_EXECUTION_ERROR,
-                };
-                (choice, prepared)
-            } else if let Some(&choice) = decode_worker_cache.get(&shape) {
-                let prepared = match decode_pool.prepare_weights_with_split(
+            let (choice, prepared) = if let Some(&choice) = decode_worker_cache.get(&shape) {
+                let prepared = match decode_pool.prepare_weights_m1_with_split(
                     Arc::clone(&weights),
                     key.k,
                     key.n,
@@ -1523,7 +1501,7 @@ fn execute_cached_w8a8_mtile_pool<F>(
 where
     F: FnOnce() -> Option<(Vec<i8>, Vec<f32>)>,
 {
-    if !matches!(m, 16 | 32 | 48 | 64) {
+    if !matches!(m, 16 | 32 | 48 | 64 | 128) {
         return STATUS_INVALID_ARGUMENT;
     }
     let Some(expected_a) = m.checked_mul(key.k) else {
@@ -1687,7 +1665,7 @@ fn execute_cached_w8a8_mtile<F>(
 where
     F: FnOnce() -> Option<(Vec<i8>, Vec<f32>)>,
 {
-    if !matches!(m, 16 | 32 | 48 | 64) {
+    if !matches!(m, 16 | 32 | 48 | 64 | 128) {
         return STATUS_INVALID_ARGUMENT;
     }
     let Some(expected_a) = m.checked_mul(key.k) else {
@@ -2197,7 +2175,7 @@ where
             let weights: Arc<[i8]> = Arc::from(weights_i8);
             let shape = (key.first.k, total_n);
             let (choice, prepared) = if let Some(&choice) = decode_worker_cache.get(&shape) {
-                let prepared = match decode_pool.prepare_weights_with_split(
+                let prepared = match decode_pool.prepare_weights_m1_with_split(
                     Arc::clone(&weights),
                     key.first.k,
                     total_n,
@@ -2214,7 +2192,7 @@ where
                         split: Int8DecodeSplit::N,
                         workers: decode_pool.workers().min(3),
                     };
-                    let prepared = match decode_pool.prepare_weights_with_split(
+                    let prepared = match decode_pool.prepare_weights_m1_with_split(
                         Arc::clone(&weights),
                         key.first.k,
                         total_n,
@@ -2351,7 +2329,7 @@ where
             let weights: Arc<[i8]> = Arc::from(weights_i8);
             let shape = (key.first.k, total_n);
             let (choice, prepared) = if let Some(&choice) = decode_worker_cache.get(&shape) {
-                let prepared = match decode_pool.prepare_weights_with_split(
+                let prepared = match decode_pool.prepare_weights_m1_with_split(
                     Arc::clone(&weights),
                     key.first.k,
                     total_n,
@@ -3552,7 +3530,7 @@ pub unsafe extern "C" fn rocknpu_matmul_q4_k_f32_f32(
         });
     }
 
-    if matches!(m, 32 | 48 | 64)
+    if matches!(m, 32 | 48 | 64 | 128)
         && k == 5632
         && n == 2048
         && env_enabled("ROCKNPU_NATIVE_MTILE")
@@ -3579,7 +3557,7 @@ pub unsafe extern "C" fn rocknpu_matmul_q4_k_f32_f32(
         );
     }
 
-    if matches!(m, 32 | 48 | 64)
+    if matches!(m, 32 | 48 | 64 | 128)
         && env_enabled("ROCKNPU_NATIVE_MTILE")
         && env_enabled("ROCKNPU_MTILE_PERSIST")
         && k <= 4096
@@ -3780,7 +3758,7 @@ pub unsafe extern "C" fn rocknpu_matmul_q6_k_f32_f32(
         });
     }
 
-    if matches!(m, 32 | 48 | 64)
+    if matches!(m, 32 | 48 | 64 | 128)
         && k == 5632
         && n == 2048
         && env_enabled("ROCKNPU_NATIVE_MTILE")
@@ -3807,7 +3785,7 @@ pub unsafe extern "C" fn rocknpu_matmul_q6_k_f32_f32(
         );
     }
 
-    if matches!(m, 32 | 48 | 64)
+    if matches!(m, 32 | 48 | 64 | 128)
         && env_enabled("ROCKNPU_NATIVE_MTILE")
         && env_enabled("ROCKNPU_MTILE_PERSIST")
         && k <= 4096
