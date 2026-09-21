@@ -4,6 +4,34 @@ Open-source Rust userspace runtime/compiler/backend for Rockchip RK3588 NPUs.
 
 RockNPU fills the userspace gap between standard model/framework frontends and the RK3588 NPU. It owns graph lowering, tensor layouts, quantization, resident weights, register-command generation, userspace scheduling, and framework integration.
 
+## Quick start
+
+### llama.cpp
+
+```sh
+git clone --depth 1 -b b10969 https://github.com/ggml-org/llama.cpp.git llama.cpp
+cmake -S llama.cpp -B llama.cpp/build -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_NATIVE=ON -DLLAMA_CURL=OFF && cmake --build llama.cpp/build --target llama-cli -j
+cmake -S adapters/ggml-rocknpu -B target/ggml-rocknpu -DCMAKE_BUILD_TYPE=Release -DGGML_SOURCE_DIR="$PWD/llama.cpp/ggml" -DGGML_CPU_LIBRARY="$PWD/llama.cpp/build/bin/libggml-cpu.so" && cmake --build target/ggml-rocknpu -j
+export GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so"
+./llama.cpp/build/bin/llama-cli --list-devices && ./llama.cpp/build/bin/llama-cli -dev ROCKNPU0 -m /path/to/model.gguf
+```
+
+A usable RK3588 should list `ROCKNPU0: RockNPU RK3588`.
+
+### Ollama
+
+Build the RockNPU backend once with the llama.cpp steps above, then:
+
+```sh
+curl -fsSL https://ollama.com/install.sh | sh
+sudo systemctl stop ollama 2>/dev/null || true
+GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" LLAMA_ARG_DEVICE=ROCKNPU0 ollama serve
+# in another shell:
+ollama run tinyllama:1.1b-chat-v1-q4_K_M
+```
+
+Current Ollama 0.34.x pins llama.cpp `b10969` (commit `391fac16460f15233a7740550d858ac96df3419d`), the same llama.cpp revision used by the validated RockNPU GGML backend. No Ollama source patch is required. `LLAMA_ARG_DEVICE=ROCKNPU0` is the standard llama.cpp device selector inherited by Ollama's runner. The optional W8 sidecar described later improves repeat startup/decode preparation but is not part of the basic install. Real llama.cpp/Ollama CPU-vs-NPU checks are recorded in [the frontend benchmark](docs/benchmarks/2026-09-22/frontend-cpu-npu.md).
+
 > You may also like oRKLLM/ork-driver, an important open reverse-engineering reference for RK35xx regcmd, quantized matmul, decode layouts, and multi-core execution.
 
 ## Project scope
@@ -39,6 +67,7 @@ Validated areas include:
 - resident/prepacked static weights;
 - ONNX dense/CNN subsets;
 - stock llama.cpp dynamic backend integration;
+- stock Ollama dynamic backend integration with no Ollama source patch;
 - Candle eager/module adapter with a real prepared RockNpuLinear NPU path;
 - TinyLlama Q4_K_M prefill and decode;
 - W8A8 M=1 decode;

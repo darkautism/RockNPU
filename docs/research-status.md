@@ -37,6 +37,7 @@ Old NPU absolute throughput values collected in mixed experimental system config
 
 - ONNX imports into the shared RockNPU IR.
 - Stock llama.cpp can dynamically load libggml-rocknpu.so; no llama.cpp fork is required.
+- Stock Ollama 0.34.2 loads the same GGML backend with no Ollama source patch. `GGML_BACKEND_PATH` supplies the plugin and the standard llama.cpp `LLAMA_ARG_DEVICE=ROCKNPU0` selector routes execution to it.
 - Candle 0.11 has a separate thin adapter whose first real module is prepared RockNpuLinear; Candle types remain outside core crates, and the adapter executes through shared rocknpu-ops / rocknpu-tensor / rocket-runtime primitives.
 - The Candle Linear path is validated both against Candle CPU semantics and on the real RK3588 NPU.
 - Supported frontend slices are explicit. Unsupported work remains outside RockNPU rather than being silently emulated.

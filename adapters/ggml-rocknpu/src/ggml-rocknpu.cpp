@@ -262,9 +262,33 @@ const char * rocknpu_device_description(ggml_backend_dev_t) {
 }
 
 void rocknpu_device_memory(ggml_backend_dev_t, size_t * free, size_t * total) {
-    // RK3588 uses shared system memory; do not present it as dedicated VRAM.
-    *free = 0;
-    *total = 0;
+    // RK3588 NPU allocations live in shared system memory rather than dedicated
+    // VRAM. Report Linux MemAvailable/MemTotal so frontends that require a
+    // non-zero accelerator memory budget (for example Ollama) can schedule the
+    // device without pretending that this is discrete VRAM.
+    size_t available_kib = 0;
+    size_t total_kib = 0;
+    size_t free_kib = 0;
+
+    std::ifstream meminfo("/proc/meminfo");
+    std::string key;
+    size_t value = 0;
+    std::string unit;
+    while (meminfo >> key >> value >> unit) {
+        if (key == "MemTotal:") {
+            total_kib = value;
+        } else if (key == "MemAvailable:") {
+            available_kib = value;
+        } else if (key == "MemFree:") {
+            free_kib = value;
+        }
+    }
+
+    if (available_kib == 0) {
+        available_kib = free_kib;
+    }
+    *free = available_kib * 1024;
+    *total = total_kib * 1024;
 }
 
 enum ggml_backend_dev_type rocknpu_device_type(ggml_backend_dev_t) {
