@@ -75,11 +75,9 @@ Use `scripts/bench_llama_cpu_npu.py --mode request --prefill-cache --npu-decode 
 with explicit artifact paths to collect isolated CPU/NPU ABBA measurements, hashes,
 raw samples and environment snapshots. By default llama-bench performs a prompt warmup in the same
 context, so resident prefill weights are warm before timed repetitions; add `--no-warmup` when the
-first timed request must include resident-cache preparation. The original recorded `pp512+tg128` cold check predates the later H1 cold-start
-optimizations. Those optimizations materially narrow the cold gap but do not yet
-establish a cold CPU win; keep cold and steady-state claims separate. See
-[the measurement record](../../docs/benchmarks/2026-09-20/README.md) and the
-[H1 decomposition](../../docs/benchmarks/2026-09-20/h1-cold-phase-decomposition.md).
+first timed request must include resident-cache preparation. Keep cold preparation and steady-state claims separate. Current userspace conclusions and benchmark policy are maintained in
+[the research status](../../docs/research-status.md) and the
+[2026-09-22 userspace checkpoint](../../docs/benchmarks/2026-09-22/userspace-checkpoint.md).
 
 ### Direct-submit decode
 
@@ -254,7 +252,7 @@ ROCKNPU GGML TRACE summary q4_K_mul_mat=402 q6_K_mul_mat=60 f16_mul_mat=0 w8a8_m
 ROCKNPU GGML TRACE decode_cache hits=157 misses=154 entries=154 resident_mb=924.00 hit_ms=206.36 hit_avg_ms=1.314 miss_ms=11304.78 miss_avg_ms=73.408 tuned_shapes=4 worker_calls=[0,88,223] ksplit_calls=45
 ```
 
-The cache contains all 154 (`22 x 7`) transformer-block projection weights. The three final-layer FFN projections first appear as M=1 during output-pruned prefill; the first autoregressive step finishes populating the cache, and the next step reuses it. Each distinct `(K,N)` decode geometry tunes effective 1/2/3-worker N-splits using warmed, forward/reverse-interleaved median samples; shapes whose K would otherwise require multiple sequential tasks also tune 2/3-worker K-splits. The selector requires at least a 5% measured improvement before accepting the next candidate, then caches both split topology and worker count and releases losing resident candidates. Two identical final runs made the same choice distribution, `worker_calls=[0,88,223]` with `ksplit_calls=45`; cache-hit averages were `1.411 ms` and `1.314 ms`, both below the previous N-split-only `1.485 ms`. The output head has `N=32000` and remains on CPU because the current W8A8 path caps N at 8192. Batching, permutations, F16 M=1, and additional GGML ops remain unsupported. Real timing decomposition shows submit/wait dominates representative worker calls (>90%). RockNPU does not optimize or maintain kernel-space submit machinery, so the next performance work must reduce the number of submits from userspace: prefer larger validated batches, same-job grouped projections, and other userspace scheduling changes over kernel/driver modifications.
+The cache contains all 154 (`22 x 7`) transformer-block projection weights. The three final-layer FFN projections first appear as M=1 during output-pruned prefill; the first autoregressive step finishes populating the cache, and the next step reuses it. Each distinct `(K,N)` decode geometry tunes effective 1/2/3-worker N-splits using warmed, forward/reverse-interleaved median samples; shapes whose K would otherwise require multiple sequential tasks also tune 2/3-worker K-splits. The selector requires at least a 5% measured improvement before accepting the next candidate, then caches both split topology and worker count and releases losing resident candidates. Two identical final runs made the same choice distribution, `worker_calls=[0,88,223]` with `ksplit_calls=45`; cache-hit averages were `1.411 ms` and `1.314 ms`, both below the previous N-split-only `1.485 ms`. The output head has `N=32000` and remains on CPU because the current W8A8 path caps N at 8192. Batching, permutations, F16 M=1, and additional GGML ops remain unsupported. Real timing decomposition shows submit/wait dominates representative worker calls (>90%). The next performance work should reduce real projection/dataflow work from userspace: prefer larger validated batches, same-job grouped projections, and fewer model execution boundaries.
 
 ### Shared-activation projection pairs
 

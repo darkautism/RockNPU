@@ -1,2 +1,0 @@
-load_backend: loaded CPU backend from /build/llama.cpp-reference/build-native-review/bin/libggml-cpu.so
-load_backend: loaded ROCKNPU backend from /build/rocknpu-pr1-review/target/ggml-rocknpu/libggml-rocknpu.so

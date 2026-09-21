@@ -1,387 +1,126 @@
-# trialanderror.md
-
-Purpose: stop future agents from re-running already-decided RockNPU/RK3588 experiments. Prefer new HW evidence over argument.
-
-## 2026-09-22 — project-scope correction: kernel optimization is out of scope
-
-- RockNPU is a userspace runtime/reverse-engineering project. Do not create or maintain Rocket kernel optimizations as part of the project.
-- Historical IOMMU-domain cache, IRQ-affinity, scheduler/locality, custom workqueue, multi-entity, DVFS-driver, and voltage-probe experiments remain historical evidence only. Their performance figures are not project toplines and are not future optimization targets.
-- The local unpublished Rocket commit historically recorded as `3345d5f` was created during RockNPU research and must not be treated as a required or maintained dependency.
-- If a required capability exists only in an external kernel driver, use a publicly maintained/reachable driver as an external dependency or leave the capability unsupported. Do not solve it by growing a RockNPU kernel fork.
-- Any performance data collected after an NPU timeout in the same boot is invalid. Reboot before further measurement; do not attempt to recover benchmark credibility by additional runs in that boot.
-- Current userspace mechanisms must be validated against the packaged stock Rocket driver wherever the stock UAPI can execute them.
-
-## 2026-09-22 — shared-host research Rocket incident / transient userspace corruption
-
-- **Observed:** o8g entered a state where unrelated userspace programs failed nondeterministically with SIGSEGV. During diagnosis, `cargo --version`, a real `rustc` compile, and even `/usr/bin/tail` failed at different times; `/etc/profile` also emitted an integer-expression error because its ordinary `id -u` substitution was no longer reliable. This was not a persistent toolchain-file failure: after reboot, 20 repeated cargo/rustc/tail probes and a fresh `cargo check -p rocknpu-regcmd` all passed.
-- **Previous-boot driver state:** at 18:03:42 the packaged Rocket driver was removed and `/build/rk3588-npu-gpu-dvfs/npu/driver/rocket.ko` from public `sky-rk3588/rk3588-npu-gpu@ed52a89afa8e68fedf636c8e891bd8fc47e82d26` was loaded. At 18:05:34 `npu_volt_probe.ko uv=850000` raised the NPU rail from 800 mV to 850 mV. The voltage-probe module was not unloaded afterward, so its restore-on-unload path never ran during that boot.
-- **Hardware warning before the userspace failures:** the kernel logged three `NPU job timed out` events on core0 at 21:49:13, 21:49:32, and 21:49:43. NPU experiments continued later in the same boot instead of treating the first timeout/reset as a contaminated-bench stop condition.
-- **Most likely mechanism, still not a forensic proof:** the loaded `ed52a89` Rocket source predates two known upstream timeout/reset fixes posted on 2026-08-24. Its IRQ completion path still writes `OPERATION_ENABLE`/`INTERRUPT_CLEAR` before taking `job_lock`, and its reset path does not mask the block and `synchronize_irq()` before dropping the in-flight job. Upstream differential reset testing found silent post-timeout output corruption only on the arm without those fixes. The packaged `6.18.43-current-rockchip64` module on this board is dated 2026-08-07 and likewise has no `synchronize_irq` reference, so intentionally provoking timeouts is unsafe on either current module. This makes a timeout/reset race the leading explanation for the contaminated boot. The surviving logs still contain no coredump or ARM fault address for the later userspace SIGSEGVs, so a causal chain to the unrelated process crashes is not proven. A board-level power/memory transient is a secondary possibility, but it is less supported: 850 mV is the vendor top-OPP voltage used by the public DVFS project, and the surviving boot log contains no brownout, thermal, storage-I/O, or EDAC error.
-- **Decision / safety rule:** do not runtime-swap Rocket modules or change the NPU rail on a shared/service host. The supported reproducible research baseline remains the public `ed52a89` tree at 700 MHz with the existing 800 mV rail on a dedicated benchmark board. Any `NPU job timed out` is a hard stop: stop NPU work and reboot to the packaged driver before unrelated service use or further benchmark claims. Historical 1 GHz/850 mV work is characterization-only and must not be automated by normal benchmark scripts.
-- **Reproducibility correction:** historical o16 results mentioning `3345d5f472e30b66b6c0d9640518c5315c99add5` refer to a **RockNPU-created local GPL Rocket commit** that I produced while modifying the driver to test higher-throughput decode and IOMMU-domain caching. It was never pushed to a public repository. The hash therefore identifies only that vanished/local research history and is useless as a standalone checkout instruction. Publicly reproducible driver results must name a reachable repository/branch/commit, or explicitly state that the historical source was not published.
-
-## 2026-09-20 — benchmark preflight corrections
-
-- Both pre-existing direct-scratch plugin builds had actual `CXX_FLAGS = -fPIC`, despite `CMAKE_CXX_FLAGS_RELEASE` listing `-O3 -DNDEBUG`. The Release flags in the cache are only a template; an empty `CMAKE_BUILD_TYPE` does not select them. Fresh explicit Release builds fixed this, and the adapter now defaults an unspecified single-config build to Release. Do not retroactively relabel all historical runs: their exact build artifacts must be checked individually.
-- `-dev none` is not sufficient to isolate CPU if the RockNPU plugin is loaded. RockNPU registers as ACCEL, and the pinned llama.cpp context adds ACCEL backends independently of the model's GPU-device list. A mistakenly plugin-loaded CPU pilot measured 12.16 tok/s; the corrected no-plugin CPU run on the same board measured 19.88 tok/s. The pilot is excluded. Clear `GGML_BACKEND_PATH`, use `-dev none -nopo 1`, and require `backends=CPU` plus CPU-only loader stderr.
-- The exploration board had reverted to stock Rocket (no NPU devfreq/module parameters) and `ondemand` CPU governors after reboot. Its 6.24 tok/s NPU and 17.79 tok/s CPU pilots are not 700 MHz/performance data. Restored the then-current **RockNPU-created local GPL Rocket research build** (historical local tip `3345d5f`, never published), 700 MHz cap/target, unchanged 800 mV rail, CPU performance governors, IOMMU cache enabled, and the documented A55 IRQ layout. No boot image was changed.
-- The existing llama.cpp `build-dl` is Release but has `GGML_NATIVE=OFF`, without ARM dot-product flags. It is a useful historical control, not the strongest CPU baseline. Final comparisons must also use an independently built native Release reference and the same executable for CPU and NPU.
-- Persistent scratch verification now alternates A, -A and all-zero activations at every shape/worker/split case. Repeating a constant input alone cannot rule out stale scratch/output. All 13 configurations passed the independent int32 oracle on the restored exploration board (4 warmups + 21 measured calls each).
-- `scripts/bench_llama_cpu_npu.py` records fresh-process CPU/NPU/NPU/CPU blocks, refuses mismatched frequency/governor/sidecar provenance, checks CPU-backend isolation, and saves every run's command, environment, stdout, stderr, exit code and raw llama-bench samples. `--allow-generic-cpu` is explicitly diagnostic. Decode and prompt-plus-decode request modes have distinct labels; neither includes model loading/warmup.
-
-## 2026-09-20 — native CPU reference and resident prefill
-
-- Native Release llama.cpp at the same pinned source (`391fac16460f15233a7740550d858ac96df3419d`) changes the conclusion: o8 CPU `tg128/t4/r3` is **33.371925 tok/s**, versus direct W8 NPU **15.797234**. Native CPU `pp512+tg128` is **50.517048**, versus W8 NPU **20.836110**. The earlier ~20 tok/s generic CPU baseline is not an acceptable performance target. Raw commands, samples and loader logs are in `docs/benchmarks/2026-09-20/`.
-- Full eight-core CPU testing did not improve these workloads: `taskset 0-7 / t8` gives `pp512=62.640916` and `pp512+tg128=42.590829`, versus A76-only `t4` at `69.462267` and `50.517048`. Retain the faster native t4 reference; do not restrict CPU to generic instructions or intentionally use the slower thread count.
-- Source inspection found that the old Q4_K/Q6_K prefill bridge dequantizes all weights, recreates the executor, and repacks weight tiles on every call. A context-owned, three-worker exact-M FP32 prepared cache removes repeated static work. It preserves FP32 NPU partials and host-f64 K accumulation; it does not substitute the lower-precision FP16 accumulation path.
-- The opt-in prefill cache measured **25.399275 -> 68.711780 tok/s** on o16 `pp512/t4/r3` with the same generic llama.cpp binary. Reading FP32 output in native `[N/4][M][4]` order then measured **91.367919 tok/s** (samples `85.7818,94.1195,94.2024`). These are prompt-processing measurements, not a decode or full-request CPU-win claim.
-- The new hardware gate exposed an existing pool error-lifecycle bug: gathering returned on the first worker failure and left remaining responses queued, poisoning the next request. Both FP16 and FP32 gathers now drain submitted responses before returning a worker error. The smoke intentionally uses a released handle and then submits a valid new request, in addition to positive/negative/zero input checks. After the fix, all 12 prefill cases pass; small/deep dyadic cases match an independent CPU oracle, and resident output matches the ordinary FP32 pool bit-for-bit.
-- `ROCKNPU_PREFILL_CACHE=1` enables the candidate. One exact-M layout per immutable weight is retained; changing M releases the previous layout before replacement, so changing prompt lengths does not accumulate copies. `ROCKNPU_DECODE=0` lets CPU handle M=1 before GGML graph assignment. Scope a possible win to the measured full workload; never label prompt-only acceleration as faster token generation.
-- **CPU target achieved for the full request:** o8 native Release, same Q4_K_M GGUF, 700 MHz NPU, A76 t4, FA on, `pp512+tg128`, two `CPU,NPU,NPU,CPU` blocks with r3 per process. All 8 processes / 24 requests succeeded. CPU mean time `12.85418591925 s`; hybrid mean time `11.46015429875 s`; throughput speedup `1.1216416101x`, blocks `1.1090023208x` / `1.1339721409x`. Raw samples and environment/hash metadata are in `docs/benchmarks/2026-09-20/abba/`. This is NPU prefill plus CPU generation, not a W8 decode win. Keep the mode explicit/opt-in; other prompts/models and cold-start latency are not established by this result.
-- Quality regression: six deterministic completion runs succeeded. Cached and uncached NPU prefill gave identical stdout for both prompts; the long prompt used 151 NPU prefill calls and zero NPU decode calls. CPU and NPU produced the same first answer sentence but different subsequent model-generated text. Do not claim CPU-token equivalence; see the byte-exact stdout and hashes in `docs/benchmarks/2026-09-20/quality/`. Further proprietary-driver work is deferred to `docs/closed-driver-hypotheses.md` now that the scoped CPU target has evidence.
-
-## 0. Symbols
-
-- `HW`: real RK3588 + Linux Rocket (`/dev/accel/accel0`), not simulator/compile-only.
-- `GGML`: stock unmodified llama.cpp dynamic backend path.
-- `M/K/N`: RockNPU matmul convention: activation `[M,K]`, weight `[N,K]`, output `[M,N]`. GGML printed axes may differ.
-- `W8A8`: int8 weight + int8 activation decode path.
-- `PC`: hardware program/PC-chain; multiple regcmd tasks in one NPU job.
-- `hot`: prepared/resident weight path; excludes first-pack/prepare cost.
-- `C5`: repeated real-HW exact/correctness evidence or direct production trace.
-- `C4`: real-HW benchmark repeated enough for direction, but timing may jitter.
-- `C3`: single HW probe and/or strong source inspection; enough to guide, not immutable.
-- `C2`: plausible hypothesis; requires proof before production.
-- `X`: do not overturn without contradictory real-HW evidence on current Rocket path.
-- `R`: revisit only after a material architecture/kernel/backend change, not by repeating same test.
-- `T`: intentionally open; worth testing.
-
-## 1. Trial/error ledger
-
-| 內容描述 | 信心指數 | 後人應不應該推翻 |
-|---|---:|---|
-| Plain FP16 `M=1` conv-as-matmul is **incorrect** on RK3588. Relaxing `M%4==0` to allow `M==1` produced large mismatches; old rocket-userspace `M=1` reference also prints FAILED. | C5 | X |
-| `M=1 -> pad M=4` FP16 works numerically and beats RockNPU scalar CPU per projection, but is catastrophically worse than optimized llama.cpp CPU decode at whole-model scale. Do not productionize this padding trick. | C5 | X |
-| Current useful decode route is `W8A8 M=1`, not plain FP16 M=1. GGML TinyLlama decode traces show real `w8a8_m1` execution for Q/O/K/V/gate/up/down. | C5 | X |
-| Wide-K `K=5632` down projection must remain split/accumulated with current hardware programming. ork `Bf` storage supporting larger K does **not** imply ordinary full-K execution supports it; production execution gates still reject `K>4096`. | C5 | X |
-| Do not infer an execution capability from a packed-weight/storage envelope. `Bf<=10752` was a false lead for full-K decode. | C5 | X |
-| GGML backend is not a loader-only stub. `GGML_OP_MUL_MAT` already executes on RK3588; real TinyLlama prefill previously sent 131 Q4_K matmuls through RockNPU. | C5 | X |
-| Stock llama.cpp dynamic loading is sufficient. No llama.cpp fork/patch/upstream PR is required for the backend. `GGML_BACKEND_PATH + GGML_BACKEND_DL=ON` is the intended integration. | C5 | X |
-| Adding narrow `GGML_OP_GLU/SWIGLU` support causes stock llama.cpp to naturally group decode FFN into one RockNPU graph: `gate MM -> up MM -> SWIGLU -> down MM`, observed as `graph_compute nodes=4`. No scheduler fork required. | C5 | X |
-| Temporary C++ F32 SWIGLU implementation was **only a scheduler/correctness probe**, not the target production implementation. `-n2` remained `The capital of the United`; 23 M=1 SWIGLU calls hit RockNPU. | C5 | X |
-| V/K concat-N pair fusion is bit-exact. Stock local K=2048, N=256+256 measured `0.866 ms` separate vs `0.334 ms` fused 2-worker (`2.59x`; fused 3-worker `0.604 ms`). Same-process ABBA measured `1.052582x` on the exploration board and `1.029613x` on the stock board, with all three blocks positive on both. This path is promoted to main/default-on; `ROCKNPU_VK_PAIR=0` is retained only for A/B and regression isolation. | C5 correctness / C4 perf | X |
-| Gate/up concat-N pair is bit-exact and preserves the same W8A8 per-channel projection math. Stock local K=2048, N=5632+5632 measured `2.955 -> 2.843 ms` (~4%). Stock same-process ABBA measured `1.018275x`; all three blocks were positive. This path is promoted to main/default-on; `ROCKNPU_FFN_PAIR=0` is retained only for A/B and regression isolation. | C5 correctness / C4 perf | X |
-| V/K + gate/up stack positively rather than canceling: same-process ABBA `both` measured `1.037348x` on the exploration board and `1.045015x` on the stock board, with all three blocks positive on both. Stock deterministic `n=24` semantic output stayed exactly `Paris -> B.C. -> Beijing -> 3. A`. The pair bundle is the validated default production configuration. | C5 correctness / C4 perf | X |
-| Small whole-token deltas must not be judged by adjacent independent llama-bench processes. The board showed order-dependent swings from roughly `-11%` to `+7.8%` without thermal throttling. For <5% claims use one process/context/backend, warm both variants, ABBA interleave, >=12 reps, and inspect block direction as well as aggregate median. | C5 | X |
-| Same-input activation quantization reuse is real in the current W8 path, but after `both` pairing the remaining safe duplicate is mainly Q vs the V/K pair: one extra K=2048 F32->I8 quantization per transformer layer. A Release-equivalent host microbench measured ~`14.1–14.5 us` for K=2048 and ~`15.6 us` for K=5632; conservatively charging `15.8 us` gives <`0.2%` whole-token upper bound for 22 saved K=2048 quantizations/token at current TinyLlama latency. Do not add pointer/generation activation-cache complexity now; revisit only if decode latency falls enough for this host work to become material. | C4 | R |
-| On current persistent-scratch W8 decode, a temporary phase profile over `704` cache-hit calls (`8 tokens x 88 calls`) measured `354.742 ms` total W8 hit time = `44.34 ms/token`; activation quantize+Arc was only `6.677 ms` total (`0.835 ms/token`) and int32->F32 rescale `3.877 ms` total (`0.485 ms/token`). The remaining `43.02 ms/token` is NPU execute/dispatch/cache-sync territory. Host quantize/rescale micro-optimization is therefore at most a low-single-digit lever now. Profiler was reverted after measurement. | C4 | R |
-| For TinyLlama mixed RockNPU/CPU decode, forcing stock llama.cpp `-fa on` preserved the exact 24-token continuation and beat `auto` in both orderings: `15.84 -> 16.40 tok/s` and reversed `15.51 -> 17.24 tok/s` center values. This is a llama.cpp execution-mode win, not a new NPU kernel; model/shape generality is still unproven, so unsupported/slower models must retain classic-attention fallback. | C5 correctness / C4 perf | T |
-| Raising global CPU threads is not a stable win with flash attention. A `4/6/8` sweep gave `14.54 / 15.58 / 11.24 tok/s`, but the order-swapped confirmation measured `t6 15.03` vs `t4 16.89 tok/s`; `t8` is clearly worse. Keep the validated `t4` baseline unless a materially different CPU scheduler strategy is proven. | C4 | R |
-| A targeted CPU scheduler experiment using a 6-thread pool but forcing non-LM-head CPU splits to 4 threads (`output.weight` head kept at 6) was exact but slower: `15.72` vs ordinary `t4 17.22 tok/s`. Do not retry head-only 6-thread scheduling without a different mechanism. The llama.cpp probe was reverted. | C4 | R |
-| Current o16g kernel does not expose DDR/DMC under `/sys/class/devfreq`; only GPU and NPU are present. The available `rk3399-dmc-freq` and `rk3328-dmc` platform driver directories have no bound device. DDR-frequency A/B therefore requires kernel/DTS work and is not a userspace optimization path on this image. | C3 | R |
-| Two-op task chaining saves little because Rocket submit is already cheap: V/K ~1.10x, gate/up ~1.03x. Chaining merely to remove one submit is not a major lever. | C4 | R |
-| Rocket submit ioctl measured ~`0.006–0.008 ms`; BO/fence completion ~`1.397–1.416 ms`. Host submit overhead is not the main decode bottleneck. | C4 | R |
-| Copying ork's NONBLOCK/doorbell idea is low value on current Rocket path: RockNPU submit is already effectively enqueue-then-wait. Attack NPU work/dataflow, not ioctl microseconds. | C4 | R |
-| Pinning workers/process to RK3588 A76 big cores did **not** help current RockNPU path. Repeated A/B: little ~`1.82–1.88 ms`, big ~`2.03–2.14 ms`. Do not cargo-cult ork affinity policy. | C4 | R |
-| Auto-tuner may choose different topology between runs; raw single-run fused/unfused comparisons can be polluted by topology choice. Use interleaved repeated A/B and inspect selected topology. | C4 | X |
-| Decode hot-cache timing has meaningful board jitter. Do not claim small (<~few %) wins from one run. | C4 | X |
-| Prepared/resident decode weights are already part of the active path. A TinyLlama trace showed `decode_cache entries=154`, ~`924 MiB` resident after first fills. Do not return to dequant/repack-every-call design. | C5 | X |
-| Current first-token/cache-fill cost can dwarf hot decode; distinguish `miss/prepare` from `hit/hot` in every benchmark. | C5 | X |
-| ork-driver binary cannot be used directly as an apples-to-apples runtime on this Rocket kernel: its rknpu CREATE ioctl fails `EINVAL`. Use ork as hardware/regcmd knowledge, not as a drop-in userspace baseline here. | C5 | R |
-| ork source contains a validated W8A8 FFN hardware chain: `MM_I8 -> SILU_I8 -> MM_I8 -> EWMUL_I8 -> MM_I8`. This is the right reference architecture for eliminating FFN F32 round-trips. | C5 | X |
-| Critical hazard: ork reports **separate-submit `MM_I8 -> SILU_I8` hangs**, while the same transition is validated when kept inside one HW PC-chain. Never implement this as two independent submits just because both ops work separately. | C5 | X |
-| Same chain constraints matter: current ork generic sequence eligibility requires int8 matmul `K%512==0 && K<=4096`; therefore TinyLlama `down K=5632` cannot simply be pasted into that generic chain unchanged. | C5 | X |
-| A true Rocket PC-chain is a **joint userspace/kernel contract**. Stock Rocket executes a multi-task job as per-task kicks (`TASK_NUMBER=1`); self-linking those regcmds without batched-kernel support can corrupt/stall. Require `rocket_batch_submit!=0` or an explicitly versioned equivalent before setting `JOB_BATCHED`. | C5 | X |
-| The production stock RK3588 has `/dev/accel/accel0` but no `rocket_batch_submit` capability; the exploration board currently exposes experimental `rocket_batch_submit=Y` and `rocket_force_core0=N`. Production RockNPU must not depend on either custom parameter. True self-linked PC-chain remains outside the production contract. | C5 | X |
-| Stock Rocket ordinary multi-task sequencing is valid for homogeneous CNA work, but a standalone LUT-load SDP task followed by CNA/MM leaves the MM output untouched. Do not use the full LUT-load-task -> CNA transition. | C5 | X |
-| A stock-UAPI-only single task made from the LUT loader's register-write prefix plus W8A8 matmul fused-SiLU output stage is hardware-valid at K=512/N=64 and K=2048/N=5632, and adds effectively no local NPU latency. It is not production-quality-equivalent because the fused stage has one shared LUT/requant domain while current GGML W8A8 uses per-output-channel scales. | C5 correctness / C4 perf | R |
-| TinyLlama per-tensor W8 gate+up passed current deterministic token-identity gates, but this is not a general quality proof. Int8-quantized SiLU activation later diverged semantically (`China is...` vs `ancient Rome...`), so full int8 fused gate/SwiGLU must not become the production path. | C5 | X |
-| Higher-precision fused SiLU output (`PREC=1`/int16 and int32-bypass variants) produced partial/garbage output. Do not repeat fused-i16/fp16 register sweeps. | C5 | X |
-| Standalone SiLU_I16 math/layout is sound, but stock Rocket pure-SDP completion is unusable: submit writes correct output quickly while the fence waits ~503-516 ms for the 500 ms timeout because completion only recognizes DPU_0/DPU_1 IRQ. Config-prefix tricks do not fix this. | C5 | X |
-| A complete quantized FFN hardware dataflow (`up MM int8 -> gate MM+SiLU -> SDP MUL -> wide-K down`) is proven as a hardware primitive, but the quality-equivalent production bridge is unresolved. Preserve the proof as architecture knowledge; do not expose it as the default model path. | C5 HW / C3 production | T |
-| The exploration module was once found with `rocket_force_core0=Y`, which falsely serialized multicore results. Restoring it to `N` recovered K5632/N2048 3-way K-split `4.044 -> 1.632 ms` and K2048/N5632 3-way N-split `3.904 -> 1.545 ms` (~2.5x). Historical multicore measurements from that period must be treated as contaminated. | C5 | X |
-| Compact-int16 hidden FFN is hardware-bit-exact under a constructed integer oracle but diverges semantically on TinyLlama; do not productionize it. A lossless raw-int32 hidden route restores exact deterministic quality but Release whole-token A/B regressed `1.42 -> 1.31 tok/s` (~-7.7%), despite the locally correct three-worker N-split topology. | C5 correctness / C4 perf | X |
-| Native/quantized intermediate retention remains a potentially larger architectural lever than submit-count shaving, but any new route must preserve model quality and stock-kernel completion semantics. | C4 | T |
-| Q4_K->FP16 correctness bridge is valid but not a performance endpoint. Do not optimize around preserving that bridge if a native quantized/resident path becomes provable. | C5 correctness / C3 perf direction | T |
-| Q6_K exists in TinyLlama and is already seen in current traces; do not assume a Q4_K-only model when analyzing actual projection coverage. | C5 | X |
-| Native W4A4 M=1 hardware is real and exact at the integer primitive: K2048/N5632 three-way N-split measured ~`0.97 ms` vs ~`2.08 ms` single worker with zero saturation; real-model tuner chose three workers (`~2081/1251/859 us`). | C5 | X |
-| Native W4A4 is **not model-quality equivalent** yet. FFN full-K+Hadamard, FFN G=512+Hadamard, and Q/O-only W4 all diverged from the default W8 deterministic continuation on the 16-token gate despite zero saturation. Keep W4 explicit opt-in; do not make it default from short-gate success. | C5 | X |
-| Whole-model W4 has no proven speed win vs W8 even after correcting the historical GGML C++ O0 build. On unchanged W4 code rebuilt Release, three adjacent TinyLlama `tg8` A/B pairs gave W4/W8 ratios ~`0.983`, `0.937`, `1.016`; aggregate means ~`4.968` vs `5.078 tok/s` (W4 ~-2.2%). Do not advertise a decode speedup from the much faster local W4 primitive. | C4 | X |
-| W4 quantization quality, not Rocket execution/overflow, is now the blocking problem. Hadamard helps short-gate quality but does not preserve longer token identity. Future W4 work should target better quantization/calibration or quantized dataflow, not another blind worker-count/group-size sweep. | C5 | T |
-| `ROCKNPU_GGML_TRACE=1` is the required first diagnostic for claims about routing. Verify weight name, type, M/K/N, chosen path, cache hit/miss, graph node grouping before changing kernels. | C5 | X |
-| Do not judge a reference binary only by exit code. Old reference M=1 test printed FAILED/mismatches while returning 0. Inspect correctness text/data. | C5 | X |
+# RockNPU trial and error ledger
+
+Purpose: preserve userspace decisions so future work does not repeat closed experiments.
+
+Confidence:
+- C5: repeated real-hardware evidence or independent model validation.
+- C4: strong repeated evidence, but narrower scope.
+- C3: useful evidence with material remaining uncertainty.
+
+Disposition:
+- KEEP: validated production direction.
+- CLOSED: do not repeat without a materially new mechanism.
+- OPEN: worth further work.
+
+## Validated production directions
+
+| Decision | Confidence | Status |
+| --- | ---: | --- |
+| Use W8A8/native quantized M=1 for TinyLlama decode. Plain FP16 M=1 is not the production route. | C5 | KEEP |
+| Keep decode weights resident and reuse persistent scratch. Repacking/dequantizing every call is obsolete. | C5 | KEEP |
+| Tune worker count/split by shape instead of hard-coding a topology. | C5 | KEEP |
+| Keep V/K concat-N pairing default-on. It is bit-exact under the existing W8 semantics and has repeatable whole-token benefit. | C5 correctness / C4 perf | KEEP |
+| Keep gate/up concat-N pairing default-on. It is bit-exact under the existing W8 semantics and has repeatable whole-token benefit. | C5 correctness / C4 perf | KEEP |
+| Keep Q/V/K triple grouping. It executes as one larger projection and uses backend-local output stashing to bridge the GGML partition boundary. | C5 | KEEP |
+| Keep native M16/M32/M48/M64/M128 routes. Fresh M128 vs M64 A-B-B-A remains positive by about 10.4% at the two-run centers. | C5 correctness / C4 perf | KEEP |
+| Keep the full-K M=1 K=5632 FFN-down path and measured multi-worker N split. | C5 | KEEP |
+| Keep FP16 fused residual for compatible prefill projections. | C5 | KEEP |
+| Keep same-job INT8 weight reuse as a primitive, but only when the natural workload already satisfies its geometry. | C5 | KEEP |
+| Keep parallel Q4_K/Q6_K prefill preparation and child allocation reuse. | C4 | KEEP |
+| Keep architecture-specific host preparation such as the validated NEON path when it reduces measured userspace work. | C4 | KEEP |
+| Stock llama.cpp dynamic backend loading is sufficient; do not maintain a llama.cpp fork merely to load RockNPU. | C5 | KEEP |
+| Correctness gates must include an independent model/reference path when model semantics are involved. | C5 | KEEP |
+
+## Closed experiments
+
+| Experiment | Result | Confidence | Status |
+| --- | --- | ---: | --- |
+| Plain FP16 M=1 | Large mismatches; invalid production geometry. | C5 | CLOSED |
+| Pad FP16 M=1 to M=4 | Can be correct, but loses badly at whole-model scale. | C5 | CLOSED |
+| Generic CPU delegation inside RockNPU backend | Preserves work instead of removing it; slower. | C4 | CLOSED |
+| Same-input activation quantization cache | Real reuse opportunity, but too small to justify complexity at current latency. | C4 | CLOSED |
+| Forced N64 segmentation for weight reuse | M256/N2048 about 2.5x slower; M256/N256 about 1.73x slower. | C5 | CLOSED |
+| W8 output-head offload | Fails quality requirement. | C5 | CLOSED |
+| Padded high-precision M4 output head | Correct, but slower. | C4 | CLOSED |
+| W4A4 default decode | Primitive is fast, but generation quality diverges and whole-model speedup is not established. | C5 | CLOSED |
+| Compact-int16 FFN hidden state | Hardware exact under constructed integer oracle, but TinyLlama semantics diverge. | C5 | CLOSED |
+| Raw-int32 hidden FFN route | Restores deterministic quality but regresses whole-token throughput. | C4 | CLOSED |
+| Naive fused SwiGLU / fully quantized FFN | Current scale/activation semantics do not preserve model quality. | C5 | CLOSED |
+| Q-only RoPE routing | No useful whole-model result. | C4 | CLOSED |
+| RMSNorm boundary-collapse experiments | No reliable correctness plus throughput win. | C4 | CLOSED |
+| Giant raw-FP16 sidecar / persistence | Storage and memory footprint dominate. | C4 | CLOSED |
+| Q2/Q4_0 speculative drafts | No useful general speculative route. | C4 | CLOSED |
+| 11-layer alternating speculative draft | Fast standalone, essentially zero acceptance. | C5 | CLOSED |
+| 16/18-layer pruned speculative drafts | Very low acceptance. | C4 | CLOSED |
+| Tested n-gram proposers | Neutral or negative on representative prompts. | C4 | CLOSED |
+| CPU thread-count escalation for TinyLlama | More threads are not a stable win; four A76 threads remain the reference. | C4 | CLOSED |
+| Head-only extra CPU threads | Exact but slower. | C4 | CLOSED |
+
+## Important measurement lessons
+
+1. A local primitive win is not a model win.
+2. Small whole-token deltas require warm, interleaved A/B. Adjacent independent processes are too noisy.
+3. Auto-tuned worker topology can change between runs; record the chosen topology.
+4. Separate first-use preparation/cache fill from hot execution.
+5. Do not infer execution capability from a packed-weight storage envelope.
+6. A short deterministic prompt is not a complete quantization-quality proof.
+7. Exact integer primitive results do not prove model-level equivalence.
+8. Keep model hash, plugin hash, llama.cpp revision, environment variables, and CPU policy state with benchmark evidence.
+9. Old absolute NPU throughput collected under mixed system configurations is not an authoritative current baseline.
+10. Failed experiment code should be deleted after the conclusion is recorded.
+
+## Userspace history
+
+### GGML / llama.cpp integration
+
+The backend progressed from a narrow proof-of-concept to a real stock-llama.cpp dynamic plugin.
+
+Important milestones:
+
+- F16, Q4_K and Q6_K MUL_MAT routes validated against independent references.
+- resident W8 decode cache established;
+- persistent direct-submit scratch established;
+- V/K and gate/up same-input pairing promoted;
+- Q/V/K triple grouping promoted across the partition boundary;
+- native M-tile path expanded through M128.
+
+### TinyLlama correctness
+
+The real GGUF path has repeatedly matched independent llama.cpp / llama-gguf references on stable greedy sequences. Near-tie logit flips are treated as numerical-precision cases rather than hidden correctness failures.
+
+### M=1 decode evolution
+
+The initial FP16 route was rejected. W8A8 became the useful decode route, then gained:
+
+- resident weights;
+- persistent scratch;
+- multi-worker shape tuning;
+- full-K K=5632 support;
+- grouped projections;
+- native sidecar support.
+
+Ordinary M=1 decode remains the largest performance gap.
 
-## 2. 2026-09-15 same-process pair ABBA evidence
+### Prefill / verifier evolution
 
-All whole-token rows below used llama.cpp `391fac16460f15233a7740550d858ac96df3419d`, TinyLlama-1.1B-Chat-v1.0-Q4_K_M, `tg32`, `r=12`, one model/context/backend process, warm baseline+candidate, and `B,A,A,B` interleave. The GGML plugin build artifacts on both boards contain `-O3 -DNDEBUG -fPIC`. `B` is pair(s) disabled; `A` is the named candidate.
+Prefill and verifier work gained:
 
-The first board is exploration-only because its loaded module exposes experimental Rocket parameters (`rocket_batch_submit=Y`, `rocket_force_core0=N`). The second board lacks those parameters and is the stock production-kernel validator.
+- resident/prepacked weights;
+- parallel preparation;
+- native M16/M32/M48/M64/M128;
+- fused residual;
+- controlled M128 improvement over M64.
 
-- Experimental V/K: baseline samples `[6355285676, 6563720148, 6443800844, 6391513469, 6438364227, 6526746411]`; candidate `[6218370374, 6111478134, 6328047050, 6125652262, 6112986243, 6093505280]`; medians `6441082535 -> 6119319252 ns`; speedup `1.052582x`; block speedups `1.0478x, 1.0306x, 1.0621x`.
-- Stock FFN pair: baseline `[6938423457, 6590359038, 6639709940, 6620918158, 6726314187, 6667731585]`; candidate `[6396010572, 6452092152, 6656396191, 6521481652, 6547130946, 6739062416]`; medians `6653720762 -> 6534306299 ns`; speedup `1.018275x`; block speedups `1.0530x, 1.0063x, 1.0081x`.
-- Stock V/K pair: baseline `[6551763654, 6502699026, 6550185944, 6499084060, 6379214169, 6432363366]`; candidate `[6113958276, 6296337698, 6331495429, 6269001866, 6357148750, 6332921532]`; medians `6500891543 -> 6313916563 ns`; speedup `1.029613x`; block speedups `1.0519x, 1.0356x, 1.0096x`.
-- Experimental BOTH: baseline `[6343612563, 6252070036, 6202569324, 6263966119, 6191903499, 6258387101]`; candidate `[6128375958, 6026424712, 6053667633, 5887300198, 6027502704, 6032537273]`; medians `6255228568 -> 6030019988 ns`; speedup `1.037348x`; block speedups `1.0363x, 1.0440x, 1.0324x`.
-- Stock BOTH: baseline `[7107273605, 6670265913, 6863762311, 6912329792, 6766908576, 6666913087]`; candidate `[6408075269, 6700032956, 6654328583, 6443878125, 6599636630, 6430685882]`; medians `6815335443 -> 6521757377 ns`; speedup `1.045015x`; block speedups `1.0511x, 1.0518x, 1.0310x`.
+This area is no longer the first bottleneck unless profiling says otherwise.
 
-The pair implementations are promoted to main/default-on after stock-kernel validation. Their environment variables remain runtime-readable so `=0` can disable either path for regression isolation without rebuilding.
+### Quantization experiments
 
-## 3. 2026-09-15 experiment consolidation
+W4A4 demonstrated real hardware capability and strong local primitive speed, but model quality and whole-model throughput did not justify promotion. Future W4 work must begin with a better quantization/calibration contract rather than another worker-count sweep.
 
-Historical experiment branches and dirty worktrees were audited before cleanup. Durable conclusions are now recorded in this file; rejected implementation source and temporary smoke programs are intentionally not promoted. In particular: fused-i16 SiLU, pure-SDP completion workarounds, compact-int16 hidden FFN, raw-int32 FFN graph fusion, W4 quality/perf experiments, PC-chain/custom-kernel paths, and temporary ordinary-multitask/projection-pair smoke programs should not be resurrected from deleted branches without new contradictory hardware evidence.
+### Speculative decoding
 
-GGML adapter performance measurements must use a Release CMake build. The validated plugin build contains `-O3 -DNDEBUG -fPIC`; conclusions from the earlier accidental `-fPIC`-only/O0 adapter are superseded.
+Verifier capacity is not enough. General speculative decoding remains blocked by proposer quality/acceptance. The failed draft-model and n-gram experiments should not be repeated unchanged.
 
-Operationally, keep both RK3588 hosts on the same RockNPU `main` commit before cross-board validation, and keep the llama.cpp reference pinned to the same validated commit. The first board's experimental Rocket module may be used only for exploration; stock-kernel production claims come from the second board.
+## Open work
 
-## 4. Decision rule for future agents
-
-1. If an item is `X`, do not rerun the same idea with renamed code. Require contradictory current-HW evidence.
-2. If an item is `R`, only reopen after a material change (kernel/UAPI/regcmd model/quantization/dataflow), and state what changed.
-3. Spend effort on `T` items first.
-4. Every perf claim must preserve exact/acceptable correctness and be measured at the **whole decode/token** level, not only a local operator microbench.
-5. For risky SDP/int8 mode transitions, prefer known-safe PC-chain topology. A separately valid op does not imply a safe cross-submit transition.
-
-## 2026-09-15 — Q/V/K cross-partition concat-N fusion promoted
-
-### Why ordinary QKV look-ahead did not work
-
-- Real `ROCKNPU_GGML_TRACE` graph-index instrumentation showed each M=1 attention Q projection enters its own GGML backend partition at `i=0`; the V/K pair arrives in a later partition, also at `i=0`.
-- Therefore Q cannot be added to the existing same-graph V/K look-ahead without crossing the scheduler boundary. No llama.cpp or kernel patch was used.
-
-### Userspace route-around
-
-- The RockNPU backend records stable per-layer V/K quantized-weight identities.
-- After two matching observations, the earlier Q partition runs one W8A8 concat-N projection for Q+V+K: `K=2048`, `N=2048+256+256=2560`.
-- Q is written directly; V and K are held in backend-context F32 stashes and copied into the later V/K partition only when the activation pointer matches.
-- Q/V/K retain the same independent per-output-row W8 scales as the pre-existing standalone Q and V/K-pair paths, so the fused result is bit-exact with RockNPU's existing W8A8 semantics.
-- A changed Q weight identity resets registry stability/pending state before any triple execution, preventing stale V/K use if a backend context sees another model.
-- After the triple resident entry executes, the superseded standalone-Q and V/K-pair prepared entries are evicted. Real trace returned TinyLlama steady-state decode-cache residency from ~1034 MiB (triple plus fallback duplicates) to ~924 MiB, equal to the pre-triple steady-state footprint. Runtime disable remains `ROCKNPU_QKV_TRIPLE=0`; fallback caches are rebuilt lazily if needed later.
-
-### Correctness
-
-Both boards, with QKV triple explicitly enabled, preserved the deterministic TinyLlama-1.1B Q4_K_M continuation:
-
-`The capital of France is Paris.\n\n2. B.C. The capital of China is Beijing.\n\n3. A`
-
-The hardened cache-eviction/generation-gate commit was re-run on the stock board and produced the same continuation.
-
-### Same-process ABBA — exploration board
-
-Validated llama.cpp commit: `391fac16460f15233a7740550d858ac96df3419d`; Release plugin/bench (`-O3 -DNDEBUG -fPIC`); `tg32`; baseline = current default V/K + FFN pairs, candidate = baseline + QKV triple. Both variants were fully warmed in the same model/context/backend before timing. Sequence is B,A,A,B repeated for 12 reps.
-
-- B samples ns: `[5995542892, 6278359791, 6144072364, 6122769890, 6084081079, 6215497349]`
-- A samples ns: `[5645392509, 5850797657, 5711393533, 5797534070, 5715837339, 5724630710]`
-- baseline median: `6133421127 ns`
-- candidate median: `5720234024 ns`
-- speedup: `1.072233x` = **+7.22%**
-- ABBA block speedups: **+6.76%, +6.59%, +7.51%** (all positive)
-
-### Same-process ABBA — stock Rocket board
-
-Same llama.cpp/model/settings/build protocol on the stock production validator.
-
-- B samples ns: `[6231702497, 6169891766, 6326957804, 6179359401, 6151824772, 6145370878]`
-- A samples ns: `[5745058262, 5957489306, 5746364615, 5877242626, 5904415888, 5985109975]`
-- baseline median: `6174625584 ns`
-- candidate median: `5890829257 ns`
-- speedup: `1.048176x` = **+4.82%**
-- ABBA block speedups: **+5.97%, +7.59%, +3.43%** (all positive)
-
-The stock median is deliberately recorded as +4.82%, not rounded into a >5% claim. It nevertheless replicated the bit-exact incremental win on the production kernel with every ABBA block positive, while the independent exploration board measured +7.22%. This satisfies the project's policy of retaining/promoting repeatable bit-exact composable gains rather than discarding useful sub-5% production evidence.
-
-### Decision
-
-- **Promote Q/V/K cross-partition fusion to the default M=1 path.**
-- `ROCKNPU_QKV_TRIPLE=0` remains the rollback/A-B isolation switch.
-- Keep the two-observation stability gate; saving one extra warmup token is not worth weakening model-generation safety.
-- Do not claim kernel batching or GGML scheduler fusion: this is a pure userspace backend precompute/stash optimization over the stock Rocket UAPI.
-
-## 2026-09-16 — TinyLlama vocab/output-head offload dead ends
-
-### Wide-N W8A8 output head: hardware-valid, quality-invalid
-
-- TinyLlama `output.weight` is Q6_K with decode geometry `M=1,K=2048,N=32000`; main keeps it on CPU because the normal RockNPU W8A8 path caps a single decode projection at `N<=8192`.
-- A pure-userspace experiment split `N=32000` into stock-compatible W8A8 waves (`24576 + 7424` rows). Real trace confirmed `output.weight ... path=w8a8_m1_wide_n`; no kernel/module change was used.
-- The hardware route completed and added the expected ~62.5 MiB resident W8 head cache (`~924 -> ~986.5 MiB`).
-- The deterministic 24-token TinyLlama gate diverged immediately after `Paris.` into a different continuation. This is output-logit quantization error, not an N-tiling failure: Q6_K -> per-row W8 is not a production-quality-equivalent output-head replacement.
-- **Decision:** do not promote or retry W8 output-head offload without a materially different logits-preserving quantization scheme.
-
-### Resident FP16 output head via padded M=4: quality-valid, performance-invalid
-
-- The existing FP16 prepacked pool requires `M % 4 == 0`. An opt-in experiment therefore dequantized the static Q6_K head once into resident FP16, padded the real M=1 activation to M=4 with three zero rows, ran the existing three-core prepared FP16 pool, and returned only row 0 logits.
-- Real trace confirmed `output.weight type=q6_K M=1 K=2048 N=32000 path=fp16_m4_wide_n` and the deterministic 24-token continuation remained exactly equal to production: `Paris. -> 2. B.C. -> Beijing. -> 3. A`.
-- A first single-context env-toggle ABBA appeared positive (~+5%), but dedicated dispatch tracing proved it was **invalid**: llama.cpp scheduler graph reuse fixed the output-head backend after the first graph build, so changing `ROCKNPU_WIDE_N_FP16` between reps did not reroute the head. Do not reuse that benchmark method for backend-routing comparisons.
-- A valid same-process benchmark used one loaded model with two independent llama contexts: B was created/warmed with CPU output head, A with RockNPU FP16 output head. Dedicated dispatch trace showed B had zero FP16-head dispatches while A dispatched `N=32000` once per generated token. Both contexts were fully warmed before `tg32`, `r=12`, B,A,A,B timing.
-- B samples ns: `[7807287060, 7300489171, 7313049513, 7834310876, 7875517732, 9206511897]`.
-- A samples ns: `[8500388395, 8209864108, 8512710945, 7914259689, 8232033508, 8405309782]`.
-- Medians: `7820798968 -> 8318671645 ns`; time ratio / throughput speedup `0.940150x`, i.e. about **-6.0% throughput**. The first two four-sample blocks were clearly negative (~-9.6% and ~-7.8% throughput); the final block was noise-sensitive because the last B sample rose to 9.21s, but did not overturn the negative median.
-- **Decision:** padded-M4 FP16 output-head offload is correctness-safe on this gate but slower than the optimized CPU Q6_K head. Do not promote. Reopen only if a true high-precision `M=1` NPU path becomes available without 4x M padding.
-
-## 2026-09-16: decode projection profile, FFN geometry, and generic CPU-delegate dead end
-
-- A temporary opt-in aggregate profiler on the production `613cbdd` dataflow measured synchronous projection calls after skipping the first 22 layer calls per class. TinyLlama `tg32`, `r=3` on the first RK3588 gave steady-state averages of about `1.0578 ms/layer` QKV triple, `3.0178 ms/layer` FFN gate/up pair, `1.1270 ms/layer` attention output, and `1.9008 ms/layer` FFN down. At 22 layers this is roughly `23.27 + 66.39 + 24.79 + 41.82 = 156.3 ms/token` in the four dominant RockNPU projection classes. The same run was about `5.10 t/s` (~196 ms/token), so these projections account for roughly 80% of decode wall time. FFN alone is about 108 ms/token and is the largest target. This is profiling guidance, not a cross-board performance claim.
-- The existing FFN gate/up concat path is a strong local optimum at the userspace scheduling/pool level. A same-process/same-`Int8DecodePool` Release smoke with exact synthetic data, 7 warmups and 51 interleaved reps compared one `K=2048,N=11264` 3-worker N-split concat against two sequential `K=2048,N=5632` 3-worker N-split projections. Int32 outputs matched exactly. Median wall was `2.781 ms` concat versus `3.068 ms` separate, a `1.1032x` micro speedup; NPU tasks fell from 6 to 3. Concat wall (`2.781 ms`) was already close to the slowest worker (`2.696 ms`), leaving only ~0.085 ms of pool/host wrapper overhead.
-- Worker-count tuning is not an opportunity for the concat shape. A same-pool 51-rep exact-output comparison of `N=11264` N2 versus N3 measured medians `3.997 ms` versus `2.797 ms`; N3 is `1.4290x` faster. The production choice of concat + 3-worker N-split + one Rocket task per worker is therefore locally well justified. Do not revisit host allocation/channel/scheduler tweaks here without new evidence that reduces actual NPU work.
-- FFN-down `K=5632,N=2048` N3/K3 tuning is noisy across fresh processes: five observed fresh tuner outcomes split 3x K3 / 2x N3 because the candidates are close to the 5% selection threshold. A stronger same-pool exact-output smoke with 7 warmups + 51 interleaved reps measured N3 median `1.622 ms` and K3 median `1.569 ms` (`1.0336x` K3 advantage). This can be used later to reduce tuner variability, but its whole-token ceiling is roughly 1.4 ms/token (<1%), so it is not a current priority.
-- `GGML_SCHED_DEBUG=2` on the pinned llama.cpp decode graph showed 221 backend splits for a single TinyLlama decode graph: 111 CPU and 110 ROCKNPU, nearly alternating. Representative CPU op counts were RMS_NORM 45, MUL 45, ROPE 44, SET_ROWS 44, ADD 44, FLASH_ATTN 22, SWIGLU 22, plus small GET_ROWS/output-head work. This motivated testing whether scheduler partition boundaries themselves were a large avoidable cost.
-- A pure-userspace opt-in prototype made ROCKNPU claim CPU-supported ops and delegated non-NPU graph views to the pinned upstream GGML CPU backend while keeping native MUL_MAT on RockNPU. It preserved upstream CPU math and shared the same host buffer type, but it still had about 111 CPU delegate groups/token because the CPU/NPU dependencies are real. With no attached persistent CPU threadpool, GGML creates/frees a disposable threadpool for every delegated group; 8-thread delegation is structurally poor. A 1-thread triage avoided extra worker creation but still measured `4.36 ± 0.37 t/s` on `tg32,r=3`, while the immediately adjacent authoritative-main run under the same board conditions measured `5.27 ± 0.46 t/s`. This is a cross-process rejection/triage, not a formal fine-grained speedup claim; the gap is large enough that generic backend-label merging is not worth productionizing. A materially different future route would need to eliminate/fuse dependent CPU work or genuinely share the caller's persistent threadpool, not merely move the same ~111 segments inside the RockNPU plugin.
-
-
-## 2026-09-16 — RK3588 stock Rocket 200 MHz frequency trap and 700 MHz correction
-
-### Stock mainline state was genuinely fixed at 200 MHz
-
-- Both RK3588 boards were running the packaged mainline `rocket` module with no NPU devfreq device and no frequency ioctl/module parameter. The live DT assigns the shared NPU compute clock 200 MHz.
-- A load-time sampler on the stock validator observed 166 samples during real TinyLlama decode: `scmi_clk_npu` stayed exactly `200000000` for every sample; DDR stayed `2112000000`; `aclk_npu0/1/2` and `clk_npu_dsu0` stayed `250000000`.
-- Therefore the earlier ~5 tok/s decode measurements were real **200 MHz-class** NPU measurements, not an idle-clock reporting artifact.
-- CPU policies were also initially `ondemand`. Locking all three CPU policies to `performance` and using only the four Cortex-A76 cores (`taskset -c 4-7`, llama.cpp `-t 4`) improved the native-W8 `tg32,r=3` result from `5.02 ± 0.54 t/s` to `5.85 ± 0.41 t/s` while NPU remained at 200 MHz. Do not benchmark RK3588 decode with `-t 8`; the A55 cores add threadpool/barrier contention.
-
-### Controlled 700 MHz setup
-
-- For benchmarking only, both boards were switched at runtime from the packaged stock module to the public experimental Rocket devfreq reference `sky-rk3588/rk3588-npu-gpu@ed52a89afa8e68fedf636c8e891bd8fc47e82d26`, built against the exact running `6.18.43-current-rockchip64` headers.
-- No DTB/boot/kernel image change was made. NPU rail stayed at the board's existing 800 mV. The devfreq ceiling was capped at `700000000` and the `userspace` governor target was set to `700000000`.
-- The driver guards NPU power-domain transitions by returning the compute clock to the safe 200 MHz rate; do not replace this with raw CRU or `/dev/mem` clock writes.
-- A stock-validator `freq_probe` exact resident-MatMul gate passed at target/cur/max 700 MHz. Current run: `M256 K512 N128`, 41 reps, `wait=0.173539 ms`, `wait-effective=193.35 GFLOP/s`. This is clearly faster than the prior controlled 200 MHz reference (`0.399286 ms`, `84.04 GFLOP/s`), although it did not reproduce the best historical 700 MHz wait (`0.125-0.131 ms`).
-
-The operator guide for build/swap/set/restore is now in `README.md` (introduced by commit `10af99a`, `Document RK3588 700MHz benchmark setup`). Reboot or restoring the packaged module returns to the stock 200 MHz-class state.
-
-### Whole-model decode at 700 MHz
-
-Pinned llama.cpp source remained `391fac16460f15233a7740550d858ac96df3419d`. CPU policies were `performance`; decode used four A76 cores; NPU target/cur was 700 MHz.
-
-Production Q4_K_M -> resident-W8 path, `tg32,r=3`:
-
-- stock validator: `10.17 ± 1.74 t/s`
-- exploration board: `10.86 ± 1.94 t/s`
-
-The independently generated native-W8 sidecar path on the stock validator measured:
-
-- `tg32,r=3`: `11.34 ± 1.41 t/s`
-- `tg32,r=6`: **`11.53 ± 0.89 t/s`**
-
-Thus NPU frequency was a major hidden limiter: the cleaner native-W8 path rose from about `5.85 t/s` at the corrected 200 MHz/CPU setup to about `11.53 t/s` at 700 MHz, roughly a 1.97x throughput increase. However, frequency alone does **not** close the gap to Rockchip's published TinyLlama W8A8 figure (~24.43 tok/s under their benchmark conditions). Current open-path native-W8 decode remains roughly 2.1x below that published target, so execution/dataflow remains the primary optimization problem.
-
-### IRQ/cpuidle A/B did not help this decode path
-
-The exploration board initially had the NPU IRQ effective on CPU0 (A55) and CPU6 cpuidle state1 enabled. The reference project's fast-boot recipe recommends IRQ -> CPU6 plus disabling CPU6 state1, so this was tested at 700 MHz. Production `tg32,r=3` changed from `10.86 ± 1.94 t/s` to `10.69 ± 2.16 t/s`, i.e. no measurable gain. Both settings were reverted and are not part of the RockNPU README benchmark recipe.
-
-### Decision / interpretation
-
-- Any future RK3588 performance claim must state the NPU frequency. A 200 MHz stock-Rocket number must not be presented as the silicon's normal high-performance ceiling.
-- Use the 700 MHz/800 mV experimental setup only for controlled performance investigation; production remains a userspace project over the packaged Rocket unless that project policy is explicitly changed.
-- Native W8 removes Q4->W8 conversion/quantization-format ambiguity but does not itself provide the missing ~2x to the published closed-stack result.
-- The exact `freq_probe` gate demonstrates hardware correctness at 700 MHz, but it does not repair the previously observed whole-model CPU-reference logit divergence of the approximate W8A8 inference path. Performance and model-semantic correctness remain separate acceptance gates.
-
-## 2026-09-17 — main-branch verification round (RockNPU board, research Rocket + IOMMU domain cache, 700 MHz / 800 mV, CPU performance governor)
-
-- Cross-verified current `main` decode routing on this board: `ROCKNPU_GGML_TRACE` shows `qkv_triple_calls=462/682`, `vk_pair_calls=44`, `ffn_pair_calls=507/726`, zero W4A4, `worker_calls=[0,44,2904]`, `ksplit_calls=726`, steady-state `decode_cache entries=88`, `resident_mb=924`. The validated pair/triple defaults behave as documented on the real model.
-- Fixed-history logit differential (same llama.cpp binary/GGUF, CPU-forced token history, 24 steps, 32000-vocab logits per step): `ROCKNPU_QKV_TRIPLE=0` and `=1` produced **bit-identical** logits (768,000 floats), and the single divergence from CPU happens at step 14 (`Canada/Ottawa` vs `China/Beijing`) **identically in both**. Conclusion: QKV triple is not the semantic divergence source; the base W8A8 quantization path is. Do not blame SIMD/threadpool without new evidence.
-- Env-gated correctness re-verified on main: `ROCKNPU_W4A4=1` without `ROCKNPU_W4A4_SCOPE` does not activate any W4 call (`w4a4_m1_mul_mat=0`), matching the documented opt-in contract.
-- Same-process-ish ABBA `llama-bench -p 0 -n 32 -r 12 -t 4 -fa on`, main plugin as baseline B vs `exp/direct-scratch-0916` plugin + GGUF-faithful W8 sidecar + `ROCKNPU_W8_DIRECT_SUBMIT=1` + `ROCKNPU_EXPERIMENT_DIRECT_SCRATCH=1` as candidate A. Deterministic 24-token outputs byte-identical between A and main. Round 1 (B,A,A,B): `12.84, 17.97, 18.70, 12.52` tok/s; round 2 reversed (A,A,B,B): `18.41, 18.65, 12.49, 12.35`; CPU-only reference `19.53`, `20.49`, `18.48` across adjacent runs. A/B geometric center ≈ **1.45–1.49x**, and candidate A sits within noise of the optimized CPU baseline instead of ~40% below it.
-- Interpretation: main's threaded-submit pool path is now the outlier (12.3–12.8 tok/s), not the candidate. The direct-submit + persistent-scratch + GGUF-faithful-sidecar bundle is the strongest measured whole-model improvement available right now, but its validated form lives in `exp/direct-scratch-0916` (unmerged; final commits are docs-only on top). Any promotion must be a clean review/merge of that branch, not a reimplementation.
-- Remaining gap vs CPU on this board is ~3%: scaled projection profile says ~43 ms/token NPU projections + ~11 ms/token CPU glue (RMSNorm/RoPE/attention/softmax/sampling). The ~2–3 tok/s residual is consistent with the measured sub-millisecond host staging bound plus CPU transformer glue, not with submit overhead.
-## 2026-09-16 — native-W8 clock/scheduler dead ends and direct-submit win
-
-### Rejected platform and host-side routes
-
-- Raising the NPU compute clock from 700 MHz to the vendor 1 GHz point at 850 mV did not improve TinyLlama native-W8 decode: `tg32,r=3` remained about `11.2 t/s`, and per-projection timing was essentially unchanged. This path is not compute-clock-bound above 700 MHz.
-- A benchmark-only Rocket clock-framework experiment raised the shared `clk_npu_dsu0` and all three NPU ACLKs from 250 to 500 MHz while compute stayed at 1 GHz. Readback confirmed the real tree changed, but `tg32,r=3` measured `10.75 ± 1.52 t/s`; the ACLK hypothesis was rejected and the board was restored to 700 MHz compute / 250 MHz ACLK / 800 mV.
-- Reusing worker-local regcmd/input/partials scratch BOs did not improve the old threaded decode path: `10.83 ± 1.23 t/s` versus an adjacent `11.21 ± 1.30 t/s` baseline. Do not reimplement that sleeping-worker variant without new evidence. A later caller-thread direct-submit implementation is materially different because BO allocation happens serially before each core submit; phase profiling measured roughly 21–40 us of `CREATE_BO+mmap` per worker, making submit start times visibly staggered for small projections. Shape-keyed persistent scratch on direct-submit removed that stagger and produced a reproducible whole-model gain (documented in `docs/repro.md`).
-- Queue instrumentation showed that the threaded INT8 pool's apparent ~0.22–0.25 ms wrapper residual was almost entirely sleeping-worker wake latency: across 1596 calls, mean worker-queue delay was about `200.8 us`, result-return delay `13.7 us`, send overhead `9.9 us`, and only ~`2.8 us` remained unexplained after subtracting queue/return.
-- Busy-spin reduced queue delay but stole CPU from useful work; a 200 us spin window collapsed short decode throughput to `3.94 t/s`. CPU affinity/core partitioning could also reduce wake delay, but `-t2` plus dedicated worker cores measured only `10.26 ± 1.48 t/s` against an adjacent `-t4` baseline of `11.12 ± 1.25 t/s`; `-t3` was also slower. `SCHED_RR` priority was unavailable (`EPERM`) even through sudo in the validation environment.
-- Selecting the absolute minimum auto-tuner median instead of the existing 5% hysteresis produced the same `11.23 t/s` center in an adjacent `tg32,r=3` A/B. Do not treat tuner hysteresis as the missing whole-token gain.
-- A per-prepared-weight direct-submit regcmd cache was tested after the persistent-scratch win. It reduced steady-state `regcmd_stage` from roughly `3–12 us/worker` to `0–0.3 us/worker`, and the standalone integer projection oracle remained exact, but real TinyLlama failed at graph compute during the first decode step. The prototype required per-weight scratch addresses so cached regcmd DMA fields stayed stable; the true-model failure shows that byte-stable command contents alone are not sufficient evidence that a regcmd BO can be resubmitted indefinitely under Rocket's model-level synchronization/lifetime semantics. The code was reverted; do not retry this form without new live-submit evidence.
-- Skipping input-BO or regcmd-BO `PREP_BO` before full CPU overwrite was integer-exact but did not produce consistent projection gains; QKV/O/FFN often stayed flat or regressed while only some down-projection samples improved. Both experiments were reverted rather than carrying microsecond-level noise into the model path.
-- A later temporary direct-scratch phase trace quantified the remaining steady-state BO work on the current `0f8e644` path. Taking the final 176 projection calls (two TinyLlama decode tokens, 88 calls/token) gave aggregate worker-phase costs of about `0.756 ms/token` input staging, `0.873 ms/token` regcmd staging, `0.328 ms/token` output `FINI_BO`, `0.826 ms/token` host accumulation, and `1.403 ms/token` submit, versus `40.338 ms/token` in the output wait phase. The diagnostic stderr itself perturbed whole-model throughput/tuner timing, so those runs are **not** throughput evidence; the internal phase magnitudes are used only to bound opportunity. Even perfect shared activation staging is therefore sub-ms/token, while NPU/weight/dataflow wait remains the structural target.
-- Stock RKNPU/DRM can import an existing foreign dma-buf into another fd/domain (`PRIME_FD_TO_HANDLE` + imported `MEM_CREATE` was verified in the local `ork-driver` reference), but the active Rocket `/dev/accel/accel0` ABI intentionally exposes only `CREATE_BO`, `SUBMIT`, `PREP_BO`, and `FINI_BO`; its BO/IOVA ownership is per DRM file and there is no Rocket PRIME/import ioctl. Cross-fd shared activation would therefore require Rocket kernel/UAPI work for at most the measured sub-ms input-stage ceiling. Do not make that driver change before attacking the ~40 ms/token NPU wait path.
-- Removing worker-local intermediate `Vec<i32>` outputs from the persistent direct-submit finish path did produce a small reproducible whole-model gain. Workers now read their mapped partial BO directly into the pool's final output slice / K-split accumulator. Three model-level comparisons remained positive: `15.35 vs 14.99`, reversed `15.80 vs 15.73`, and `tg32,r=24` `16.19 ± 1.06 vs 16.02 ± 1.03 tok/s`; exact TinyLlama output was unchanged.
-
-### Proven candidate: submit all Rocket jobs before waiting
-
-- Rocket `ROCKET_IOCTL_SUBMIT` is asynchronous; the blocking completion point is the later output-BO `PREP_BO` wait. The previous pool woke one host thread per NPU device and each thread immediately performed submit+wait, paying Linux wake latency every projection.
-- The candidate splits prepared execution into `begin_execute_prepared()` (pack + asynchronous submit) and `finish_execute_prepared()` (wait + host accumulation). An env-gated pool path, `ROCKNPU_W8_DIRECT_SUBMIT=1`, keeps one guarded Rocket fd per NPU and executes all selected `begin` calls on the caller thread before any `finish` call. Thus 1–3 NPU jobs are in flight before the first wait, and no worker wakeup is required for steady-state projections.
-- A traced short run reduced average W8 pool time from roughly `764.5 us` to `617.4 us` per projection, consistent with removing most scheduler-wakeup overhead and starting all NPU jobs earlier.
-- After removing all profiler/affinity/spin/RT/queue/exact-min diagnostic code, the cleaned same-build `tg32,r=12` comparison on the stock 700 MHz validator was **`11.28 ± 0.63 t/s` threaded versus `13.70 ± 1.12 t/s` direct**, a center gain of **+21.5%**.
-- The cleaned threaded and direct paths produced byte-identical deterministic 24-token stdout for the existing native-W8 gate (same SHA-256 `e2af1f590675b3f2fb2ee3d8050f3b697e80f4813bf023a7c204033662e52797`). `rocknpu-matmul` library tests also passed `19/19`.
-
-### Correctness root cause and resolution
-
-- The bad native-W8 continuation was traced to the sidecar generator, not the direct-submit scheduler. The old v1 sidecar quantized the original FP16/BF16 safetensors, while the model actually executed by llama.cpp is `TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf`. Production/runtime W8 first dequantizes the live Q4_K/Q6_K GGUF tensor and then requantizes it per output row. The old generator also used NumPy `rint` ties-to-even rather than Rust `f32::round()` half-away-from-zero.
-- A GGUF-faithful generator now dequantizes the actual pinned GGUF tensors, applies the same symmetric per-output-row W8 quantization and half-away-from-zero rounding, and emits a v2 sidecar. The deterministic 24-token gate is byte-identical across runtime-W8, corrected-sidecar threaded, and corrected-sidecar direct-submit: SHA-256 `08730f9092a465cc9915db41d7ba8f999504c968e4937d73b6d9f068dcae8f8d`, continuation `Paris. -> 2. B.C. -> Beijing. -> 3. A`.
-- The v2 sidecar binds every W8 tensor to a sampled FNV-1a fingerprint of the live quantized GGUF source bytes and records whole-GGUF size/SHA-256 provenance. Loader validation accepted all `154/154` corrected tensors and rejected all `154/154` legacy v1 tensors; rejected or missing fingerprints safely fall back to runtime W8 instead of silently changing model weights.
-- With the corrected v2 sidecar, exact `llama-bench -p 0 -n 32 -r 12 -t 4 -dev ROCKNPU0` measured **`11.58 ± 0.79 t/s` threaded versus `13.69 ± 1.07 t/s` direct**, a center gain of **+18.2%**. The earlier +21.5% result therefore survives the correctness repair within board jitter.
-- Direct-submit is now correctness-cleared for this deterministic model gate, but it remains on the experimental native-W8 branch until the normal project merge/review bar is satisfied.
-
-## 2026-09-16 — Rocket per-job IOMMU attach/detach overhead and domain-cache experiment
-
-- Source inspection of the active Rocket scheduler showed that every job calls `iommu_attach_group()` in `rocket_job_run()` and `iommu_detach_group()` in the completion IRQ path. A low-overhead kprobe/kretprobe run over 50 cached `K=512,N=32` W8 calls measured median `iommu_attach_group` time of about `9.5 us` and median detach time of about `11.0 us`; the same small projection had a roughly `55-70 us` call floor. This is materially larger than the previously measured input-copy opportunity.
-- Linux IOMMU semantics do not allow simply leaving one custom domain attached and attaching another. The experimental fix therefore caches the last attached domain per NPU core: same-domain jobs skip attach/detach; a different domain detaches the old domain before attaching the new one; reset, driver fini, and file close detach and clear the cached pointer. The implementation was tested in the external GPL-2.0 Rocket/DVFS research tree at commit `ed52a89afa8e68fedf636c8e891bd8fc47e82d26`; it is **not** copied into the MIT RockNPU production source.
-- A first non-DVFS OOT build exposed a useful trap: it left `scmi_clk_npu` at the DT default 200 MHz, producing only about `6.3-6.8 t/s`. Those numbers are valid 200 MHz measurements but are not comparable to the project's 700 MHz baseline and are excluded from performance conclusions.
-- The cache patch was then ported to the already validated DVFS Rocket tree. Readback before the authoritative measurements was `scmi_clk_npu=700000000`, `vdd_npu_s0=800 mV`; CPU policies were `performance`. The deterministic 24-token TinyLlama gate stayed byte-exact with cache both off and on. Two independent TinyLlama processes were also run concurrently with the cache enabled; both exited zero and produced the exact expected continuation, exercising cross-file/domain switching under contention.
-- At 700 MHz, identical direct-submit/direct-scratch W8 microbenchmarks measured cache off -> on medians: `K512,N32 60.96 -> 37.04 us` (-39%), `K2048,N32 64.46 -> 45.50 us` (-29%), `K2048,N256 113.75 -> 88.08 us` (-23%), and `K2048,N2048 249.81 -> 248.20 us` (essentially flat). The size dependence is consistent with removing a fixed driver cost rather than changing NPU arithmetic throughput.
-- Whole-model results are positive but noisy. With `-fa auto`, `tg32,r=12` measured `15.78 ± 1.45 t/s` cache-off versus `16.43 ± 1.57 t/s` cache-on. With `-fa on`, short `r=12` order-swapped centers were noisy (`16.80 off -> 18.39 on -> 17.59 off -> 17.27 on`), so the one-run 18.39 value must not be treated as a stable topline. Longer `tg32,r=24` A-B-A-B at the same 700 MHz point measured `17.14 ± 1.98 on -> 15.32 ± 1.96 off -> 18.12 ± 1.29 on -> 16.84 ± 1.92 off`; the two on centers average `17.63 t/s` and the two off centers `16.08 t/s` (about +9.6% center), but the per-run standard deviations remain large enough that the exact percentage is provisional.
-- **Decision:** keep this as a proven fixed-overhead driver optimization and a promising whole-model gain, but do not claim a stable 18.39 t/s topline or merge GPL Rocket code into RockNPU. Future work should either upstream/land the cache in the Rocket driver with proper lifecycle review or reproduce the change in the maintained kernel path, then rerun the 700 MHz long A/B. Do not revisit activation-copy sharing before this driver-side opportunity is exhausted.
-
-## 2026-09-16 — Rocket runtime-PM ceiling and NPU threaded-IRQ scheduling
-
-- After the per-core IOMMU-domain cache removed the attach/detach fixed cost, runtime-PM bookkeeping was measured before attempting a driver patch. Scoped function-graph tracing on the Rocket IRQ/scheduler paths recorded 700 `__pm_runtime_suspend()` calls with median `1.167 us`, p90 `2.042 us`, and mean `1.727 us`. Two directly observed `__pm_runtime_resume()` calls inside `rocket_job_run()` were about `5.25-5.54 us` under function-graph tracing. This is a real per-job cost, but its whole-token ceiling is too small to explain the remaining 3-4 tok/s gap. **Decision:** do not hold a permanent runtime-PM reference or make a large PM patch without stronger evidence.
-- Rocket completion uses `devm_request_threaded_irq()`: the hard IRQ masks the NPU interrupt and returns `IRQ_WAKE_THREAD`; the threaded handler advances `task_count`, signals the fence, and performs the PM put. With the default IRQ affinity `0-7`, low-overhead entry kprobes over the same 1450 task completions measured hard-IRQ -> threaded-handler wake latency `p10=5 us`, `median=10 us`, `p90=21 us`, `p99=51 us`, mean `12.208 us`, max `149 us`. Trace samples showed the interrupts repeatedly landing on CPU0 from idle. The RK3588 `cpu-sleep` state reports a `220 us` exit latency.
-- Pinning the three NPU IRQs to A76 CPUs 4/5/6 and disabling their `cpu-sleep` state reduced the same wake-latency distribution to `median=2 us`, `p90=3 us`, `p99=7 us`, max `12 us`, but whole-model throughput regressed: candidate `16.47 +/- 2.30 tok/s` versus adjacent baseline `17.74 +/- 2.47 tok/s`. The likely cost is contention with llama.cpp CPU work on the big cores. **Decision:** reject the A76 placement despite the excellent IRQ micro-latency.
-- A better topology keeps NPU IRQ work on the A55 cluster: `fdab0000.npu -> CPU0`, `fdac0000.npu -> CPU1`, `fdad0000.npu -> CPU2`, with `cpu-sleep` disabled only on CPUs 0/1/2. The deterministic 24-token TinyLlama gate stayed byte-exact. On the identical 1450-completion trace, wake latency improved from baseline `10/21/51 us` median/p90/p99 to `6/8/23 us`; mean fell from `12.208` to `6.820 us`.
-- Whole-model interleaving at the validated `700 MHz / 800 mV`, domain-cache enabled, corrected GGUF-faithful W8 sidecar, direct-submit, direct-scratch, and `-fa on` produced: baseline B1 `17.74 +/- 2.47`, A55 candidate C1 `19.18 +/- 2.15`, baseline B2 `18.61 +/- 1.91`, A55 candidate C2 `19.57 +/- 2.09 tok/s`. A longer matching `tg32,r=24` pair measured candidate C3 `19.33 +/- 1.81` versus baseline B3 `17.86 +/- 2.06 tok/s` (~+8.2% center). The rough unweighted centers across the three blocks are `18.07` baseline and `19.36 tok/s` candidate (~+7.1%). Do not treat the single `19.57` block as a stable topline; the repeatable center is approximately `19.3-19.4 tok/s`.
-- This reaches roughly 91% of the known CPU TinyLlama baseline (`~21.23 tok/s`) while preserving the exact semantic gate. The change is platform scheduling/power-state tuning, not an NPU arithmetic change.
-- `scripts/tune_rocket_irq_latency.sh` reproduces the validated A55 layout without hard-coding IRQ numbers: it finds the three NPU device IRQs from `/proc/interrupts`, supports `apply` and `restore`, and was exercised in both directions on the validator. It only writes Linux IRQ affinity/cpuidle sysfs/procfs controls; no GPL Rocket source is copied into the MIT repository.
-
-## 2026-09-17 — DRM scheduler high-priority submit-workqueue dead end
-
-- Pointer-paired kprobes on `drm_sched_entity_push_job(job) -> rocket_job_run(job)` confirmed a real scheduler dispatch fixed cost under the validated `700 MHz / 800 mV`, domain-cache-enabled, A55-IRQ setup: over 700 jobs, `p10=3 us`, `median=9 us`, `p90=30 us`, `p99=60 us`, `mean=12.264 us`, `max=104 us`.
-- A GPL-only research patch gave each Rocket core a dedicated ordered `WQ_HIGHPRI` via `drm_sched_init_args.submit_wq`. Same-build dispatch measurements changed from `median=7 us, p90=33 us, p99=62 us, mean=11.680 us` with the option off to `median=10 us, p90=15 us, p99=60 us, mean=11.129 us` with it on. This is tail shaping, not a center-latency win.
-- Both settings passed the deterministic 24-token exact TinyLlama gate. Matching `tg32,r=12`, `-fa on` whole-model blocks at the formal clock/voltage point were: prior `on 19.36 +/- 2.15`, then `off 19.30 +/- 2.17`, order-swapped `on 19.30 +/- 2.11`, and final `off 19.19 +/- 2.17 tok/s`. The distributions overlap and there is no repeatable throughput gain.
-- **Decision:** reject the high-priority submit-workqueue experiment and revert the GPL patch instead of preserving it as a positive result. Continue on completion-path fixed costs: Rocket threaded IRQ signals its hardware `done_fence`, DRM scheduler then propagates completion to the scheduler `finished` fence attached to the output BO reservation, and `PREP_BO` waits on that reservation through `dma_resv_wait_timeout()`. Measure that completion/wakeup chain before changing it.
-
-## 2026-09-17 — completion wakeup chain and A76 deep-idle negative result
-
-- Low-overhead tracing split the Rocket completion path after the validated A55 IRQ tuning. Over 700 jobs, threaded IRQ entry -> Rocket hardware fence signal measured `median=2 us, p90=3 us, p99=4 us`; Rocket fence signal -> `drm_sched_job_done` measured `median=1 us, p90=1 us`; scheduler job-done -> scheduler `finished` fence signal measured `median=1 us, p90=1 us`. DRM completion propagation itself is therefore only about a few microseconds and is not the remaining large fixed cost.
-- For blocking output `PREP_BO` waits containing exactly one unambiguous completion, scheduler `finished` fence signal -> `PREP_BO` return measured `n=305`, `median=7 us`, `p90=51 us`, `p99=61 us`, mean `16.807 us`, max `66 us`. Scheduler tracepoints isolated that tail: `finished -> sched_waking` was `median=1 us, p90=2 us`; `sched_waking -> sched_wakeup` was `median=5 us, p90=45 us, p99=50 us`; `sched_wakeup -> sched_switch` was `median=2 us, p90=3 us`; switch -> ioctl return was `median=1 us, p90=3 us`. The long tail is therefore inside the target task's TTWU / remote CPU wake path, not fence propagation or runqueue delay.
-- The TTWU tail was not primarily caused by wake migration: 325 same-target-CPU samples still had `median=5 us, p90=45 us, p99=49 us`; only three observed migrated wakes were around `48-52 us`.
-- CPUs 4-7 expose WFI (`1 us` declared exit latency) and `cpu-sleep` (`220 us`). Keeping NPU IRQs on A55 CPUs 0/1/2 but disabling only CPU4-7 `cpu-sleep` collapsed the main waiter's `sched_waking -> sched_wakeup` distribution to `n=587`, `median=5 us`, `p90=6 us`, `p99=8 us`, mean `4.809 us`, max `11 us`. This is strong mechanism evidence that A76 deep idle creates the 45-50 us wake tail.
-- The deterministic 24-token TinyLlama gate remained exact, and formal runs were read back at `700 MHz / 800 mV`, CPU governor `performance`. Short `tg32,r=12` blocks initially looked positive: candidate C1 `19.08 +/- 2.71` vs control B1 `18.14 +/- 1.82`, then candidate C2 `20.26 +/- 2.45` vs control B2 `19.12 +/- 1.99 tok/s`. Longer validation did not reproduce a stable gain: `r=24` control B3 `18.42 +/- 1.26`, candidate C3 `19.64 +/- 2.63`, control B4 `19.38 +/- 1.41`, candidate C4 `18.27 +/- 2.57 tok/s`.
-- **Decision:** do not promote CPU4-7 deep-idle disabling. It removes a real ~45-50 us completion-wakeup tail, but the whole-model benefit is not repeatable under longer interleaving and the final candidate block regressed. Restore CPU4-7 `cpu-sleep`. Treat this as a useful bound on waiter-wakeup latency, not a throughput tuning. Continue on scheduler dispatch/job lifecycle rather than making broader A76 cpuidle changes.
-
-## 2026-09-17 — DRM submit-worker dispatch decomposition and bound-workqueue dead end
-
-- A 700-job trace paired the real user-context scheduler submission with workqueue and DRM scheduler execution. On the clean domain-cache + A55-IRQ setup, `drm_sched_entity_push_job -> workqueue_queue_work` was `median=1 us, p90=2 us`; `queue_work -> workqueue_execute_start` was the largest center component at `median=7 us, p90=9 us, p99=53 us`; worker start -> `drm_sched_job_run` was `median=4 us, p90=5 us`; `drm_sched_job_run -> rocket_job_run` was `median=1 us`. End-to-end push -> Rocket run was `median=13 us, p90=17 us, p99=59 us` in that trace.
-- Default unbound submit-worker placement was spread across both clusters. CPU4 executions were especially fast (`median=3 us, p90=3 us` queue -> execute), while A55 CPU0/2 were about `median=7 us`; CPU5/6/7 also had `median=3 us` but showed ~45-70 us tails. This motivated testing locality instead of another priority-only workqueue policy.
-- A first strict single-CPU affinity prototype using `apply_workqueue_attrs()` could not be built as an out-of-tree module because `alloc_workqueue_attrs_noprof`, `apply_workqueue_attrs`, and `free_workqueue_attrs` are not exported by this kernel. No live test was performed with that version.
-- A buildable GPL-only default-off experiment instead supplied a normal bound per-CPU workqueue through `drm_sched_init_args.submit_wq`. The exact TinyLlama gate showed real model submissions originate almost entirely on A76 CPUs (`6282` pushes: CPU4 `2239`, CPU5 `3069`, CPU6 `462`, CPU7 `497`), so bound workqueues naturally execute on the currently active submit CPU rather than reserving a specific A76.
-- On the 700-job projection trace, the bound candidate achieved exact CPU locality (`700/700` queue/execute pairs stayed on the submit CPU) and improved scheduler center latency: `queue -> execute median 7 -> 4 us`, and push -> `rocket_job_run median 13 -> 7 us`. However tails worsened: queue -> execute `p90=23 us, p99=98 us, max=162 us`; push -> Rocket `p90=25 us, p99=101 us, max=164 us`. Per-CPU traces showed the long tail on all CPU4-7, consistent with same-core competition rather than a single bad CPU.
-- The deterministic 24-token gate remained exact. Same-build formal `700 MHz / 800 mV`, A55-IRQ, `tg32,r=12`, `-fa on` whole-model blocks were candidate C1 `19.35 +/- 2.01`, bound=0 control B1 `19.52 +/- 2.12`, and order-swapped candidate C2 `18.65 +/- 1.90 tok/s`. There is no whole-model gain despite the halved median scheduler-dispatch latency.
-- **Decision:** reject bound per-CPU submit workqueues and revert the GPL experiment to the then-clean **RockNPU-created local Rocket baseline** (historical unpublished tip `3345d5f`). The submit-worker placement trade-off is now bounded: high priority improves p90 without center/throughput gain, while strict locality improves center but worsens tails/contention and also does not improve throughput. Continue by measuring the ~4 us inside `drm_sched_run_job_work` and job lifecycle itself rather than trying more workqueue placement policies.
-
-## 2026-09-17 — strict CPU4 DRM submit-worker dead end
-
-- Because Linux 6.18 exports `queue_work_on()` but does not export the `workqueue_attrs` allocation/apply/free APIs to OOT modules, a minimal **core `gpu_sched` research module** was built instead of bypassing symbol/export rules. It added a default-off `submit_cpu=-1` module parameter, restricted the experiment to the three Rocket scheduler names (`fdab0000.npu`, `fdac0000.npu`, `fdad0000.npu`), used a bound `max_active=1` submit workqueue for those schedulers when enabled, and routed run/free work through `queue_work_on(submit_cpu, ...)`. No GPL scheduler code was copied into the MIT repo.
-- With `submit_cpu=4`, the experiment achieved exact intended locality. Across all traced `drm_sched_run_job_work` executions, `2099/2099` ran on CPU4; queue -> execute was `median=1 us, p90=3 us, p99=50 us, mean=2.827 us, max=175 us`. Restricting to the **700 userspace-originated new jobs** gave `700/700` CPU4 execution and `median=3 us, p90=5 us, p99=59 us, mean=6.75 us, max=175 us`, versus the prior default-worker baseline `median=7 us, p90=9 us, p99=53 us, mean=7.801 us`. The target ~4 us center reduction was therefore real.
-- The mandatory 24-token TinyLlama continuation remained byte-exact under the CPU4 candidate. However the formal whole-model `tg32,r=12`, `-fa on`, `700 MHz / 800 mV`, domain-cache + A55-IRQ setup measured only **`14.57 +/- 1.69 tok/s`**. After restoring the packaged stock `gpu-sched.ko` and otherwise identical formal setup, the adjacent baseline returned to **`18.32 +/- 2.00 tok/s`**. This is a large reversible whole-model regression despite the better dispatch center, so no `r=24` promotion test was justified.
-- `llama-completion`'s own perf print is not a useful discriminator for this candidate: the exact candidate gate printed about `1.76 tok/s` eval and the post-revert exact gate about `1.81 tok/s`, while both produced the required bytes. The formal `llama-bench` A/B above is the throughput evidence.
-- The core scheduler patch was fully reverted; the running board was restored to packaged stock `gpu_sched`, packaged Panthor, research Rocket with `rocket_cache_iommu_domain=Y`, `700 MHz`, `800 mV`, IRQs on CPU0/1/2, CPU0-2 `cpu-sleep` disabled, and CPU4-7 deep sleep enabled. Post-revert exact 24-token correctness passed again.
-- **Decision:** reject strict CPU4 submit-worker routing. Saving ~4 us from the median scheduler dispatch does not predict whole-model throughput, and concentrating Rocket scheduler run/free work on one A76 caused a much larger model-level loss through a mechanism not yet isolated. Do not retry CPU4 strict routing, or another single-A76 equivalent, without new evidence that explains and removes that whole-model penalty. Continue inside `drm_sched_run_job_work` / job lifecycle rather than further workqueue-placement tuning.
-
-## 2026-09-17 — Rocket job lifecycle, IOMMU-domain thrash, and locality-policy dead ends
-
-- Low-overhead decomposition after the strict-CPU4 rejection found no large hidden scheduler-body cost. With one probe at a time, `drm_sched_run_job_work -> drm_sched_job_run` was about `3 us` median; `drm_sched_entity_pop_job` accounted for roughly `1 us`, leaving about `2 us` for credit/job-begin/trace work. `mod_delayed_work_on()` for the per-job TDR rearm was about `2 us` under probe, too small to justify weakening timeout semantics.
-- Rocket submit-front work was also bounded: `rocket_ioctl_submit` was roughly `7 us` median under probe, with `drm_sched_job_init` about `1 us`, each GEM lookup about `1 us`, and entity push about `2 us`. `rocket_job_free` was around `5 us` median, but correlation against 700 userspace-originated run queues found `0/700` cases where free work overlapped the next run-work queue wait, so free-job cleanup is not the source of the ~7 us dispatch center.
-- Driver fixed-cost tracing isolated the dominant tail after `rocket_job_run`: fence creation was about `1 us` median / `6 us` p99, `__pm_runtime_resume` was entered on all 700 jobs but was about `1 us` median, and the core `job_lock` mutex itself was about `1 us` median / `3 us` p99. The apparent `20-30 us` tail after PM return matched IOMMU-domain cache misses instead: the 700-job projection workload produced **271 `iommu_attach_group()` + 271 `iommu_detach_group()` calls**. The miss count matched the slow-sample count, identifying domain switching rather than fence/PM/mutex work as the remaining driver-side tail.
-- The reason is structural: direct-submit uses three independent Rocket DRM file contexts, therefore three independent IOMMU domains, while each file's DRM scheduler entity can run on all three NPU schedulers. Jobs from the three domains migrate among the three cores and repeatedly evict each core's cached domain.
-- A userspace experiment duplicated one DRM file context across all direct workers so all workers shared one domain. Integer projection correctness passed, but sharing one scheduler entity serialized the workers: representative QKV N3 rose from about `0.23 ms` to about `0.55 ms`, and the wide FFN projection similarly lost most multi-core overlap. The experiment was fully reverted. Do not retry one shared scheduler entity as a domain-sharing shortcut.
-- A GPL-only default-off hard file-to-core policy assigned each newly opened Rocket file to a single NPU scheduler. It reduced the 700-job attach/detach count from `271/271` to **`28/28`**, proving that job-to-job domain thrash can be eliminated. Correctness remained byte-exact. However whole-model performance did not improve: short `tg32,r=12` was `18.23 +/- 1.88` pin-on versus `18.29 +/- 2.05 tok/s` pin-off, and the longer `r=24` pair was **`18.44 +/- 1.32` pin-on versus `19.52 +/- 1.66 tok/s` pin-off**. Static pinning removes DRM's useful load balancing and was rejected/reverted.
-- A second GPL-only default-off experiment preserved load balancing and used cached-domain locality only when the candidate core's scheduler score was close to the globally best score. With preference disabled but score statistics enabled, the 700-job workload split exactly as: `no_local=28`, `delta0=429`, `delta1=243`, `delta2+=0`. A tie-only policy (`slack=0`) forced 429 jobs but left attach/detach unchanged at `271/271`, showing equal-score ties were already effectively selecting the same core. Allowing only one score of slack (`slack=1`) forced about 672/700 jobs and reduced attach/detach to **`28/28`** while preserving the exact 24-token TinyLlama output.
-- Despite the strong mechanism win, `slack=1` was whole-model flat under order-swapped `tg32,r=12`, `-fa on`: candidate C1 `19.06 +/- 2.14` vs baseline B1 `18.40 +/- 1.97`, then baseline B2 `19.20 +/- 2.14` vs candidate C2 `18.63 +/- 2.17 tok/s`. Candidate mean `18.845` vs baseline mean `18.80 tok/s` is only about **+0.24%**, far below repeatability/noise and not enough to justify `r=24`. The likely trade is direct: avoiding a ~20 us domain switch by accepting a scheduler score one worse sometimes delays useful parallel work enough to cancel the fixed-cost saving.
-- **Decision:** reject hard file/core pinning, shared-file-context serialization, tie-only locality, and score-slack-one locality as throughput tunings. All later GPL scheduler/locality experiments were fully reverted to the **RockNPU-created local Rocket baseline** (historical unpublished tip `3345d5f`); no GPL code was copied into the MIT RockNPU tree. The board was restored to research Rocket with only `rocket_cache_iommu_domain=Y`, `700 MHz / 800 mV`, CPU governors `performance`, A55 IRQ tuning, CPU4-7 deep sleep enabled, trace/kprobes cleared, and the deterministic 82-byte TinyLlama gate passed again. Domain thrash is real and measurable, but eliminating it is not sufficient unless scheduler load balancing is preserved with essentially zero displacement cost.
-
-### Shared IOMMU domain with multiple scheduler entities
-
-- A final locality variant tested whether the previous shared-file serialization could be removed without returning to three independent IOMMU domains. The external GPL Rocket research module gained a default-off `rocket_file_entities=3` mode: one DRM file/domain owns three independent DRM scheduler entities, while a temporary MIT-side env-gated direct-submit path duplicated that one DRM file context across the three workers. The default remained one entity/file and no GPL code was copied into RockNPU.
-- The mechanism worked as intended. The deterministic 24-token TinyLlama gate was byte-exact both before and after tracing. The 700-job projection workload retained real multi-core overlap instead of the earlier single-entity serialization: representative QKV N3 was `0.214 ms`, attention-output N3 `0.185 ms`, wide FFN N3 `0.808 ms`, and FFN-down K3 about `0.482 ms`, all in the normal parallel range. IOMMU attach/detach calls fell from the normal three-file `271/271` to **`39/39`**, so job-to-job domain thrash was largely eliminated without serializing the NPU workers.
-- Whole-model throughput nevertheless regressed under fresh-process order-swapped `tg32,r=12`, `-fa on` at the formal point. Candidate C1 was `18.91 +/- 2.40`, baseline B1 `19.42 +/- 2.07`, baseline B2 `19.48 +/- 2.09`, and candidate C2 `19.37 +/- 2.15 tok/s`. Candidate mean `19.14` versus baseline mean `19.45 tok/s` is about **-1.6%**. Because both orderings failed to show a positive center, no `r=24` promotion run was justified.
-- **Decision:** reject shared-domain/multi-entity scheduling as a throughput tuning. It proves that domain thrash and worker serialization can be solved simultaneously, but that alone does not improve TinyLlama decode. Both the GPL multi-entity patch and MIT shared-file experiment were fully reverted; the **RockNPU-created local Rocket baseline** (historical unpublished tip `3345d5f`) and clean RockNPU binaries were rebuilt/reloaded, `700 MHz / 800 mV` plus A55 IRQ tuning restored, the research-only parameter disappeared, and the 82-byte exact gate passed again. Treat the IOMMU-domain line as bounded rather than the next source of the remaining CPU-vs-NPU gap.
+See docs/research-status.md for the canonical current hypotheses and priority order.

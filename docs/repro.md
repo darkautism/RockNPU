@@ -1,1087 +1,213 @@
-# Reproducing RK3588 Rocket/Rust MatMul milestones
+# RockNPU reproduction guide
 
-Run on the RK3588 host with `/dev/accel/accel0` accessible to the current user.
+This guide covers reproducible userspace validation only.
 
-## Rust unit/ABI gates
+Prerequisites:
 
-```sh
-cargo test --manifest-path /home/kautism/rocknpu/Cargo.toml --workspace
-```
+- RK3588 host;
+- accessible accelerator device at /dev/accel/accel0;
+- current stable Rust toolchain;
+- model/test artifacts required by the selected gate.
 
-Expected: `rocket-uapi` ABI layout test plus `rocknpu-regcmd` generic-encoder/golden/layout/shape-limit tests pass.
+No system-driver modification is part of this guide.
 
-## Pure Rust hardware gate
+## 1. Workspace build
 
-```sh
-cargo run --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke
-```
+    cargo build --workspace
+    cargo test --workspace
 
-Expected summary:
+For a quick userspace ABI/runtime check:
 
-```text
-M4-K32-N16 PASS ... regcmd_count=126
-M12-K32-N16 PASS ... regcmd_count=126
-M16-K64-N32 PASS ... regcmd_count=126
-M32-K128-N48 PASS ... regcmd_count=126
-M64-K256-N64 PASS ... regcmd_count=126
-M256-K512-N128 PASS ... regcmd_count=126
-PASS: generic pure-Rust RK3588 fp16 MatMul encoder + Rocket UAPI + 6 real NPU shapes + exact CPU compare
-```
+    cargo test -p rocket-uapi
+    cargo test -p rocket-runtime
+    cargo test -p rocknpu-regcmd
 
-The gate is exact: deterministic small-integer inputs are accumulated in CPU FP32, narrowed to FP16, then compared bit-for-bit with every NPU output element. Shape-tagged command/input/weight/output/reference evidence is written under `artifacts/`.
+## 2. Basic hardware smoke
 
-## Generic encoder byte gate against the public reference
+    cargo run --release -p rocket-smoke
 
-The validation-only helpers compare the Rust stream with the pinned GPL reference generator using identical sentinel IOVAs:
+This exercises the Rust buffer/submit/register-command path and compares NPU output with a CPU reference.
 
-```sh
-cc -O2 -std=gnu11 -I reference/rocket-userspace/include \
-  artifacts/dump_fp16_shape.c reference/rocket-userspace/build-ref/librocketnpu.a \
-  -lm -ldrm -o artifacts/dump_fp16_shape
-cargo build -p rocknpu-regcmd --example dump_fp16
-```
+## 3. W8A8 M=1 decode gates
 
-The six hardware-gate shapes must each produce 126 identical 64-bit command words in both dumpers. The C helper is validation/reference material, not production Rust code.
+TinyLlama-sized projection examples:
 
-## Tiled hardware gates
+    cargo run --release -p rocket-smoke --bin int8_decode_m1 -- 2048 256
+    cargo run --release -p rocket-smoke --bin int8_decode_m1 -- 2048 2048
+    cargo run --release -p rocket-smoke --bin int8_decode_m1 -- 2048 5632
+    cargo run --release -p rocket-smoke --bin int8_decode_m1 -- 5632 2048
 
-The first M-tiled gate exceeds the one-task CBUF envelope and must produce two NPU tasks:
+The result must pass the exact int32 CPU oracle.
 
-```sh
-cargo run --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin tiled
-```
+## 4. Native M-tile gate
 
-Expected tail:
+Examples:
 
-```text
-shape=M512 K512 N128
-Mt=256 Kt=512 Nt=128
-m_tiles=2 k_tiles=1 n_tiles=1 tasks=2
-PASS: tiled pure-Rust RK3588 fp16 MatMul M512 K512 N128; tasks=2; mismatches=0
-```
+    cargo run --release -p rocket-smoke --bin int8_mtile -- 64
+    cargo run --release -p rocket-smoke --bin int8_mtile -- 128
 
-The K-split host-accumulation baseline is:
+M128 is a promoted capability. Do not infer model speed from this primitive alone.
 
-```sh
-cargo run --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin k_tiled
-```
+## 5. Fused residual gate
 
-Expected planning: `M64/K4096/N64 -> Kt=1536 -> 1536+1536+1024`. Every NPU partial must bit-match the CPU partial and host accumulation must match the tiled CPU oracle.
+    cargo run --release -p rocket-smoke --bin fused_residual -- 16 2048 2048
 
-The NPU EW/ERDMA K-accumulation gate is:
+The fused result is compared against plain NPU matmul plus CPU FP16 residual addition.
 
-```sh
-cargo run --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin kacc
-```
+Validated max-abs error for this shape is approximately 0.000610.
 
-Expected tail:
+## 6. Same-job weight reuse gate
 
-```text
-tile=0 ... mode=plain  ... PASS
-tile=1 ... mode=ew-add ... PASS
-tile=2 ... mode=ew-add ... PASS
-PASS: NPU EW K-accumulation M64 K4096 N64; Kt=1536; tasks=3; staged_mismatches=0
-```
+    cargo run --release -p rocket-smoke --bin int8_weight_reuse -- 128 256 reuse
 
-This gate intentionally uses two output BOs in ping-pong order. Do not change it to in-place EW accumulation.
+This validates repeated same-weight M128 tasks.
 
-## EW accumulation byte gate against the public reference
+Do not force wide TinyLlama projections into N64 column splits merely to use this feature; that production experiment regressed substantially.
 
-```sh
-cc -O2 -std=gnu11 -I reference/rocket-userspace/include \\
-  artifacts/dump_fp16_accum_shape.c reference/rocket-userspace/build-ref/librocketnpu.a \\
-  -lm -ldrm -o artifacts/dump_fp16_accum_shape
-cargo build -p rocknpu-regcmd --example dump_fp16_accum
-```
+## 7. Real pretrained ONNX gates
 
-Validated accumulation shapes are `16x32x16`, `64x256x64`, `64x1536x64`, `128x512x128`, and `256x512x128`; all must produce 126 command words byte-identical to the public C generator.
+When the model/input artifacts are present:
 
+    cargo run --release -p rocket-smoke --bin prepared_mnist
+    python3 scripts/verify_real_mnist.py prepared-mnist-npu
 
-## Reusable single-core executor gates
+    cargo run --release -p rocket-smoke --bin mnist8_cnn_prepared
+    python3 scripts/verify_mnist8.py mnist8-prepared
 
-The consolidated executor owns planner-driven packing, submission, K-accumulation policy, and row-major gather:
+    cargo run --release -p rocket-smoke --bin cifar10_edgeinfer
+    python3 scripts/verify_cifar10_edgeinfer.py
 
-```sh
-cargo run --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin executor
-```
+The Python tools are independent validation oracles, not production execution backends.
 
-Expected cases include:
+## 8. Build the stock-llama.cpp dynamic backend
 
-```text
-n-only PASS M64 K512 N272 ... jobs=2 ... mismatches=0
-mnk-ragged PASS M300 K512 N272 ... jobs=8 npu_kacc_groups=4 ... mismatches=0
-tiny-m-host-kacc PASS M4 K4096 N64 ... jobs=2 host_kacc_groups=1 ... mismatches=0
-PASS: reusable single-core fp16 executor hardware gate; cases=3
-```
+Assume:
 
-The deterministic pseudo-random hardware differential sweep is:
+    export ROCKNPU_DIR=/path/to/RockNPU
+    export LLAMA_CPP_DIR=/path/to/llama.cpp
 
-```sh
-cargo run --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin executor_sweep
-```
+Build llama.cpp with dynamic backends:
 
-It must pass two independent seeds for boundary/N-tail cases and the mixed-policy case:
+    cmake -S "$LLAMA_CPP_DIR" \
+      -B "$LLAMA_CPP_DIR/build-rocknpu" \
+      -DGGML_BACKEND_DL=ON \
+      -DGGML_NATIVE=ON
+    cmake --build "$LLAMA_CPP_DIR/build-rocknpu" -j
 
-```text
-mixed-kacc-tail seed=0x5eed5eed PASS M260 K1024 N272   Mt=256 Kt=384 Nt=256 tiles=12 jobs=12 npu_kacc=2 host_kacc=2 mismatches=0
-PASS: executor deterministic randomized hardware differential sweep; cases=5
-```
+Build the RockNPU backend:
 
-## FP32-output byte gate and accuracy gate
+    cmake -S "$ROCKNPU_DIR/adapters/ggml-rocknpu" \
+      -B "$ROCKNPU_DIR/target/ggml-rocknpu" \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DGGML_SOURCE_DIR="$LLAMA_CPP_DIR/ggml" \
+      -DGGML_CPU_LIBRARY="$LLAMA_CPP_DIR/build-rocknpu/bin/libggml-cpu.so"
+    cmake --build "$ROCKNPU_DIR/target/ggml-rocknpu" -j
 
-The FP32-output encoder is a five-register variant of the validated FP16 stream. Build the validation-only reference helper and Rust dumper:
+Load it:
 
-```sh
-cc -O2 -std=gnu11 -I reference/rocket-userspace/include \
-  artifacts/dump_fp16_f32out_shape.c reference/rocket-userspace/build-ref/librocketnpu.a \
-  -lm -ldrm -o artifacts/dump_fp16_f32out_shape
-cargo build -p rocknpu-regcmd --example dump_fp16_f32out
-```
+    export GGML_BACKEND_PATH="$ROCKNPU_DIR/target/ggml-rocknpu/libggml-rocknpu.so"
 
-Validated byte-identical shapes are `16x32x16`, `64x256x64`, `128x512x128`, `256x384x128`, and `44x128x16`. Each stream has 126 command words.
+Verify discovery:
 
-Run the real accuracy gate:
-
-```sh
-cargo run --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin fp32out
-```
-
-Observed on this RK3588:
-
-```text
-M64 K4096 N128, Mt=64 Kt=1024 Nt=128, ktiles=4
-FP16-output max abs error = 0.893799
-FP32-output max abs error = 0.000183
-FP32 normalized error     = 0.00000014
-improvement               = 4881.33x
-PASS
-```
-
-`execute_f32` emits FP32 NPU partials (`C2=4`) and accumulates K partials on the host in FP64; it does not depend on an unvalidated FP32 EW mode.
-
-## Scratch reuse and warmed release benchmark
-
-The executor owns grow-only reusable scratch BOs. The normal executor gate now repeats the tiny-M shape and must report `scratch_reuse=PASS`; the second same-shape call must not increase the BO allocation counter.
-
-Phase timing and representative warmed release measurements are produced by:
-
-```sh
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin bench
-```
-
-The benchmark checks deterministic repeated outputs and zero post-warm allocations. Evidence is written to `artifacts/executor-bench.txt`. Benchmark binaries now report devfreq state dynamically: stock Rocket reports devfreq unavailable, while an experimental DVFS driver reports `cur/target/max/governor`. Historical stock examples after safe block/bytemuck packing were about `52 GFLOP/s` end-to-end for `M64/K4096/N512` and about `77 GFLOP/s` for `M256/K1024/N256`; controlled-clock results are documented separately below.
-
-## RK3588 multicore scheduling and persistent pool
-
-One DRM fd does not expose true three-core fan-out: its scheduling entity serializes queued work onto one core. The multicore gate therefore gives every worker its own Rocket fd, BOs, and executor. It preconditions the NPU first, samples worker counts in interleaved order, and uses medians to avoid governor-ramp artifacts:
-
-```sh
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin multicore
-```
-
-Current expected evidence is approximately:
-
-```text
-M256 K384 N256, 40 calls/worker
-1 worker   ~32 aggregate GFLOP/s
-2 workers  ~63 aggregate GFLOP/s   ~1.9-2.0x
-3 workers  ~94 aggregate GFLOP/s   ~2.9x
-PASS
-```
-
-Do not use the discarded cold ordered run that briefly reported >3x scaling; that was a governor/clock-ramp artifact. `artifacts/multicore-probe.txt` contains the preconditioned/interleaved evidence.
-
-The persistent API gate is:
-
-```sh
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin pool
-```
-
-It creates a long-lived `Fp16MatmulPool` with three worker threads/fds, shares A/B through `Arc<[f16]>`, partitions N on 16-channel boundaries, and gathers row-major output. `M256/K384/N768` must match the CPU reference bit-for-bit on both the first and repeated call; worker scratch allocation counts must remain unchanged on the repeat. Repeated warmed runs observed `5.334-5.653 ms` with one worker vs `1.906-2.138 ms` with three (`2.64-2.80x`). Evidence is `artifacts/pool-run.txt`.
-
-
-## Resident/prepacked weight gates
-
-Static B weights can be packed once into a resident Rocket BO and reused without touching B on every inference call:
-
-```sh
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin prepacked
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin prepacked_bench
-```
-
-`prepacked` covers single-tile, simultaneous ragged M/N/K, deep-K EW accumulation, and tiny-M host accumulation. Every result must bit-match `cpu_reference_executor_semantics`, and the repeated call must not increase the scratch allocation counter. `M300/K512/N272` has eight compute jobs but only four unique resident N/K weight tiles because M-axis duplicates are deduplicated.
-
-`prepacked_bench` warms both streaming and resident paths and excludes the one-time prepack cost from repeated-call timing while reporting it separately. Representative observations showed resident weights improving deep-K and prefill workloads by roughly `1.2-1.5x` at the stock 200 MHz-class configuration, with larger packing-phase reductions.
-
-The resident multicore characterization is:
-
-```sh
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin multicore_prepacked
-```
-
-Every worker owns a separate Rocket fd and its own resident B BO. Correctness and zero-post-warm-allocation checks remain enabled.
-
-## Controlled NPU-frequency characterization (experimental reference only)
-
-Stock Armbian Rocket has no `/sys/class/devfreq/fdab0000.npu` node on this host. The live NPU DT nodes carry a 200 MHz assigned clock and no NPU OPP table. To characterize the silicon without changing the project kernel policy, the public GPL-2.0 Rocket DVFS research tree `https://github.com/sky-rk3588/rk3588-npu-gpu.git` was checked out at commit `ed52a89afa8e68fedf636c8e891bd8fc47e82d26`, built against exact `6.18.43-current-rockchip64` headers, loaded temporarily, then removed. It is not production project code. Do this only on a dedicated benchmark host; a shared/service machine must stay on the packaged driver.
-
-Safety conditions used for this experiment:
-
-- no DTB or boot-service changes,
-- dedicated benchmark host only; no Caddy/worker/other long-lived service workload sharing the board,
-- original `vdd_npu_s0 = 800 mV` left unchanged,
-- userspace governor only, with `max_freq` capped to the requested point,
-- tested only 200, 600, and 700 MHz; no >700 MHz point because the research driver requires a higher-voltage guard above 700 MHz,
-- exact resident hardware gate run before performance measurement at 600 and 700 MHz,
-- any `NPU job timed out` is a hard stop for that boot: stop NPU work and reboot before unrelated service use or further benchmark claims,
-- custom driver lowered to 200 MHz before unload; packaged stock Rocket restored and exact gate rerun afterward.
-
-The focused phase-separated probe is:
-
-```sh
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin freq_probe
-```
-
-With the appropriate externally controlled frequency, `M256/K512/N128`, one resident job, 41 repetitions produced:
-
-```text
-200 MHz  wait=0.399286 ms                 wait-effective=84.04 GFLOP/s
-600 MHz  wait=0.181122-0.186955 ms        wait-effective=179.48-185.26 GFLOP/s
-700 MHz  wait=0.125123-0.130957 ms        wait-effective=256.22-268.17 GFLOP/s
-```
-
-Do not infer clock scaling from total executor wall time alone: CPU pack/gather and scheduler noise can move independently. The fence-wait phase is the preferred clock-scaling evidence. `artifacts/dvfs-fp16-summary.txt` records the experiment. After reproduction, restore stock Rocket; normal project tests do not require the external DVFS module.
-
-
-## Project-owned tensor/op contract gate
-
-The high-level MatMul boundary can be tested without exposing Rocket commands to the caller:
-
-```sh
-cargo test --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocknpu-tensor -p rocknpu-ops
-cargo run --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin ops_contract
-```
-
-The gate requires all of the following:
-
-```text
-ops single-fp16 PASS shape=64x256x64
-ops single-fp32 PASS shape=64x256x64 max_abs_error=0
-ops pool-fp16 PASS shape=64x256x96 workers=3
-ops auto-cpu-fallback PASS shape=3x7x5
-PASS: project-owned tensor/op MatMul contract hardware gate
-```
-
-`Auto` must not pad an unsupported shape: the unaligned case proves it routes to the independent `rocknpu-ops` CPU implementation. `NpuPool + Fp32Accurate` remains intentionally unsupported until that path has its own hardware gate.
-
-## C/open reference UAPI gate
-
-Pinned source: `reference/rocket-userspace` at commit `1a181cd69fd98fafa998cfeca963d35cb5f43c46`.
-
-```sh
-cmake -S reference/rocket-userspace -B reference/rocket-userspace/build-ref -G Ninja -DROCKETNPU_BUILD_TESTS=ON
-cmake --build reference/rocket-userspace/build-ref --target uapi_selftest_rocket matmul_fp16_rocket -j 4
-reference/rocket-userspace/build-ref/uapi_selftest_rocket
-ROCKET_TEST_SEED=0x3588 reference/rocket-userspace/build-ref/matmul_fp16_rocket 4 32 16
-```
-
-Observed on this host: UAPI self-test `14 checks, 0 failed`; deterministic FP16 MatMul `OK: [4,32]x[16,32]`.
-
-
-## First ONNX hybrid model gate
-
-The first model-format gate is a real serialized ONNX model, not an in-memory graph:
-
-```sh
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin tiny_model
-```
-
-Expected graph:
-
-```text
-input [4,32]
-MatMul -> Add -> Relu -> MatMul -> Add
-output [4,16]
-```
-
-The two MatMul nodes run through the stock-Rocket RK3588 NPU backend; Add and Relu run on CPU. The binary compares against the same graph forced to CPU and requires `mismatches=0`. It writes `artifacts/tiny-mlp.onnx`, CPU/NPU FP16 output binaries, and `artifacts/tiny-mlp-run.txt`.
-
-Independent format validation:
-
-```sh
-python3 -c "import onnx; m=onnx.load('/home/kautism/rocknpu/artifacts/tiny-mlp.onnx'); onnx.checker.check_model(m); print('PASS')"
-```
-
-Observed: Python ONNX 1.17 checker PASS, IR 9, opset 13, operations `MatMul/Add/Relu/MatMul/Add`, input `[4,32]`, output `[4,16]`. The Rust ONNX dependency uses `onnx-protobuf 0.2.3`; protobuf is intentionally pinned to exactly `3.4.0` because that generated crate performs a compile-time protobuf-version check.
-
-## Environment evidence
-
-```sh
-cat artifacts/environment.txt
-cat artifacts/rust-run.log
-```
-
-Do not treat a successful compile as the hardware gate. `rocket-smoke` must run on RK3588 and report zero mismatches.
-
-## Independent tiny-model numerical verification
-
-After `cargo run --release -p rocket-smoke --bin tiny_model`, run:
-
-```sh
-python3 scripts/verify_tiny_model.py
-```
-
-Expected: all five ONNX node outputs report `fp16_bits=True`, `fp32_exact=True`, `max_abs=0`, followed by `PASS: ONNX ReferenceEvaluator == NumPy node trace == RK3588 NPU, max_abs_error=0`. This verifier is intentionally outside the Rust importer/backend path.
-
-
-## External pretrained MNIST MLP gate
-
-Source model: Pico-CNN `data/mnist_mlp/mnist_mlp.onnx` (BSD-3-Clause), SHA-256 `967612db6a1724e85101d5e11aaed3322d7d52ddd65f9af910fa8c71cf88c7cd`. Canonical MNIST test data comes from the CVDF mirror of the original MNIST dataset. Pico-CNN's example normalizes input pixels to `[0,1]`; the gate uses the first 50 test images, matching the model's declared batch.
-
-After fetching the model/data and producing the independent ONNX reference artifacts, run:
-
-```sh
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin real_mnist
-python3 /home/kautism/rocknpu/scripts/verify_real_mnist.py
-```
-
-Expected hardware evidence on stock Rocket:
-
-```text
-model_nodes=7
-gemm_npu=4
-padded_npu=4
-relu_cpu=3
-ref_pred_match=50/50
-ref_accuracy=49/50
-npu_accuracy=49/50
-ref_npu_max_abs=0.056854248
-ref_npu_mean_abs=0.011868
-```
-
-The independent verifier must report seven trace nodes, NumPy final output exactly equal to the saved ONNX ReferenceEvaluator FP32 output, and `npu_top1_vs_ref=50/50`. Current per-node maximum absolute FP32-reference errors are approximately `0.01724, 0.00622, 0.01764, 0.01753, 0.06614, 0.04184, 0.05685`. These are FP16-lowering errors; top-1 must remain identical for this gate.
-
-
-## Prepared pretrained MNIST model-session gate
-
-Prepare the four Gemm weights once into resident Rocket BOs, drop the parsed ONNX model, and repeatedly execute using only the prepared session plus activation input:
-
-```sh
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin prepared_mnist
-```
-
-Current accepted evidence is approximately:
-
-```text
-prepared MNIST PASS
-dense=4 padded=4
-resident_MB=3.218 resident_tiles=21
-prepare_wall_ms=3.52-3.56 weight_pack_ms=1.42-1.44
-streaming_median_ms=6.53-6.56
-prepared_median_ms=5.02-5.10
-speedup=1.28-1.31x
-scratch_allocs=5 scratch_grows=0
-top1_ref=50/50 accuracy=49/50
-bit_identical_streaming=true
-model_dropped_before_prepared_runs=true
-```
-
-Then independently validate every prepared-session node against the original FLOAT ONNX graph:
-
-```sh
-python3 scripts/verify_real_mnist.py prepared-mnist-npu
-```
-
-Expected final lines include `numpy_final_vs_onnx_reference_exact=True`, `npu_top1_vs_ref=50/50`, and `PASS`. The per-node error profile must match the accepted streaming path; the current final Gemm is `max_abs=0.05685425`, `mean_abs=0.01186811`. Evidence files are `artifacts/prepared-mnist-run.txt`, `artifacts/prepared-mnist-npu-trace.tsv`, and `artifacts/prepared-mnist-npu-trace-f16.bin`.
-
-This gate proves that resident/prepacked static weights survive after the parsed source model is dropped and that warmed inference performs no new executor scratch allocation. It does not yet prove reuse across a different batch/M geometry; that is the next residency milestone.
-
-
-## Dynamic-batch resident MNIST gate
-
-Prepare one M-compatible resident model and reuse exactly the same static BOs for several batch sizes:
-
-```sh
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin dynamic_batch_mnist
-python3 scripts/verify_real_mnist.py dynamic-mnist-npu
-```
-
-Accepted stock-Rocket evidence:
-
-```text
-dynamic MNIST PASS batches=[1,4,16,50]
-dense=4 m_compatible=4 resident_MB=3.213 resident_tiles=31
-batch 1/4/16/50 top1_ref = 1/1, 4/4, 16/16, 50/50
-post-max-M-warm scratch allocation/growth unchanged
-batch50 final max_abs=0.08248138 mean_abs=0.01110571
-```
-
-The larger error than fixed-M preparation is an accepted consequence of the conservative M-invariant K tiling, not a license to skip the independent oracle.
-
-## Worker-local resident pool gates
-
-First validate the pool resident protocol directly:
-
-```sh
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin pool_prepared
-```
-
-Expected current evidence for `M256/K384/N768`: three worker-local resident copies, exact CPU-oracle results at `M64/128/256`, no post-warm worker scratch growth, explicit release PASS, and roughly `1.11x` resident-vs-streaming warmed improvement on this stock run.
-
-Then run the full prepared pool model:
-
-```sh
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin pool_model_mnist
-python3 scripts/verify_real_mnist.py pool-mnist-npu
-```
-
-Accepted evidence:
-
-```text
-pool model MNIST PASS workers=3 dense=4
-resident_copies=10 resident_MB=3.217 resident_tiles=37
-model_dropped=true release=true
-batch 1/4/16/50 top1_ref = 1/1, 4/4, 16/16, 50/50
-batch50_median_ms=5.343
-independent final max_abs=0.06208801 mean_abs=0.01178154
-```
-
-Do not infer that three workers should be Auto-selected for this model: the full-model median is not materially better than the single-worker prepared path.
-
-
-## Persistent FP32 pool gate
-
-```sh
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin pool_fp32
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin ops_contract
-```
-
-Expected characteristics: integer `M64/K256/N96` is exact; deterministic fractional `M64/K4096/N192` stays near `1e-7` normalized RMS versus the f64 CPU reference, repeated output is stable, and scratch allocation/grow counters do not change after the deep-shape warmup. `ops_contract` must also report `ops pool-fp32 PASS` through the public `PoolNpuBackend` API.
-
-## Adaptive streaming Auto policy gate
-
-```sh
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin auto_worker_probe
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin auto_tuned
-```
-
-`auto_worker_probe` is characterization evidence, not a fixed expected winner table. `auto_tuned` must show that each aligned shape receives a cached 1/2/3-worker choice, a repeated call reuses the cache, FP16/FP32 differential thresholds pass, and an unaligned Auto request falls back to CPU without changing cache size.
-
-## Resident lifecycle / low-4-GiB stress
-
-```sh
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin lifecycle_stress
-```
-
-Current bounded gate alternates warmed shapes for 128 executions, performs 128 resident prepare/drop cycles, holds 96 `K1024/N512` resident copies concurrently (about 100.7 MB), drops them, reallocates and executes again, then performs 48 pool prepare/release cycles and requires a released handle to be rejected. Every resident DMA range must remain below `u32::MAX`.
-
-
-## Official MNIST-8 CNN gate
-
-Source model: ONNX Model Zoo / `onnxmodelzoo/mnist-8`, SHA-256 `2f06e72de813a8635c9bc0397ac447a601bdbfa7df4bebc278723b958831c9bf`. It is the pretrained CNTK MNIST CNN published by the model zoo (IR 3, opset 8). The gate uses the first 100 canonical MNIST test images normalized to `[0,1]`.
-
-First validate the project-owned FP16 Conv lowering and the two real model layers:
-
-```sh
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin conv_fp16
-cargo run --release --manifest-path /home/kautism/rocknpu/Cargo.toml -p rocket-smoke --bin conv_mnist8_layers
-```
-
-`conv_fp16` must report zero mismatches for `IC32/H8/W8 -> OC16`, 5x5 pad2. The real-layer gate must show Conv1 (`IC1->OC8`, padded to `IC32->OC16`) bit-exact to the FP16 CPU oracle and Conv2 (`IC8->OC16`, padded to `IC32->OC16`) within the accepted one-result / `7.63e-6` FP16 rounding difference.
-
-Then run the full graph with both Conv nodes and the final MatMul on NPU:
-
-```sh
-cargo run --release --manifest-path /build/rocknpu/Cargo.toml -p rocket-smoke --bin mnist8_cnn_npu
-python3 /build/rocknpu/scripts/verify_mnist8.py mnist8-allnpu
-```
-
-Accepted stock-Rocket evidence:
-
-```text
-MNIST-8 CNN ALL-NPU-COMPUTE PASS nodes=12
-conv_nodes=2 conv_npu=2 pool_cpu=2 reshape_cpu=2 add_cpu=3 relu_cpu=2
-matmul_npu=1 padded_npu=1
-top1_ref=100/100
-ref_accuracy=98/100 npu_accuracy=98/100
-max_abs=0.02100563 mean_abs=0.00299615
-```
-
-The Python verifier must report `onnx_checker=PASS node_count=12 trace_count=12`, compare every intermediate output requested directly from ONNX `ReferenceEvaluator`, and finish with `final_top1_match 100 /100` plus PASS. Current sample-0 maximum errors include first NPU Conv `0.00177240`, second NPU Conv `0.00469589`, NPU MatMul `0.00604439`, and final Add `0.01325989`. Across all 100 samples the final maximum is `0.02100563`.
-
-Prepared Conv residency has separate low-level and full-graph gates:
-
-```sh
-cargo run --release --manifest-path /build/rocknpu/Cargo.toml -p rocket-smoke --bin conv_prepared
-cargo run --release --manifest-path /build/rocknpu/Cargo.toml -p rocket-smoke --bin mnist8_cnn_prepared
-python3 /build/rocknpu/scripts/verify_mnist8.py mnist8-prepared
-cargo run --release --manifest-path /build/rocknpu/Cargo.toml -p rocket-smoke --bin conv_prepared_bench
-cargo run --release --manifest-path /build/rocknpu/Cargo.toml -p rocket-smoke --bin mnist8_conv_bench
-```
-
-The prepared model must report two resident Conv tensors / 51,200 bytes, Conv scratch `weight_bytes=0`, no post-first-inference scratch growth, the same 100/100 top-1/reference trace result, and bit-identical streaming/prepared layer outputs. Representative warmed layer medians were `0.2080 -> 0.1945 ms` and `0.1207 -> 0.1070 ms`; a 40-inference block full-model comparison measured `0.9626 -> 0.8066 ms` (`1.194x`). Treat single sub-millisecond samples as scheduler-noisy and prefer the block result.
-
-## Edge-infer CIFAR-10 pretrained model gate
-
-Run the real RGB pretrained model on stock RK3588 Rocket:
-
-```sh
-cargo run --release --manifest-path /build/rocknpu/Cargo.toml -p rocket-smoke --bin cifar10_edgeinfer
-```
-
-Then independently validate all 13 intermediate tensors and final prediction against the original ONNX model:
-
-```sh
-cd /build/rocknpu
-python3 scripts/verify_cifar10_edgeinfer.py
-```
-
-Expected high-level result: three Conv and two Gemm nodes execute on NPU, prediction is class 8 (`ship`), each trace node remains within the verifier's ONNX-reference bound, CPU/NPU cross-backend max absolute difference is <= `0.002`, and final FP16 logits are bit-identical. The current measured cross-backend maximum is `0.00097656`.
-
-## High-level `rocknpu::Session` hardware gate
-
-Run the public Session API against the same real models from the formal build workspace:
-
-```sh
-cd /build/rocknpu
-cargo run -p rocket-smoke --bin session_models
-```
-
-This gate constructs each model through `rocknpu::Session::load`, so ONNX parsing and supported static weight preparation happen once before inference. It then exercises repeated `Session::run` calls without exposing `RocketDevice`, IOVA, register commands, or executor internals to the caller.
-
-Current accepted RK3588 evidence:
-
-```text
-MNIST-8:
-  eager resident weights = 2 Conv + 1 dense, 59,392 bytes
-  NPU placement = 2 Conv + 1 MatMul
-  top1 vs saved ONNX reference = 100/100
-  accuracy = 98/100
-  final max_abs = 0.02100563
-
-edge-infer CIFAR-10:
-  eager resident weights = 3 Conv + 2 dense, 104,448 bytes
-  NPU placement = 3 Conv + 2 Gemm
-  prediction = 8 (ship), reference = 8
-  final max_abs = 0.00475883
-```
-
-The Session gate checks final outputs against saved independent FP32 reference artifacts and checks the execution statistics/placement contract. It does not replace the trace-level standard oracle. After changing Session/frontend/backend behavior, also run the existing independent verifiers:
-
-```sh
-cargo run -p rocket-smoke --bin mnist8_cnn_prepared
-python3 scripts/verify_mnist8.py mnist8-prepared
-cargo run -p rocket-smoke --bin cifar10_edgeinfer
-python3 scripts/verify_cifar10_edgeinfer.py
-cargo run -p rocket-smoke --bin prepared_mnist
-python3 scripts/verify_real_mnist.py prepared-mnist-npu
-```
-
-All generated evidence remains under `/build/rocknpu/artifacts/` and is gitignored.
-
-## High-level `rocknpu run` CLI gate
-
-The CLI uses standard C-order `float32` NumPy `.npy` files and the same Session runtime as the Rust API. Build the two checked input files from the existing canonical artifacts:
-
-```sh
-cd /build/rocknpu
-python3 -c "import numpy as np; x=np.fromfile('artifacts/mnist8-input100-f32.bin',dtype='<f4').reshape(100,1,28,28); np.save('artifacts/cli-mnist8-input.npy',x[:1]); x=np.fromfile('artifacts/cifar10-edgeinfer-input-f32.bin',dtype='<f4').reshape(1,3,32,32); np.save('artifacts/cli-cifar10-input.npy',x)"
-```
-
-First validate the file/CLI contract without NPU dependence:
-
-```sh
-cargo run -p rocknpu -- run artifacts/mnist-8.onnx --input artifacts/cli-mnist8-input.npy --output artifacts/cli-mnist8-cpu.npy --target cpu
-cargo run -p rocknpu -- run artifacts/cifar10-edgeinfer.onnx --input artifacts/cli-cifar10-input.npy --output artifacts/cli-cifar10-cpu.npy --target cpu
-```
-
-Then run the identical interface on Rocket/NPU:
-
-```sh
-cargo run -p rocknpu -- run artifacts/mnist-8.onnx --input artifacts/cli-mnist8-input.npy --output artifacts/cli-mnist8-npu.npy
-cargo run -p rocknpu -- run artifacts/cifar10-edgeinfer.onnx --input artifacts/cli-cifar10-input.npy --output artifacts/cli-cifar10-npu.npy
-```
-
-Current accepted debug-build RK3588 evidence:
-
-```text
-MNIST-8 CLI NPU:
-  resident_bytes=59392
-  npu_conv=2 npu_dense=1
-  output shape=(1,10)
-  max_abs vs saved FP32 reference=0.0132598877
-
-CIFAR-10 CLI NPU:
-  resident_bytes=104448
-  npu_conv=3 npu_dense=2
-  output shape=(1,10)
-  prediction=8 (ship)
-  max_abs vs saved FP32 reference=0.0047588348
-```
-
-Finally prove NumPy can read the RockNPU-produced files and that top-1 remains equal to the saved references:
-
-```sh
-python3 -c "import numpy as np; a=np.load('artifacts/cli-mnist8-npu.npy'); r=np.fromfile('artifacts/mnist8-ref100-f32.bin',dtype='<f4').reshape(100,10)[:1]; assert a.dtype==np.float32 and a.shape==(1,10) and a.argmax(1)[0]==r.argmax(1)[0]; a=np.load('artifacts/cli-cifar10-npu.npy'); r=np.fromfile('artifacts/cifar10-edgeinfer-ref-f32.bin',dtype='<f4').reshape(1,10); assert a.dtype==np.float32 and a.shape==(1,10) and a.argmax(1)[0]==r.argmax(1)[0]==8; print('PASS: rocknpu CLI NumPy round-trip + RK3588 inference')"
-```
-
-This gate proves the documented end-user ONNX command path itself, rather than only the lower-level smoke binaries. It does not expand the ONNX operator set or claim general NumPy dtype/layout support.
-
-## TinyLlama GGUF autoregressive hardware gates
-
-The first real LLM gate uses `TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf`. The validated artifact is 667,814,880 bytes and can be fetched from the public second-state TinyLlama GGUF mirror:
-
-```sh
-cd /build/rocknpu
-curl -L --fail --retry 3 \
-  -o artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf \
-  https://huggingface.co/second-state/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf
-stat -c '%s %n' artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf
-```
-
-Expected size:
-
-```text
-667814880 artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf
-```
-
-Run the RockNPU first-token path on the real RK3588 NPU:
-
-```sh
-cargo run -p rocket-smoke --bin llm_gguf -- \
-  artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf Hello npu
-```
-
-Accepted model metadata and result:
-
-```text
-vocab_size=32000 hidden_size=2048 intermediate_size=5632
-layers=22 heads=32 kv_heads=4 head_dim=64 context=2048
-rope_theta=10000 rope_style=Normal
-LLM GGUF FIRST TOKEN PASS target=npu prompt_tokens=2 padded_tokens=4 token_id=29892 text="," npu_linears=154 cpu_linears=1
-```
-
-The 154 NPU Linears are exactly seven projections across each of 22 transformer blocks. The current LM head is the one CPU Linear because M=1 decode/GEMV has not yet been optimized for the NPU. Quantized GGUF layer weights are converted to FP16 before preparation; only one block's prepared projection weights need to be resident at a time.
-
-First compare with the separate `llama-gguf` CPU model implementation:
-
-```sh
-cargo run -p rocknpu-llm --example gguf_reference -- \
-  artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf Hello
-```
-
-Expected:
-
-```text
-LLAMA-GGUF REFERENCE FIRST TOKEN prompt_tokens=2 token_id=29892 text=","
-```
-
-A stronger oracle uses an external llama.cpp checkout outside the RockNPU tree. The accepted run used llama.cpp commit `391fac16460f15233a7740550d858ac96df3419d`; it is validation material, not a RockNPU dependency:
-
-```sh
-git clone https://github.com/ggml-org/llama.cpp.git /build/llama.cpp-reference
-git -C /build/llama.cpp-reference checkout 391fac16460f15233a7740550d858ac96df3419d
-cmake -S /build/llama.cpp-reference -B /build/llama.cpp-reference/build \
-  -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF
-cmake --build /build/llama.cpp-reference/build --target llama-completion -j 8
-/build/llama.cpp-reference/build/bin/llama-completion \
-  -m /build/rocknpu/artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf \
-  -no-cnv -p Hello -n 1 --temp 0 --no-warmup --verbose-prompt --log-verbosity 0
-```
-
-The raw completion is `Hello,`, so the first generated token text is again `","`. `-no-cnv` is required: allowing the model's chat template changes the prompt semantics and is not the same gate.
-
-### Autoregressive KV-cache gate
-
-The runtime now retains one K/V cache per transformer layer and performs incremental one-token decode. During prefill, only the real prompt rows are cached even when end-padding is added to make the NPU MatMul row count legal. After each layer's prefill, its Rocket resident-weight BOs are released while the one-time dequantized FP16 matrices are retained for the current CPU M=1 decode path.
-
-Use a high-margin sequence to make exact cross-runtime greedy comparison meaningful:
-
-```sh
-cargo run --release -p rocket-smoke --bin llm_gguf -- \
-  artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf \
-  "1, 2, 3, 4, 5, 6, 7, 8," npu 32
-```
-
-Accepted RK3588 result:
-
-```text
-prompt_tokens=25 padded_tokens=28
-text=" 9, 10, 11, 12, 13, 14, 15, 16, "
-prefill_npu=154 prefill_cpu=0
-decode_npu=0 decode_cpu=4774 lm_head_cpu=32
-```
-
-The exact 32 generated token IDs are:
-
-```text
-[29871, 29929, 29892, 29871, 29896, 29900, 29892, 29871,
- 29896, 29896, 29892, 29871, 29896, 29906, 29892, 29871,
- 29896, 29941, 29892, 29871, 29896, 29946, 29892, 29871,
- 29896, 29945, 29892, 29871, 29896, 29953, 29892, 29871]
-```
-
-Run the independent Rust CPU model with the same prompt and token budget:
-
-```sh
-cargo run --release -p rocknpu-llm --example gguf_reference -- \
-  artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf \
-  "1, 2, 3, 4, 5, 6, 7, 8," 32
-```
-
-It must reproduce all 32 IDs and the same decoded string. The separately built llama.cpp raw-completion oracle must also produce the same sequence; the validated numeric prompt has large top-1/top-2 margins throughout, making it suitable for an exact greedy gate.
-
-A semantic prompt is also exercised:
-
-```text
-The capital of France is -> " Paris.\n\n2. B."
-```
-
-RockNPU, `llama-gguf`, and llama.cpp agree on the first eight generated tokens. Extending that particular greedy sequence exposes a useful precision boundary at token 9: llama.cpp's native Q4_K path ranks token `29907` (`C`) above token `315` (` C`) by about `0.125`, while the FP16-dequantized Rust reference ranks `315` above `29907` by about `0.040`. Once either near-tied token is chosen, later greedy history naturally diverges.
-
-Therefore exact greedy token identity is a hard cross-runtime requirement only on numerically stable reference steps. Near-tied candidates must be investigated with logits and reported as numerical precision divergence rather than mislabeled as a K/V-state failure. The project also keeps a unit differential where cached single-token decode matches full-sequence recomputation for the same transformer block.
-
-This remains a correctness milestone rather than a performance claim. Q4_K_M weights are currently converted to FP16, prefill uses the NPU, and M=1 projection/LM-head decode stays on CPU. The next performance work is native quantized execution and a validated NPU GEMV/decode path.
-
-## Stock GGML dynamic-backend gate
-
-RockNPU can be loaded by an unmodified llama.cpp build as an out-of-tree GGML backend. The validated external ABI is llama.cpp commit `391fac16460f15233a7740550d858ac96df3419d`; GGML ABI types remain confined to `adapters/ggml-rocknpu`.
-
-Build the adapter and its Rust C ABI sidecar:
-
-```sh
-cmake -S adapters/ggml-rocknpu \
-  -B target/ggml-rocknpu \
-  -DGGML_SOURCE_DIR=/build/llama.cpp-reference/ggml \
-  -DGGML_CPU_LIBRARY=/build/llama.cpp-reference/build-native-0920/bin/libggml-cpu.so
-cmake --build target/ggml-rocknpu -j 8
-```
-
-First prove stock llama.cpp discovers the real Rocket-backed device:
-
-```sh
-GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" \
-  /build/llama.cpp-reference/build/bin/llama-cli --list-devices
-```
+    "$LLAMA_CPP_DIR/build-rocknpu/bin/llama-cli" --list-devices
 
 Expected device:
 
-```text
-ROCKNPU0: RockNPU RK3588
-```
+    ROCKNPU0: RockNPU RK3588
 
-Then run one deliberately narrow stock GGML correctness test:
+## 9. TinyLlama W8 sidecar
 
-```sh
-GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" \
-  /build/llama.cpp-reference/build/bin/test-backend-ops \
-  test -b ROCKNPU0 -o MUL_MAT \
-  -p type_a=f16,type_b=f32,m=16,n=4,k=256
-```
+The W8 sidecar must match the exact source GGUF.
 
-Accepted result:
+Before performance testing, verify the sidecar manifest source hash equals the model SHA-256.
 
-```text
-MUL_MAT(type_a=f16,type_b=f32,m=16,n=4,k=256,...): OK
-1/1 tests passed
-Backend ROCKNPU: OK
-```
+Current canonical TinyLlama model hash:
 
-The test data and CPU reference are owned by stock llama.cpp. The RockNPU path is `GGML -> libggml-rocknpu.so -> rocknpu-capi -> Fp16MatmulExecutor -> RocketDevice -> RK3588 NPU`.
+    5c66751b61537f9e55177b1b67e06af88e0e2df88f86de4909f5bf87fb1ae583
 
-### Q4_K / Q6_K and real TinyLlama through stock GGML
+Do not reuse a sidecar generated from another GGUF revision.
 
-For ordinary `GGML_BACKEND_PATH` auto-loading, configure the same unmodified llama.cpp source with its dynamic-backend option enabled:
+## 10. Decode benchmark
 
-```sh
-cmake -S /build/llama.cpp-reference \
-  -B /build/llama.cpp-reference/build-dl \
-  -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON
-cmake --build /build/llama.cpp-reference/build-dl \
-  --target llama-completion test-backend-ops -j 8
-```
+The repository script runs interleaved CPU/NPU measurements and stores raw evidence.
 
-The older reference build used `GGML_BACKEND_DL=OFF`; with a statically registered CPU backend, ordinary `llama_backend_init()` does not call `ggml_backend_load_all()`. That build remains valid for tools such as `test-backend-ops` that explicitly load all backends, but `build-dl` is the clean external-plugin reproduction path.
+Example:
 
-Run the stock Q4_K oracle:
+    python3 scripts/bench_llama_cpu_npu.py \
+      --bench "$LLAMA_CPP_DIR/build-rocknpu/bin/llama-bench" \
+      --plugin "$ROCKNPU_DIR/target/ggml-rocknpu/libggml-rocknpu.so" \
+      --model /path/to/TinyLlama.gguf \
+      --sidecar /path/to/w8-sidecar \
+      --output /tmp/rocknpu-abba \
+      --mode decode \
+      --tokens 128 \
+      --reps 3 \
+      --blocks 2
 
-```sh
-GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" \
-  /build/llama.cpp-reference/build-dl/bin/test-backend-ops \
-  test -b ROCKNPU0 -o MUL_MAT -p q4_K
-```
+Before timing, set CPU policies 0/4/6 to performance so host-side comparison is reproducible.
 
-Accepted result: `7/7 tests passed`, `Backend ROCKNPU: OK`. The stock oracle's M=1 sample uses K=256. K=256 is now inside the validated W8A8 M=1 full-K envelope; the hardware gates below include direct K=256 bit-exact checks as well as the real-model K=2048 path.
+The benchmark script records:
 
-Run the stock Q6_K oracle:
+- command;
+- model/plugin/binary hashes;
+- CPU policy/frequency snapshot;
+- temperature snapshot;
+- per-process raw stdout/stderr;
+- result rows;
+- block speedups.
 
-```sh
-GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" \
-  /build/llama.cpp-reference/build-dl/bin/test-backend-ops \
-  test -b ROCKNPU0 -o MUL_MAT -p q6_K
-```
+## 11. Small performance claims
 
-Accepted result: `3/3 tests passed`, `Backend ROCKNPU: OK`.
+For expected gains below about 5%, independent process-to-process comparisons are too noisy.
 
-The Q4_K/Q6_K bridge forwards raw GGML quantized blocks into Rust. `M>=4` uses the existing FP16 correctness bridge. Supported `M=1` weights are lazily dequantized/requantized to W8A8 once, packed into resident Rocket BOs, cached by stable GGML weight identity plus dtype/shape, then reused across decode tokens. Each call only quantizes the activation, submits INT8 MatMul through Rocket, and rescales int32 output to F32.
+Use:
 
-For the resident-cache real-model gate, first run stock CPU with the four-token prompt `The capital of` and `-n 3`; greedy generation produces `" the United States"`. Then run:
+1. one model/context/backend process when possible;
+2. warm baseline and candidate;
+3. interleaved ABBA order;
+4. enough repetitions to inspect block direction;
+5. deterministic correctness gate in the same code revision.
 
-```sh
-ROCKNPU_GGML_TRACE=1 \
-GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" \
-  /build/llama.cpp-reference/build-dl/bin/llama-completion \
-  -fit off -ngl 0 \
-  -m artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf \
-  -no-cnv -p "The capital of" -n 3 --temp 0 --no-warmup --verbose-prompt
-```
+Projection-pair work historically required this discipline.
 
-The RockNPU run produces the same `" the United States"` continuation. Opt-in execution tracing at the actual backend boundary proves the transition from M=4 prefill to true M=1 decode and exposes cache behavior:
+## 12. Cold vs hot execution
 
-```text
-ROCKNPU GGML TRACE mul_mat weight=blk.0.attn_q.weight type=q4_K M=4 K=2048 N=2048 path=fp16_bridge
-...
-ROCKNPU GGML TRACE mul_mat weight=blk.21.ffn_gate.weight type=q4_K M=1 K=2048 N=5632 path=w8a8_m1
-ROCKNPU GGML TRACE mul_mat weight=blk.21.ffn_down.weight type=q4_K M=1 K=5632 N=2048 path=w8a8_m1
-ROCKNPU GGML TRACE mul_mat weight=blk.0.attn_q.weight type=q4_K M=1 K=2048 N=2048 path=w8a8_m1
-...
-ROCKNPU GGML TRACE summary q4_K_mul_mat=402 q6_K_mul_mat=60 f16_mul_mat=0 w8a8_m1_mul_mat=311
-ROCKNPU GGML TRACE decode_cache hits=157 misses=154 entries=154 resident_mb=924.00 hit_ms=206.36 hit_avg_ms=1.314 miss_ms=11304.78 miss_avg_ms=73.408 tuned_shapes=4 worker_calls=[0,88,223] ksplit_calls=45
-```
+Always state whether timing includes:
 
-The cache contains exactly the 154 transformer-block projection weights (`22 layers x 7`). Across the `-n 3` run it records 154 misses while the cache is populated and 157 hits as already prepared weights are reused. Production decode owns a persistent three-fd worker pool. Every `(K,N)` geometry tunes effective 1/2/3-worker N-splits; when K is large enough that the single-worker executor would issue multiple sequential tasks, 2/3-worker K-splits are also candidates. All candidates are prepared, warmed once, measured with three forward/reverse-interleaved samples, and a later candidate must beat the currently selected one by at least 5%. The winning split topology plus worker count is cached by shape and loser resident BOs are released; there is no TinyLlama-specific routing table. Two identical final runs selected the same distribution, `worker_calls=[0,88,223]` and `ksplit_calls=45`; their hit averages were `1.411 ms` and `1.314 ms`, versus `1.485 ms` before K-split and `2.573 ms` on the older single-fd resident path. The latest run's 157 hits total `206.36 ms`, so 154 projection calls at that measured average are about `202 ms` before remaining CPU-side model work. This is still slower than the separately measured optimized llama.cpp CPU decode baseline (~49.4 ms/token). `output.weight` remains on CPU because N=32000 exceeds the W8A8 N<=8192 envelope.
+- model loading;
+- sidecar loading;
+- first dequantization;
+- prepared-weight creation;
+- first cache fill;
+- steady-state cache hits.
 
-### W8A8 M=1 decode through upstream Rocket
+A cold-start optimization is not a decode optimization.
 
-RockNPU's M=1 work was accelerated by ork-driver's public RK3588 INT8/W8A8 research. The directly source-derived baseline regcmd template is isolated in `crates/rocknpu-regcmd/src/int8/ork_isc.rs` under its original ISC notice; the surrounding Rust encoder, executor, BO management, IOVA ownership, task submission, synchronization, and Rocket integration are MIT RockNPU code. The upstream notice is also preserved in `docs/licenses/ork-driver-ISC.txt`.
+## 13. Current clean reference checks
 
-Build the two hardware gates:
+The 2026-09-22 consolidation revalidated current main with the ordinary public device interface after a fresh reboot.
 
-```sh
-cargo build --release -p rocket-smoke --bin int8_decode_m1 --bin int8_decode_widek
-```
+Confirmed again:
 
-The single-submit M=1 gate accepts the current validated full-K envelope (`K % 256 == 0`, `K <= 4096`, `N % 32 == 0`, `N <= 8192`) and exact-compares every int32 output against a CPU dot-product oracle. K=256 was revalidated on current main with both a small and wide N shape; TinyLlama projection shapes use the same path:
+- M=1 K=5632 N=2048 exact decode;
+- M128 K=2048 N=2048 exact M-tile;
+- fused residual M16/K2048/N2048;
+- repeated M128 weight-reuse gate;
+- M128 > M64 on a 100%-acceptance lookup A-B-B-A.
 
-```sh
-./target/release/int8_decode_m1 256 64
-./target/release/int8_decode_m1 256 2048
-./target/release/int8_decode_m1 2048 256
-./target/release/int8_decode_m1 2048 2048
-./target/release/int8_decode_m1 2048 5632
-```
+See docs/research-status.md for the current interpretation and priority order.
 
-Observed exact gates:
+## 14. Evidence policy
 
-```text
-INT8 PREPARED DECODE PASS M=1 K=256 N=64 outputs=64 ...
-INT8 PREPARED DECODE PASS M=1 K=256 N=2048 outputs=2048 ...
-INT8 DECODE PASS M=1 K=2048 N=256  outputs=256  regcmd_count=112 submit_wait_us=660.9
-INT8 DECODE PASS M=1 K=2048 N=2048 outputs=2048 regcmd_count=112 submit_wait_us=1575.6
-INT8 DECODE PASS M=1 K=2048 N=5632 outputs=5632 regcmd_count=112 submit_wait_us=3905.9
-```
+A promoted claim must include:
 
-TinyLlama's FFN-down projection has `K=5632`, beyond the verified single-submit schedule. Following ork-driver's wide-K decode strategy, `int8_decode_widek` splits K into five 1024-wide slices plus one 512-wide tail, executes six NPU int32 partials through Rocket, then host-accumulates them exactly:
+- RockNPU commit;
+- model hash;
+- llama.cpp revision;
+- plugin/binary hashes;
+- exact environment variables;
+- command;
+- correctness result;
+- raw timing evidence.
 
-```sh
-./target/release/int8_decode_widek
-```
-
-Observed gate:
-
-```text
-INT8 WIDE-K DECODE PASS M=1 K=5632 N=2048 slices=6 outputs=2048 submit_wait_us=4121.8 host_accum_us=32.1
-```
-
-The prepared-weight hardware gate exact-checks both the first execution and a second reuse of the same Rocket-resident BO. Representative observations: K=2048,N=5632 prepares once in about `134.7 ms`, then per-call host staging is about `0.02 ms` and NPU submit/wait about `3.9-4.1 ms`; K=5632,N=2048 prepares once in about `89.4 ms`, then staging is about `0.07 ms` and NPU submit/wait about `4.4 ms`. GGML uses this prepared path automatically.
-
-The persistent multicore characterization gate is:
-
-```sh
-cargo build --release -p rocket-smoke --bin int8_decode_multicore
-./target/release/int8_decode_multicore 2048 5632 3
-./target/release/int8_decode_multicore 2048 2048 2
-./target/release/int8_decode_multicore 2048 256 2
-./target/release/int8_decode_multicore 5632 2048 3
-```
-
-It gives each worker an independent Rocket fd/IOMMU domain, stores only that worker's aligned N slice of the resident weight, gathers int32 slices in original order, and exact-compares against the CPU dot-product oracle. Representative N-split medians were `3.960 -> 1.647 ms` (`2.40x`) for K2048/N5632 with three workers, `1.598 -> 0.985 ms` (`1.62x`) for K2048/N2048 with two, approximately no material gain for K2048/N256, and about `4.24 -> 1.79 ms` for K5632/N2048 with three. Timing decomposition on current hardware shows the worker hot path is submit/wait dominated: for K2048/N5632 about `1.39 ms` of roughly `1.45 ms` worker total is submit/wait, while packing is about `0.015 ms`; K2048/N2048 shows the same pattern at roughly `0.78 ms` submit/wait versus `0.012 ms` packing. Therefore persistent scratch/regcmd caching has only low-single-digit percentage headroom here.
-
-For wide K, compare a K-split that gives each of the three fds a full-N partial dot product and accumulates int32 results on the host:
-
-```sh
-cargo build --release -p rocket-smoke --bin int8_decode_ksplit
-./target/release/int8_decode_ksplit
-```
-
-The exact production-pool gate for K5632/N2048 passed against every CPU int32 result and measured `4.231 ms` single-worker versus `1.676 ms` with three-way K-split (`2.52x`). The standalone topology prototype measured `1.713 ms` in the same run. This is modestly faster than the corresponding three-way N-split because each K-split worker executes one full-K task rather than six sequential 1024/512-wide tasks. These observations are characterization only; production includes K-split candidates only for shapes that otherwise require multiple K tasks and measures them against N-split candidates at runtime. With host overhead now reduced to tens of microseconds, submit/kernel efficiency is the dominant remaining performance target.
-
-### GGUF-faithful native-W8 sidecar
-
-For native prequantized W8 experiments, generate the sidecar from the **exact GGUF being executed**, not from the original FP16/BF16 checkpoint. The runtime W8 path dequantizes the live Q4_K/Q6_K tensor first, so a sidecar quantized from a different source model is numerically a different model.
-
-```sh
-python3 scripts/make_tinyllama_w8_sidecar_gguf.py \
-  artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf \
-  /build/w8a8-models/native-w8-gguf \
-  --gguf-py /build/llama.cpp-reference/gguf-py
-```
-
-The generator emits `rocknpu-w8-sidecar-v2`, records the source GGUF size/SHA-256, uses half-away-from-zero row quantization to match the Rust runtime, and writes a lightweight source fingerprint beside every tensor. The GGML loader checks that fingerprint against the live quantized GGUF bytes before accepting a sidecar tensor. Missing or mismatched fingerprints are rejected and the normal runtime-W8 conversion is used instead; legacy v1 sidecars therefore cannot silently substitute weights.
-
-Use the corrected sidecar with:
-
-```sh
-ROCKNPU_W8_SIDECAR_DIR=/build/w8a8-models/native-w8-gguf \
-GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" \
-  /build/llama.cpp-reference/build-dl/bin/llama-completion \
-  -fit off -ngl 0 \
-  -m artifacts/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf \
-  -no-cnv -p "The capital of France is" -n 24 --temp 0 --no-warmup -t 4
-```
-
-Validated deterministic stdout is exactly:
-
-```text
- The capital of France is Paris.
-
-2. B.C. The capital of China is Beijing.
-
-3. A
-```
-
-Its stdout SHA-256 is `08730f9092a465cc9915db41d7ba8f999504c968e4937d73b6d9f068dcae8f8d`, identical for runtime-W8, corrected-sidecar threaded, and corrected-sidecar direct-submit paths. With `ROCKNPU_GGML_TRACE=1`, the corrected v2 sidecar loaded `154/154` tensors with zero source rejections; the legacy v1 sidecar loaded zero and rejected all 154 before safe fallback.
-
-The experimental direct-submit scheduler can be enabled with `ROCKNPU_W8_DIRECT_SUBMIT=1`. On the stock 700 MHz validator, corrected-sidecar `llama-bench -p 0 -n 32 -r 12 -t 4 -dev ROCKNPU0` measured `11.58 ± 0.79 tok/s` threaded versus `13.69 ± 1.07 tok/s` direct.
-
-A second opt-in, `ROCKNPU_EXPERIMENT_DIRECT_SCRATCH=1`, keeps per-worker, per-prepared-shape regcmd/input/partial Rocket BOs alive across direct-submit decode calls. This is intentionally coupled to the caller-thread direct-submit path rather than the older sleeping-worker path: eliminating repeated `CREATE_BO+mmap` also reduces the delay between core0/core1/core2 submits. The deterministic 24-token TinyLlama gate remains exact. Two adjacent `tg32,r=12` A/B runs on the same 700 MHz board measured baseline `13.72 ± 1.12` / `13.73 ± 1.13 tok/s` versus persistent-scratch `15.28 ± 1.31` / `15.28 ± 1.32 tok/s`, a reproducible center gain of about 11.3–11.4%; a clean branch rebuilt from `f54fcf2` measured `15.76 ± 1.40` versus `13.93 ± 1.12 tok/s`. Projection microbenchmarks also moved QKV N3 from `0.333 ms` to `0.293 ms` and attention-output N3 from `0.302 ms` to `0.255 ms` while preserving the exact int32 CPU oracle. The persistent path also omits the old partial-output `PREP -> memset(0) -> FINI` because each INT8 WDMA task fully overwrites its assigned int32 range. Two `tg32,r=12` order-swapped comparisons measured `15.65 vs 15.47` and `15.64 vs 15.35 tok/s`, adding roughly another 1–2% without changing the exact continuation. The persistent finish path now also accumulates each mapped worker partial directly into the pool's final `Vec<i32>` instead of allocating a worker-local intermediate `Vec<i32>` and copying/accumulating it again. The deterministic gate remains exact. Model-level comparisons stayed in the same direction: `15.35 vs 14.99 tok/s` (+2.4%), reversed `15.65 vs 15.95 tok/s` (+1.9% for the candidate), another reversed pair `15.80 vs 15.73 tok/s` (+0.45%), and a lower-noise `tg32,r=24` run `16.19 ± 1.06 vs 16.02 ± 1.03 tok/s` (+1.06%). With persistent scratch enabled, TinyLlama's down projection (`K=5632,N=2048`) now uses three-way K split directly. After the scratch/finish changes K3 is typically only 1–4% faster than N3, so the generic tuner's 5% hysteresis kept selecting N3. Two order-swapped whole-model `tg32,r=12` comparisons measured K3 `15.85` vs N3 `15.68 tok/s` (+1.1%) and N3 `15.47` vs K3 `15.80 tok/s` (+2.1%), with the 24-token exact gate unchanged.
-
-For TinyLlama decode, forcing llama.cpp flash attention with `-fa on` also avoids the classic CPU attention chain (`KQ MUL_MAT -> SOFT_MAX -> KQV MUL_MAT -> CONT`) that `auto` selected in this mixed RockNPU/CPU configuration. The deterministic 24-token continuation remains exact. Two order-swapped `tg32,r=12` comparisons measured `15.84 ± 1.45` auto versus `16.40 ± 2.09 tok/s` with flash attention (+3.5% center), then `17.24 ± 1.96` with flash attention versus `15.51 ± 1.42 tok/s` auto (+11.2% center). This is a llama.cpp execution-mode result, not a new RockNPU NPU kernel. Applicability may vary by model/attention shape; unsupported or slower cases should retain the existing classic-attention fallback rather than globally forcing the mode without validation.
-
-### Historical kernel experiment: Rocket IOMMU-domain cache
-
-> **Out of RockNPU scope.** This section records a past GPL Rocket-driver experiment. Its performance numbers must not be used as the current RockNPU userspace baseline, and the project will not maintain or reproduce this kernel optimization.
-
-The current Rocket scheduler attaches the submitting file's IOMMU domain to the selected NPU core for each job and detaches it again on completion. Low-overhead kprobes measured roughly `9.5 us` median attach plus `11.0 us` median detach on a small cached job. For M=1 decode, where RockNPU submits many short jobs, that fixed kernel cost is large enough to matter.
-
-A research-only patch was validated against the external GPL-2.0 RK3588 Rocket/DVFS tree at commit `ed52a89afa8e68fedf636c8e891bd8fc47e82d26`. It keeps a per-core `attached_domain`: repeated jobs from the same file/domain reuse the attachment; a different domain first detaches the old one; reset, file close, and driver fini detach/clear it. The patch is intentionally not copied into RockNPU's MIT production source. A module parameter was used only to perform idle-state A/B switching during validation.
-
-Use only controlled clock data for this experiment. A non-DVFS OOT Rocket build stayed at the DT-default 200 MHz and produced about `6.3-6.8 tok/s`; those runs are not part of the 700 MHz comparison. The authoritative board state was read back as NPU compute `700 MHz`, NPU rail `800 mV`, CPU governors `performance`.
-
-At 700 MHz with `ROCKNPU_W8_DIRECT_SUBMIT=1` and `ROCKNPU_EXPERIMENT_DIRECT_SCRATCH=1`, cache off -> on projection medians were:
-
-```text
-K=512  N=32    60.96 -> 37.04 us
-K=2048 N=32    64.46 -> 45.50 us
-K=2048 N=256  113.75 -> 88.08 us
-K=2048 N=2048 249.81 -> 248.20 us
-```
-
-The deterministic 24-token TinyLlama gate passed with the cache both disabled and enabled. In addition, two independent `llama-completion` processes were run concurrently with caching enabled; both returned the exact expected stdout, providing a real multi-file/domain-switch correctness check.
-
-Whole-model `tg32` results remain noisy, so preserve the complete sequence rather than quoting only the best run. With flash attention on, a 700 MHz `r=24` A-B-A-B sequence was:
-
-```text
-cache on   17.14 ± 1.98 tok/s
-cache off  15.32 ± 1.96 tok/s
-cache on   18.12 ± 1.29 tok/s
-cache off  16.84 ± 1.92 tok/s
-```
-
-The two cache-on centers average `17.63 tok/s` versus `16.08 tok/s` for cache-off (about +9.6% center), while short `r=12` runs were less monotonic. Treat the fixed-cost microbenchmark win as established and the exact whole-model percentage as provisional until the driver change is landed in the maintained Rocket/kernel path and repeated there. In particular, `18.39 tok/s` observed in one shorter cache-on run is a valid sample but **not** a stable topline claim.
-
-### Experimental native W4A4 M=1 decode
-
-The repository also contains a native signed-int4 M=1 register-command/executor path. The source-derived baseline register template is isolated in `crates/rocknpu-regcmd/src/int4/ork_isc.rs` under ork-driver's ISC notice; RockNPU's geometry patching, nibble packing, Rocket BO ownership/submission, resident cache, grouped execution, and multicore pool are Rust/MIT code around that isolated template.
-
-Build and run the primitive gates:
-
-```sh
-cargo build --release -p rocket-smoke \
-  --bin int4_decode_m1 \
-  --bin int4_decode_grouped \
-  --bin int4_decode_multicore
-
-./target/release/int4_decode_m1
-./target/release/int4_decode_grouped
-./target/release/int4_decode_multicore 3
-```
-
-The single-program executor accepts signed int4 codes in `i8` storage, nibble-packs A/B into the validated RK3588 layout, and exposes the native dense `int16[N]` accumulator surface. Static weights are prepared once and retained in Rocket BOs. The grouped gate verifies independent K-group partials exactly against CPU dot products. On the current RK3588, the TinyLlama FFN geometry produced:
-
-```text
-W4A4 GROUPED PASS K=2048 N=5632 G=512 resident_mb=5.50
-W4A4 MULTICORE PASS M=1 K=2048 N=5632 ... single_ms=2.080 multicore_ms=0.970 speedup=2.15x
-```
-
-No int16 saturation was observed in the model experiments. For full-K (`G=2048`) W4A4 with normalized Hadamard rotation, the real-model first-shape tuner measured approximately:
-
-```text
-ROCKNPU W4A4 tune K=2048 N=5632 candidates=[1, 2, 3] medians_us=[2081.301, 1250.648, 858.653] selected_workers=3
-```
-
-GGML W4A4 is deliberately opt-in. Both variables are required for routing away from W8A8:
-
-```sh
-ROCKNPU_W4A4=1
-ROCKNPU_W4A4_SCOPE=ffn   # or attn / proj2048 / kv / explicit all
-```
-
-`ROCKNPU_W4A4_GROUP=<N>` controls K-group quantization, `ROCKNPU_W4A4_HADAMARD=1` applies an orthonormal FWHT to activations and weight rows before quantization, and `ROCKNPU_W4A4_TRACE=1` prints tuner/saturation/cache diagnostics. `ROCKNPU_W4A4=1` without a scope intentionally does not change routing.
-
-This path has **hardware correctness but not model-level equivalence**. Prompt `The capital of` with greedy `-n 3` can still produce the W8A8 continuation `" the United States"`, but the longer `-n 16` gate diverges. Default W8A8 continued with `" the United States of America, Washington D.C. Is the most populous"`; FFN full-K Hadamard W4A4 instead continued `" the United States, located in the state of Virginia.\n\n2. New"`, and G=512 Hadamard also diverged later. A Q/O-only W4 experiment diverged as well. Since all of these runs reported zero saturation, the remaining difference is quantization error rather than an int16-overflow or Rocket execution failure.
-
-Whole-model speed is also not yet materially better: same-setting dynamic-backend `llama-bench -p 0 -n 8 -r 3 -t 8 -ngl 0` measured `5.09 ± 0.13 tok/s` for the FFN W4 experiment and `5.02 ± 0.17 tok/s` for default W8A8. Treat that difference as noise. W4A4 is therefore kept as an explicit research path for half-width resident weights, native-int4 kernel work, and future quantization-quality experiments; W8A8 remains the supported default decode route.
-
-### RK3588 NPU IRQ-thread latency tuning
-
-After enabling the validated per-core Rocket IOMMU-domain cache, runtime-PM bookkeeping was measured before changing it. Scoped function-graph samples put the ordinary autosuspend bookkeeping at roughly `1.167 us` median for `__pm_runtime_suspend()` (700 samples, p90 `2.042 us`), while directly observed `__pm_runtime_resume()` calls inside `rocket_job_run()` were about `5.25-5.54 us` under tracing. This is measurable but too small to be the primary remaining decode bottleneck.
-
-Rocket completion is a threaded IRQ. With the default three NPU IRQ affinities set to `0-7`, 1450 hard-IRQ/thread-entry pairs measured:
-
-```text
-p10       5 us
-median   10 us
-p90      21 us
-p99      51 us
-mean   12.208 us
-max     149 us
-```
-
-The trace repeatedly showed NPU interrupts landing on CPU0 from idle, and the board's `cpu-sleep` cpuidle state advertises a `220 us` exit latency. Pinning NPU IRQs to the A76 cluster reduced wake latency dramatically but hurt TinyLlama throughput, so do not use the big cores for this purpose.
-
-The validated topology keeps the three NPU IRQ threads on separate A55 cores and prevents only those cores from entering the deep `cpu-sleep` state:
-
-```sh
-sudo scripts/tune_rocket_irq_latency.sh apply
-# restore the normal platform policy after testing:
-sudo scripts/tune_rocket_irq_latency.sh restore
-```
-
-The helper discovers the IRQ numbers for `fdab0000.npu`, `fdac0000.npu`, and `fdad0000.npu` dynamically. On the validator, `apply` produced CPU affinity `0,1,2`; `restore` returned all three IRQs to `0-7` and re-enabled `cpu-sleep` on CPUs 0/1/2.
-
-With the A55 layout, the identical 1450-completion wake-latency distribution improved to:
-
-```text
-p10       5 us
-median    6 us
-p90       8 us
-p99      23 us
-mean    6.820 us
-max      82 us
-```
-
-The deterministic 24-token TinyLlama continuation remained exact. At `700 MHz / 800 mV`, CPU governors `performance`, per-core IOMMU-domain cache enabled, corrected GGUF-faithful native W8 sidecar, `ROCKNPU_W8_DIRECT_SUBMIT=1`, `ROCKNPU_EXPERIMENT_DIRECT_SCRATCH=1`, and flash attention forced on, interleaved whole-model blocks measured:
-
-```text
-baseline       17.74 +/- 2.47 tok/s
-A55 IRQ tune   19.18 +/- 2.15 tok/s
-baseline       18.61 +/- 1.91 tok/s
-A55 IRQ tune   19.57 +/- 2.09 tok/s
-
-# matching longer tg32,r=24 pair
-A55 IRQ tune   19.33 +/- 1.81 tok/s
-baseline       17.86 +/- 2.06 tok/s
-```
-
-The `r=24` pair is about +8.2% in center. Across these three blocks the rough unweighted centers are `18.07` baseline versus `19.36 tok/s` tuned (~+7.1%). These `19.3-19.4 tok/s` figures are historical results from a custom Rocket/IOMMU-cache plus IRQ-tuning environment. They are not a RockNPU project topline and should not be compared with the later corrected native CPU baseline. The kernel-side tuning path is closed as out of project scope.
+Do not use old absolute NPU results from mixed experimental environments as current toplines.
