@@ -225,6 +225,31 @@ Do not revisit until lifetime/teardown ownership is explicitly designed and test
 
 ORK research was useful for re-checking the INT8 M-tile assumptions and the duplicated register patch behavior. This checkpoint does not copy external kernel/driver code into the MIT RockNPU tree.
 
+### External ordinary-generation comparison
+
+These are **reference points, not direct A/B results**. The local RockNPU number remains the controlled ordinary `llama-bench tg128` result above: **13.79 +/- 0.85 tok/s** on the Q4_K_M GGUF.
+
+| Runtime / path | Model / quantization | Published TG | Relative to RockNPU 13.79 | Comparability |
+|---|---|---:|---:|---|
+| RockNPU local | TinyLlama 1.1B, Q4_K_M GGUF | 13.79 tok/s | 1.00x | local baseline |
+| Radxa RKLLM reference | TinyLlama 1.1B, RK3588 | 15.03 tok/s | RockNPU is ~8.3% lower | older external reference; conversion/runtime details incomplete |
+| RKLLM independent reproduction | TinyLlama 1.1B, plain W8A8 | 23.08 +/- 0.37 tok/s | RockNPU is ~40.3% lower; needs ~+67.4% to match | strongest current external reference found; ROCK 5B+, working DDR/DMC scaling |
+| Rockchip-derived benchmark table | TinyLLAMA 1.1B, W8A8, seqlen 128, 64 new tokens | 24.26-24.49 tok/s | RockNPU is ~43.2-43.7% lower; needs ~+75.9-77.6% to match | external maximum-frequency reference, not local A/B |
+| llama.cpp PanVK report | Llama-3.2-1B-Instruct Q4_1, Mali-G610 | ~3.6 tok/s | RockNPU number is ~3.8x higher | **different model/quantization**; GPU-direction evidence only, not a TinyLlama A/B |
+
+Sources:
+- Rockchip RKLLM / rknn-llm benchmark discussion and independent reproduction: https://github.com/airockchip/rknn-llm/issues/532
+- Rockchip-derived benchmark table: https://github.com/Pelochus/ezrknn-llm/blob/main/benchmark.md
+- Seeed RK3588 benchmark table: https://sensecraft.seeed.cc/ai-lab/en/tutorials/rk/benchmark/rk3576-and-rk3588-llm-and-vlm-performance-benchmarks
+- Radxa RKLLM reference: https://docs.radxa.com/en/som/nx/nx5/ai-dev/rkllm-usage
+- Mali-G610 / PanVK llama.cpp report: https://github.com/ggml-org/llama.cpp/issues/17783
+
+The 2026 RKLLM reproduction is especially useful because it explains why older community results were much lower. Plain W8A8 versus grouped W8A8 and functional DDR/DMC frequency scaling materially change decode throughput. The reproduced 23.08 tok/s result is therefore a more credible performance target than treating the older 15.03 tok/s figure as the closed-runtime ceiling.
+
+There is still no comparable public RKLLM lookup-speculative benchmark. The local 127-149 tok/s M64 verifier result must therefore stay in a separate category; it cannot be divided by RKLLM ordinary-generation throughput.
+
+The available Mali-G610/PanVK evidence strongly suggests the current RockNPU ordinary path is already ahead of that open GPU path, but the public report uses Llama-3.2-1B-Instruct Q4_1 rather than the exact TinyLlama/Q4_K_M workload. Treat this as directional evidence only, not a formal win.
+
 ## Safe benchmark notes
 
 - Keep model/binaries in `/tmp` tmpfs when measuring; this avoids NVMe/TCP read stalls.
