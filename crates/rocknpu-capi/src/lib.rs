@@ -93,6 +93,10 @@ struct CachedPoolW4A4Weight {
 struct MtileProfile {
     calls: usize,
     ksplit_calls: usize,
+    cache_hits: usize,
+    cache_misses: usize,
+    weight_prepare_ns: u128,
+    weight_pack_ns: u128,
     quant_ns: u128,
     alloc_ns: u128,
     input_stage_ns: u128,
@@ -347,10 +351,10 @@ unsafe fn max_abs_finite_neon(values: &[f32]) -> Option<f32> {
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn quantize_symmetric_neon_second_pass(values: &[f32], scale: f32) -> Vec<i8> {
+unsafe fn quantize_symmetric_neon_into(values: &[f32], scale: f32, out: &mut [i8]) {
     use std::arch::aarch64::*;
 
-    let mut out = vec![0i8; values.len()];
+    debug_assert_eq!(values.len(), out.len());
     let mut i = 0usize;
     unsafe {
         let scale_v = vdupq_n_f32(scale);
@@ -373,6 +377,14 @@ unsafe fn quantize_symmetric_neon_second_pass(values: &[f32], scale: f32) -> Vec
         out[i] = (values[i] / scale).round().clamp(-127.0, 127.0) as i8;
         i += 1;
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn quantize_symmetric_neon_second_pass(values: &[f32], scale: f32) -> Vec<i8> {
+    let mut out = vec![0i8; values.len()];
+    // SAFETY: caller already established NEON support and output has exact length.
+    unsafe { quantize_symmetric_neon_into(values, scale, &mut out) };
     out
 }
 
@@ -438,21 +450,52 @@ fn quantize_symmetric_i4(values: &[f32]) -> Option<(Vec<i8>, f32)> {
     Some((quantized, scale))
 }
 
-fn append_quantized_symmetric(values: &[f32], dst: &mut Vec<i8>) -> Option<f32> {
-    let mut max_abs = 0.0f32;
-    for &value in values {
-        if !value.is_finite() {
-            return None;
-        }
-        max_abs = max_abs.max(value.abs());
+fn quantize_symmetric_into(values: &[f32], out: &mut [i8]) -> Option<f32> {
+    if values.len() != out.len() {
+        return None;
     }
+    #[cfg(target_arch = "aarch64")]
+    let max_abs = if host_neon_enabled() {
+        // SAFETY: RK3588 is AArch64/ASIMD; the helper handles arbitrary tails.
+        unsafe { max_abs_finite_neon(values)? }
+    } else {
+        let mut max_abs = 0.0f32;
+        for &value in values {
+            if !value.is_finite() {
+                return None;
+            }
+            max_abs = max_abs.max(value.abs());
+        }
+        max_abs
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let max_abs = {
+        let mut max_abs = 0.0f32;
+        for &value in values {
+            if !value.is_finite() {
+                return None;
+            }
+            max_abs = max_abs.max(value.abs());
+        }
+        max_abs
+    };
     let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
-    dst.extend(
-        values
-            .iter()
-            .map(|&value| (value / scale).round().clamp(-127.0, 127.0) as i8),
-    );
+    #[cfg(target_arch = "aarch64")]
+    if host_neon_enabled() {
+        // SAFETY: output slice exactly matches the input length and NEON is available.
+        unsafe { quantize_symmetric_neon_into(values, scale, out) };
+        return Some(scale);
+    }
+    for (out, &value) in out.iter_mut().zip(values) {
+        *out = (value / scale).round().clamp(-127.0, 127.0) as i8;
+    }
     Some(scale)
+}
+
+fn append_quantized_symmetric(values: &[f32], dst: &mut Vec<i8>) -> Option<f32> {
+    let start = dst.len();
+    dst.resize(start + values.len(), 0);
+    quantize_symmetric_into(values, &mut dst[start..])
 }
 
 fn prepare_q4_k_w8a8(weight_bytes: &[u8], k: usize, n: usize) -> Option<(Vec<i8>, Vec<f32>)> {
@@ -461,7 +504,34 @@ fn prepare_q4_k_w8a8(weight_bytes: &[u8], k: usize, n: usize) -> Option<(Vec<i8>
     if weight_bytes.len() != n.checked_mul(row_bytes)? {
         return None;
     }
-    let mut weights = Vec::with_capacity(n.checked_mul(k)?);
+    let total = n.checked_mul(k)?;
+    if total >= PARALLEL_DEQUANT_MIN_VALUES {
+        let mut weights = vec![0i8; total];
+        let mut scales = vec![0.0f32; n];
+        weight_bytes
+            .par_chunks_exact(row_bytes)
+            .zip(weights.par_chunks_mut(k))
+            .zip(scales.par_iter_mut())
+            .try_for_each_init(
+                || (vec![0.0f32; k], [0.0f32; VALUES]),
+                |state, ((encoded_row, output_row), output_scale)| -> Option<()> {
+                    let (row, decoded) = state;
+                    for (block_index, bytes) in encoded_row
+                        .chunks_exact(size_of::<BlockQ4K>())
+                        .enumerate()
+                    {
+                        let block: BlockQ4K = pod_read_unaligned(bytes);
+                        dequantize_q4_k(&block, decoded);
+                        let start = block_index * VALUES;
+                        row[start..start + VALUES].copy_from_slice(decoded);
+                    }
+                    *output_scale = quantize_symmetric_into(row, output_row)?;
+                    Some(())
+                },
+            )?;
+        return Some((weights, scales));
+    }
+    let mut weights = Vec::with_capacity(total);
     let mut scales = Vec::with_capacity(n);
     let mut row = Vec::with_capacity(k);
     let mut decoded = [0.0f32; VALUES];
@@ -474,7 +544,7 @@ fn prepare_q4_k_w8a8(weight_bytes: &[u8], k: usize, n: usize) -> Option<(Vec<i8>
         }
         scales.push(append_quantized_symmetric(&row, &mut weights)?);
     }
-    (weights.len() == n.checked_mul(k)? && scales.len() == n).then_some((weights, scales))
+    (weights.len() == total && scales.len() == n).then_some((weights, scales))
 }
 
 fn prepare_q4_k_grouped_w8a8(
@@ -1413,19 +1483,36 @@ where
     }
 
     let executor = Int8DecodeExecutor::from_externally_guarded_device(&context.device);
+    let mut cache_miss = false;
+    let mut weight_prepare_ns = 0u128;
+    let mut weight_pack_ns = 0u128;
     let cached = match context.decode_mtile_weights.entry(key) {
         Entry::Occupied(entry) => entry.into_mut(),
         Entry::Vacant(entry) => {
+            cache_miss = true;
+            let started = Instant::now();
             let Some((weights_i8, scales)) = prepare() else {
                 return STATUS_INVALID_ARGUMENT;
             };
+            weight_prepare_ns = started.elapsed().as_nanos();
+            let started = Instant::now();
             let prepared = match executor.prepare_weights(&weights_i8, key.k, key.n) {
                 Ok(prepared) => prepared,
                 Err(_) => return STATUS_EXECUTION_ERROR,
             };
+            weight_pack_ns = started.elapsed().as_nanos();
             entry.insert(CachedW8MtileWeight { prepared, scales })
         }
     };
+    if let Some(profile) = context.mtile_profile.as_mut() {
+        if cache_miss {
+            profile.cache_misses += 1;
+            profile.weight_prepare_ns += weight_prepare_ns;
+            profile.weight_pack_ns += weight_pack_ns;
+        } else {
+            profile.cache_hits += 1;
+        }
+    }
 
     let result = if key.k > 4096 {
         match executor.execute_prepared_m16(&activations_i8, &cached.prepared) {
@@ -1533,12 +1620,18 @@ where
     } = context;
     let executor = Int8DecodeExecutor::from_externally_guarded_device(device);
     let cache_key = (key, group_size);
+    let mut cache_miss = false;
+    let mut weight_prepare_ns = 0u128;
+    let mut weight_pack_ns = 0u128;
     let cached = match decode_grouped_mtile_weights.entry(cache_key) {
         Entry::Occupied(entry) => entry.into_mut(),
         Entry::Vacant(entry) => {
+            cache_miss = true;
+            let started = Instant::now();
             let Some((weights_i8, scales)) = prepare() else {
                 return STATUS_INVALID_ARGUMENT;
             };
+            weight_prepare_ns = started.elapsed().as_nanos();
             if weights_i8.len() != key.n.saturating_mul(key.k)
                 || scales.len() != groups.saturating_mul(key.n)
             {
@@ -1546,6 +1639,7 @@ where
             }
             let group_matrix = key.n.saturating_mul(group_size);
             let mut prepared = Vec::with_capacity(groups);
+            let started = Instant::now();
             for group_index in 0..groups {
                 let start = group_index.saturating_mul(group_matrix);
                 let end = start.saturating_add(group_matrix);
@@ -1557,9 +1651,19 @@ where
                     Err(_) => return STATUS_EXECUTION_ERROR,
                 }
             }
+            weight_pack_ns = started.elapsed().as_nanos();
             entry.insert(CachedGroupedW8MtileWeight { prepared, scales })
         }
     };
+    if let Some(profile) = context.mtile_profile.as_mut() {
+        if cache_miss {
+            profile.cache_misses += 1;
+            profile.weight_prepare_ns += weight_prepare_ns;
+            profile.weight_pack_ns += weight_pack_ns;
+        } else {
+            profile.cache_hits += 1;
+        }
+    }
 
     if cached.prepared.len() != groups {
         return STATUS_EXECUTION_ERROR;
@@ -2180,9 +2284,13 @@ pub unsafe extern "C" fn rocknpu_context_destroy(context: *mut RockNpuContext) {
         }
         if let Some(profile) = &context.mtile_profile {
             eprintln!(
-                "ROCKNPU MTILE PROFILE calls={} ksplit_calls={} quant_ms={:.3} alloc_ms={:.3} input_stage_ms={:.3} regcmd_ms={:.3} submit_ms={:.3} wait_ms={:.3} host_accum_ms={:.3} execute_total_ms={:.3} rescale_ms={:.3}",
+                "ROCKNPU MTILE PROFILE calls={} ksplit_calls={} cache_hits={} cache_misses={} weight_prepare_ms={:.3} weight_pack_ms={:.3} quant_ms={:.3} alloc_ms={:.3} input_stage_ms={:.3} regcmd_ms={:.3} submit_ms={:.3} wait_ms={:.3} host_accum_ms={:.3} execute_total_ms={:.3} rescale_ms={:.3}",
                 profile.calls,
                 profile.ksplit_calls,
+                profile.cache_hits,
+                profile.cache_misses,
+                ns_to_ms(profile.weight_prepare_ns),
+                ns_to_ms(profile.weight_pack_ns),
                 ns_to_ms(profile.quant_ns),
                 ns_to_ms(profile.alloc_ns),
                 ns_to_ms(profile.input_stage_ns),

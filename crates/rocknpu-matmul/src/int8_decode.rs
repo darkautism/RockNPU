@@ -3,7 +3,7 @@
 use rocket_runtime::{RocketBuffer, RocketDevice, RocketOwnedBuffer, Task};
 use rocknpu_regcmd::{
     INT8_REGCMD_COUNT, Int8DecodeDesc, Int8EncodeError, encode_int8_decode_m1,
-    encode_int8_mtile, weight_i8_fullk_index,
+    encode_int8_mtile,
 };
 use std::fmt;
 use std::io;
@@ -668,22 +668,30 @@ impl<'a> Int8DecodeExecutor<'a> {
 
         let pack_start = Instant::now();
         bo.prep_relative(0)?;
-        bo.as_mut_slice().fill(0);
         let mut offsets = Vec::with_capacity(slices);
         let mut weight_offset = 0usize;
-        for slice in 0..slices {
-            offsets.push(weight_offset);
-            let k0 = slice_k0(slices, slice);
-            let kp = slice_kp(k, slices, slice);
-            for kk in 0..kp {
-                for col in 0..n {
-                    let dst = weight_offset + weight_i8_fullk_index(kp, n, kk, col);
-                    bo.as_mut_slice()[dst] = b_nk[col * k + k0 + kk] as u8;
+        let b_bytes: &[u8] = bytemuck::cast_slice(b_nk);
+        {
+            let packed = bo.as_mut_slice();
+            for slice in 0..slices {
+                offsets.push(weight_offset);
+                let k0 = slice_k0(slices, slice);
+                let kp = slice_kp(k, slices, slice);
+                let kt = kp / 32;
+                for nt in 0..n / 32 {
+                    for kb in 0..kt {
+                        for nl in 0..32 {
+                            let col = nt * 32 + nl;
+                            let src = col * k + k0 + kb * 32;
+                            let dst = weight_offset + nt * kt * 32 * 32 + kb * 32 * 32 + nl * 32;
+                            packed[dst..dst + 32].copy_from_slice(&b_bytes[src..src + 32]);
+                        }
+                    }
                 }
+                weight_offset = weight_offset
+                    .checked_add(kp.checked_mul(n).ok_or(Int8DecodeError::SizeOverflow)?)
+                    .ok_or(Int8DecodeError::SizeOverflow)?;
             }
-            weight_offset = weight_offset
-                .checked_add(kp.checked_mul(n).ok_or(Int8DecodeError::SizeOverflow)?)
-                .ok_or(Int8DecodeError::SizeOverflow)?;
         }
         bo.fini()?;
         let pack_ns = pack_start.elapsed().as_nanos();
