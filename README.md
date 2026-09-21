@@ -39,12 +39,16 @@ This mode does not claim faster NPU-only decode or CPU-identical generated token
 
 The current mainline RK3588 `rocket` driver leaves the shared NPU compute clock at the Device Tree boot rate of **200 MHz** and does not expose an NPU devfreq control. On RK3588 this is a severe benchmark limiter: a workload can be functionally correct while running far below the silicon's normal performance range.
 
-For controlled performance work, RockNPU currently uses the public experimental Rocket devfreq reference at commit `ed52a89afa8e68fedf636c8e891bd8fc47e82d26`. This is a **temporary runtime module swap for benchmarking**, not a production dependency. Rebooting restores the packaged module unless you explicitly install a boot service.
+For controlled performance work on a **dedicated benchmark host**, RockNPU has used the public GPL-2.0 experimental Rocket devfreq tree at `https://github.com/sky-rk3588/rk3588-npu-gpu.git`, commit `ed52a89afa8e68fedf636c8e891bd8fc47e82d26`. This is a **temporary runtime kernel-module swap for benchmarking**, not a production dependency and not appropriate on a host that also carries services such as Caddy, workers, or other users' jobs. Rebooting restores the packaged driver on the validated Armbian setup unless a boot service was explicitly installed.
 
 ### Safety / scope
 
+- **Do not perform the module swap on a shared/service host.** Use a disposable or dedicated benchmark board.
 - Stop all NPU clients before unloading `rocket` (`sudo fuser -v /dev/accel/accel0` should show no users).
-- The instructions below keep the NPU rail at its existing **800 mV** and cap the NPU at the already validated **700 MHz** point.
+- The supported reproduction procedure below keeps the NPU rail at its existing **800 mV** and caps the NPU at the already validated **700 MHz** point.
+- Do not load `npu_volt_probe.ko` or raise the NPU rail as part of ordinary RockNPU reproduction. Historical 1 GHz / 850 mV experiments are silicon-characterization data, not the supported baseline.
+- If the experimental driver reports any `NPU job timed out`, stop the benchmark immediately. Do not continue using that boot for performance work or unrelated long-lived services; reboot back to the packaged driver before continuing.
+- After any experiment, restore CPU governors and NPU frequency. Prefer a reboot to the packaged driver before returning the board to normal service.
 - Do **not** request more than 700 MHz at 800 mV. The experimental driver refuses rates above 700 MHz unless the NPU rail is at least 850 mV.
 - Do **not** change the RK3588 NPU clock with `/dev/mem` or raw CRU writes. The NPU power domains must return to the 200 MHz safe rate around power-domain transitions; the devfreq driver handles that guard.
 - The debugfs `clk_summary` SCMI entry may remain stale. Use the devfreq `cur_freq` / `target_freq` values and workload measurements to verify the requested clock.

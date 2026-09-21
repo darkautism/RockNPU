@@ -223,15 +223,17 @@ Every worker owns a separate Rocket fd and its own resident B BO. Correctness an
 
 ## Controlled NPU-frequency characterization (experimental reference only)
 
-Stock Armbian Rocket has no `/sys/class/devfreq/fdab0000.npu` node on this host. The live NPU DT nodes carry a 200 MHz assigned clock and no NPU OPP table. To characterize the silicon without changing the project kernel policy, a public GPL-2.0 Rocket DVFS research tree was cloned at `reference/rk3588-npu-gpu`, commit `ed52a89afa8e68fedf636c8e891bd8fc47e82d26`, built against exact `6.18.43-current-rockchip64` headers, loaded temporarily, then removed. It is not production project code.
+Stock Armbian Rocket has no `/sys/class/devfreq/fdab0000.npu` node on this host. The live NPU DT nodes carry a 200 MHz assigned clock and no NPU OPP table. To characterize the silicon without changing the project kernel policy, the public GPL-2.0 Rocket DVFS research tree `https://github.com/sky-rk3588/rk3588-npu-gpu.git` was checked out at commit `ed52a89afa8e68fedf636c8e891bd8fc47e82d26`, built against exact `6.18.43-current-rockchip64` headers, loaded temporarily, then removed. It is not production project code. Do this only on a dedicated benchmark host; a shared/service machine must stay on the packaged driver.
 
 Safety conditions used for this experiment:
 
 - no DTB or boot-service changes,
+- dedicated benchmark host only; no Caddy/worker/other long-lived service workload sharing the board,
 - original `vdd_npu_s0 = 800 mV` left unchanged,
 - userspace governor only, with `max_freq` capped to the requested point,
 - tested only 200, 600, and 700 MHz; no >700 MHz point because the research driver requires a higher-voltage guard above 700 MHz,
 - exact resident hardware gate run before performance measurement at 600 and 700 MHz,
+- any `NPU job timed out` is a hard stop for that boot: stop NPU work and reboot before unrelated service use or further benchmark claims,
 - custom driver lowered to 200 MHz before unload; packaged stock Rocket restored and exact gate rerun afterward.
 
 The focused phase-separated probe is:
