@@ -64,7 +64,7 @@ Prompt + decode total time:
 
 Prewarm therefore moves substantial preparation work before decode, but it did not merely hide the cost: both controlled prewarm runs were still faster end-to-end than CPU, and both were faster end-to-end than the measured no-prewarm NPU run. On the repeated run, total prompt+decode time was 7.543 s versus 10.972 s for CPU, about a 1.45x end-to-end request speedup; the 2.42x figure applies to the lookup-speculative decode phase only.
 
-A separate ordinary non-speculative `llama-bench tg128` sanity run at the same controlled 1 GHz NPU / performance big-core setting measured **13.79 +/- 0.85 tok/s** on RockNPU versus **10.45 +/- 0.09 tok/s** on the four-core CPU for this Q4_K_M GGUF. This serial-generation result is the appropriate local number to consider when comparing against conventional one-token-at-a-time runtimes; it is not directly interchangeable with the 127-149 tok/s lookup-speculative numbers.
+A separate ordinary non-speculative `llama-bench tg128` sanity run at the same controlled 1 GHz NPU / performance big-core setting measured **13.79 +/- 0.85 tok/s** on RockNPU versus **10.45 +/- 0.09 tok/s** on the four-core CPU for this Q4_K_M GGUF. This was a sanity measurement under the speculative-checkpoint environment, **not the best known ordinary-generation configuration**. Earlier validated M=1 work on the same project reached about **16 tok/s** with caller-thread direct submit + persistent scratch, and about **19.3-19.4 tok/s** in the research-driver configuration with per-core IOMMU-domain caching plus the validated A55 IRQ-latency tune at 700 MHz / 800 mV. The native-M64 path only applies to M=32..64 and does not accelerate ordinary M=1 generation. Therefore 13.79 must not be used as the project-wide ordinary-generation ceiling. None of these ordinary-generation figures is directly interchangeable with the 127-149 tok/s lookup-speculative verifier numbers.
 
 ## Confirmed findings
 
@@ -227,15 +227,15 @@ ORK research was useful for re-checking the INT8 M-tile assumptions and the dupl
 
 ### External ordinary-generation comparison
 
-These are **reference points, not direct A/B results**. The local RockNPU number remains the controlled ordinary `llama-bench tg128` result above: **13.79 +/- 0.85 tok/s** on the Q4_K_M GGUF.
+These are **reference points, not direct A/B results**. The **13.79 +/- 0.85 tok/s** `tg128` result above is only the ordinary-generation sanity run taken under the speculative checkpoint environment; it is not the project's best known M=1 path. For ordinary-generation context, retain the separately validated ~16 tok/s userspace direct-submit/persistent-scratch result and the ~19.3-19.4 tok/s research-driver result documented in `docs/repro.md`.
 
-| Runtime / path | Model / quantization | Published TG | Relative to RockNPU 13.79 | Comparability |
+| Runtime / path | Model / quantization | Published TG | Relation | Comparability |
 |---|---|---:|---:|---|
-| RockNPU local | TinyLlama 1.1B, Q4_K_M GGUF | 13.79 tok/s | 1.00x | local baseline |
-| Radxa RKLLM reference | TinyLlama 1.1B, RK3588 | 15.03 tok/s | RockNPU is ~8.3% lower | older external reference; conversion/runtime details incomplete |
-| RKLLM independent reproduction | TinyLlama 1.1B, plain W8A8 | 23.08 +/- 0.37 tok/s | RockNPU is ~40.3% lower; needs ~+67.4% to match | strongest current external reference found; ROCK 5B+, working DDR/DMC scaling |
-| Rockchip-derived benchmark table | TinyLLAMA 1.1B, W8A8, seqlen 128, 64 new tokens | 24.26-24.49 tok/s | RockNPU is ~43.2-43.7% lower; needs ~+75.9-77.6% to match | external maximum-frequency reference, not local A/B |
-| llama.cpp PanVK report | Llama-3.2-1B-Instruct Q4_1, Mali-G610 | ~3.6 tok/s | RockNPU number is ~3.8x higher | **different model/quantization**; GPU-direction evidence only, not a TinyLlama A/B |
+| RockNPU local sanity | TinyLlama 1.1B, Q4_K_M GGUF | 13.79 tok/s | sanity only | speculative-checkpoint env; not best M=1 configuration |
+| Radxa RKLLM reference | TinyLlama 1.1B, RK3588 | 15.03 tok/s | not direct A/B | older external reference; conversion/runtime details incomplete |
+| RKLLM independent reproduction | TinyLlama 1.1B, plain W8A8 | 23.08 +/- 0.37 tok/s | not direct A/B | different quantization/runtime; ROCK 5B+, working DDR/DMC scaling |
+| Rockchip-derived benchmark table | TinyLLAMA 1.1B, W8A8, seqlen 128, 64 new tokens | 24.26-24.49 tok/s | not direct A/B | external maximum-frequency reference, different quantization/runtime |
+| llama.cpp PanVK report | Llama-3.2-1B-Instruct Q4_1, Mali-G610 | ~3.6 tok/s | not direct A/B | **different model/quantization**; GPU-direction evidence only, not a TinyLlama A/B |
 
 Sources:
 - Rockchip RKLLM / rknn-llm benchmark discussion and independent reproduction: https://github.com/airockchip/rknn-llm/issues/532
@@ -244,7 +244,7 @@ Sources:
 - Radxa RKLLM reference: https://docs.radxa.com/en/som/nx/nx5/ai-dev/rkllm-usage
 - Mali-G610 / PanVK llama.cpp report: https://github.com/ggml-org/llama.cpp/issues/17783
 
-The 2026 RKLLM reproduction is especially useful because it explains why older community results were much lower. Plain W8A8 versus grouped W8A8 and functional DDR/DMC frequency scaling materially change decode throughput. The reproduced 23.08 tok/s result is therefore a more credible performance target than treating the older 15.03 tok/s figure as the closed-runtime ceiling.
+The 2026 RKLLM reproduction is especially useful because it explains why older community results were much lower. Plain W8A8 versus grouped W8A8 and functional DDR/DMC frequency scaling materially change decode throughput. It is a useful external target range, but it is not valid to turn it into a precise RockNPU percentage gap without matching quantization, memory-clock state, token lengths, and runtime conditions.
 
 There is still no comparable public RKLLM lookup-speculative benchmark. The local 127-149 tok/s M64 verifier result must therefore stay in a separate category; it cannot be divided by RKLLM ordinary-generation throughput.
 
