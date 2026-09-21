@@ -3,26 +3,6 @@ use rocket_runtime::RocketDevice;
 use rocknpu_matmul::Fp16MatmulExecutor;
 use std::error::Error;
 
-fn clock_note() -> String {
-    let base = std::path::Path::new("/sys/class/devfreq/fdab0000.npu");
-    if !base.exists() {
-        return "clock_note=Rocket NPU devfreq unavailable (stock driver / uncontrolled clock)"
-            .to_string();
-    }
-    let read = |name: &str| {
-        std::fs::read_to_string(base.join(name))
-            .map(|v| v.trim().to_string())
-            .unwrap_or_else(|_| "?".to_string())
-    };
-    format!(
-        "clock_note=devfreq cur={} target={} max={} governor={}",
-        read("cur_freq"),
-        read("target_freq"),
-        read("max_freq"),
-        read("governor")
-    )
-}
-
 const REPS: usize = 5;
 
 fn data(m: usize, k: usize, n: usize, seed: u64) -> (Vec<f16>, Vec<f16>) {
@@ -129,7 +109,6 @@ fn run_case(
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    println!("{}", clock_note());
     let dev = RocketDevice::open()?;
     let mut ex = Fp16MatmulExecutor::new(&dev)?;
     let cases = [

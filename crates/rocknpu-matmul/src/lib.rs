@@ -1280,7 +1280,7 @@ impl Fp16MatmulPool {
         self.gather_run_f32(request_id, &slices, m, n, start)
     }
 
-    /// Prepack one B[N,K] into each active worker's own Rocket fd/IOMMU domain.
+    /// Prepack one B[N,K] into each active worker's own device context.
     /// The returned handle stores only an ID/shape; host B is not needed by
     /// subsequent `execute_prepared` calls.
     pub fn prepare_weights_compatible_m(

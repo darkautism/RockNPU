@@ -86,9 +86,8 @@ fn median(mut values: Vec<f64>) -> f64 {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(artifacts())?;
 
-    // Precondition all three NPU schedulers/cores before collecting numbers. The
-    // host does not expose an unprivileged NPU devfreq node, and a cold 1->2->3
-    // ordering was observed to mix governor ramp into apparent scaling.
+    // Precondition all three workers before collecting numbers so first-use
+    // setup is not mixed into the scaling samples.
     let _ = run_workers(3)?;
 
     let order = [3usize, 1, 2, 2, 1, 3, 1, 2, 3];

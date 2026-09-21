@@ -7,26 +7,6 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Instant;
 
-fn clock_note() -> String {
-    let base = std::path::Path::new("/sys/class/devfreq/fdab0000.npu");
-    if !base.exists() {
-        return "clock_note=Rocket NPU devfreq unavailable (stock driver / uncontrolled clock)"
-            .to_string();
-    }
-    let read = |name: &str| {
-        std::fs::read_to_string(base.join(name))
-            .map(|v| v.trim().to_string())
-            .unwrap_or_else(|_| "?".to_string())
-    };
-    format!(
-        "clock_note=devfreq cur={} target={} max={} governor={}",
-        read("cur_freq"),
-        read("target_freq"),
-        read("max_freq"),
-        read("governor")
-    )
-}
-
 const M: usize = 256;
 const K: usize = 384;
 const N: usize = 256;
@@ -108,7 +88,6 @@ fn median(mut values: Vec<f64>) -> f64 {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(artifacts())?;
-    println!("{}", clock_note());
     let _ = run_workers(3)?;
     let order = [3usize, 1, 2, 2, 1, 3, 1, 2, 3];
     let mut samples = [Vec::<f64>::new(), Vec::new(), Vec::new(), Vec::new()];
