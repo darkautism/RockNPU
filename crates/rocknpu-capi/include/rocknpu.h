@@ -38,6 +38,14 @@ int rocknpu_context_decode_cache_stats(
     rocknpu_decode_cache_stats * out);
 void rocknpu_context_destroy(rocknpu_context * context);
 
+int rocknpu_prewarm_quantized_m16(
+    rocknpu_context * context,
+    const uint8_t * weights,
+    size_t weights_bytes,
+    uint32_t quant_kind,
+    size_t k,
+    size_t n);
+
 int rocknpu_matmul_f16_f32_f32(
     rocknpu_context * context,
     const uint16_t * weights_nk_f16_bits,

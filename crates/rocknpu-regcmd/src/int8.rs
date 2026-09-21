@@ -81,6 +81,18 @@ fn patch_register(ops: &mut [u64; INT8_REGCMD_COUNT], reg: u16, value: u32) {
     *word = (*word & 0xffff_0000_0000_ffff) | ((value as u64) << 16);
 }
 
+fn patch_register_all(ops: &mut [u64; INT8_REGCMD_COUNT], reg: u16, value: u32) {
+    let mut patched = 0usize;
+    for word in ops.iter_mut().filter(|word| (**word as u16) == reg) {
+        *word = (*word & 0xffff_0000_0000_ffff) | ((value as u64) << 16);
+        patched += 1;
+    }
+    assert!(
+        patched > 0,
+        "validated int8 regcmd is missing register 0x{reg:04x}"
+    );
+}
+
 /// Index into the RK3588 full-K int8 weight layout `[N/32][K/32][32][32]`.
 /// `k_index` and `n_index` are zero-based logical coordinates of B[K,N].
 pub fn weight_i8_fullk_index(k: usize, n: usize, k_index: usize, n_index: usize) -> usize {
@@ -94,18 +106,18 @@ pub fn weight_i8_fullk_index(k: usize, n: usize, k_index: usize, n_index: usize)
     nt * kt * 32 * 32 + kb * 32 * 32 + nl * 32 + kk
 }
 
-/// Encode the hardware-proven W8A8 M=16 research tile.
-/// This remains separate from the production M=1 API; larger M values are rejected until
-/// they have their own Rocket correctness gate (M=32 currently wraps at row 16).
+/// Encode the hardware-validated research W8A8 multi-row tile.
+/// Production still routes M=16 by default. M=32/48/64 are exposed only through
+/// explicit research routing until the wider path is promoted.
 pub fn encode_int8_mtile(
     m: usize,
     desc: Int8DecodeDesc,
 ) -> Result<[u64; INT8_REGCMD_COUNT], Int8EncodeError> {
-    if m != 16 || desc.k == 0 || desc.n == 0 {
+    if !matches!(m, 16 | 32 | 48 | 64) || desc.k == 0 || desc.n == 0 {
         return Err(Int8EncodeError::InvalidShape {
             k: desc.k,
             n: desc.n,
-            reason: "research M-tile is hardware-proven only for M=16 and non-zero K/N",
+            reason: "research M-tile requires M in {16,32,48,64} and non-zero K/N",
         });
     }
     if !desc.k.is_multiple_of(512) || desc.k > 4096 {
@@ -130,7 +142,9 @@ pub fn encode_int8_mtile(
     let k = u32::try_from(desc.k).map_err(|_| Int8EncodeError::SizeOverflow)?;
     let n = u32::try_from(desc.n).map_err(|_| Int8EncodeError::SizeOverflow)?;
     let weight_elems = u32::try_from(
-        desc.k.checked_mul(desc.n).ok_or(Int8EncodeError::SizeOverflow)?,
+        desc.k
+            .checked_mul(desc.n)
+            .ok_or(Int8EncodeError::SizeOverflow)?,
     )
     .map_err(|_| Int8EncodeError::SizeOverflow)?;
 
@@ -165,14 +179,13 @@ pub fn encode_int8_mtile(
     );
 
     let scale = desc.k / 512;
-    let base = 177i32
-        - 15i32 * (i32::try_from(scale).map_err(|_| Int8EncodeError::SizeOverflow)? - 1);
+    let base =
+        177i32 - 15i32 * (i32::try_from(scale).map_err(|_| Int8EncodeError::SizeOverflow)? - 1);
     let slope = 15i32 * i32::try_from(scale).map_err(|_| Int8EncodeError::SizeOverflow)?;
     let mg = m.div_ceil(64).max(1);
-    let v = (base
-        - slope * (i32::try_from(mg).map_err(|_| Int8EncodeError::SizeOverflow)? - 1))
+    let v = (base - slope * (i32::try_from(mg).map_err(|_| Int8EncodeError::SizeOverflow)? - 1))
         .max(0x1b) as u32;
-    patch_register(&mut ops, 0x1040, v);
+    patch_register_all(&mut ops, 0x1040, v);
 
     patch_register(&mut ops, 0x1070, input_dma);
     patch_register(&mut ops, 0x1110, weights_dma);
@@ -184,7 +197,6 @@ pub fn encode_int8_mtile(
     patch_register(&mut ops, 0x3014, m_minus_1 << 16);
     Ok(ops)
 }
-
 
 /// Encode the current production-style W8A8 decode primitive:
 /// `C[1,N] i32 = A[1,K] i8 x B[K,N] i8`.

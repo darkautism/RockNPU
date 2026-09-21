@@ -2,8 +2,7 @@
 
 use rocket_runtime::{RocketBuffer, RocketDevice, RocketOwnedBuffer, Task};
 use rocknpu_regcmd::{
-    INT8_REGCMD_COUNT, Int8DecodeDesc, Int8EncodeError, encode_int8_decode_m1,
-    encode_int8_mtile, weight_i8_fullk_index,
+    INT8_REGCMD_COUNT, Int8DecodeDesc, Int8EncodeError, encode_int8_decode_m1, encode_int8_mtile,
 };
 use std::fmt;
 use std::io;
@@ -179,15 +178,20 @@ impl<'a> Int8DecodeExecutor<'a> {
             _guard: None,
         }
     }
-    /// Execute the hardware-proven research M=16 W8A8 tile against one full-K resident
+    /// Execute a hardware-validated research W8A8 M-tile against one full-K resident
     /// weight slice while reusing context-owned Rocket BOs across calls.
-    pub fn execute_prepared_m16_persistent(
+    pub fn execute_prepared_mtile_persistent(
         &self,
+        m: usize,
         a_mk: &[i8],
         weights: &Int8PreparedWeights,
         scratch_slot: &mut Option<Int8MtileScratch>,
     ) -> Result<Int8DecodeOutput, Int8DecodeError> {
-        const M: usize = 16;
+        if !matches!(m, 16 | 32 | 48 | 64) {
+            return Err(Int8DecodeError::InvalidInput(
+                "persistent M-tile path requires M in {16,32,48,64}",
+            ));
+        }
         let total_start = Instant::now();
         if self.device.fd() != weights.device_fd {
             return Err(Int8DecodeError::InvalidInput(
@@ -196,16 +200,16 @@ impl<'a> Int8DecodeExecutor<'a> {
         }
         if weights.slices != 1 || weights.k > SINGLE_SUBMIT_K_MAX {
             return Err(Int8DecodeError::InvalidInput(
-                "persistent M=16 path requires one full-K prepared weight slice",
+                "persistent M-tile path requires one full-K prepared weight slice",
             ));
         }
-        let expected_a = M
+        let expected_a = m
             .checked_mul(weights.k)
             .ok_or(Int8DecodeError::SizeOverflow)?;
         if a_mk.len() != expected_a {
-            return Err(Int8DecodeError::InvalidInput("A length must equal 16*K"));
+            return Err(Int8DecodeError::InvalidInput("A length must equal M*K"));
         }
-        let output_values = M
+        let output_values = m
             .checked_mul(weights.n)
             .ok_or(Int8DecodeError::SizeOverflow)?;
         let output_bytes = output_values
@@ -238,9 +242,9 @@ impl<'a> Int8DecodeExecutor<'a> {
             *scratch_slot = Some(scratch);
         }
         let alloc_ns = alloc_start.elapsed().as_nanos();
-        let scratch = scratch_slot
-            .as_mut()
-            .ok_or(Int8DecodeError::InvalidInput("persistent M=16 scratch missing"))?;
+        let scratch = scratch_slot.as_mut().ok_or(Int8DecodeError::InvalidInput(
+            "persistent M-tile scratch missing",
+        ))?;
 
         let input_stage_start = Instant::now();
         scratch.input.prep_relative(0)?;
@@ -255,7 +259,7 @@ impl<'a> Int8DecodeExecutor<'a> {
 
         let regcmd_stage_start = Instant::now();
         let ops = encode_int8_mtile(
-            M,
+            m,
             Int8DecodeDesc::new(
                 weights.k,
                 weights.n,
@@ -319,6 +323,15 @@ impl<'a> Int8DecodeExecutor<'a> {
                 total_ns: total_start.elapsed().as_nanos(),
             },
         })
+    }
+
+    pub fn execute_prepared_m16_persistent(
+        &self,
+        a_mk: &[i8],
+        weights: &Int8PreparedWeights,
+        scratch_slot: &mut Option<Int8MtileScratch>,
+    ) -> Result<Int8DecodeOutput, Int8DecodeError> {
+        self.execute_prepared_mtile_persistent(16, a_mk, weights, scratch_slot)
     }
 
     /// Original single-slice M=16 fast path. Keep this separate from the later K-split
@@ -501,10 +514,7 @@ impl<'a> Int8DecodeExecutor<'a> {
                     .checked_add(kp)
                     .ok_or(Int8DecodeError::SizeOverflow)?;
                 let dst_start = input_offset
-                    .checked_add(
-                        row.checked_mul(kp)
-                            .ok_or(Int8DecodeError::SizeOverflow)?,
-                    )
+                    .checked_add(row.checked_mul(kp).ok_or(Int8DecodeError::SizeOverflow)?)
                     .ok_or(Int8DecodeError::SizeOverflow)?;
                 let dst_end = dst_start
                     .checked_add(kp)
@@ -551,8 +561,7 @@ impl<'a> Int8DecodeExecutor<'a> {
             let output_dma = output
                 .dma_address()
                 .checked_add(
-                    u64::try_from(partial_offset)
-                        .map_err(|_| Int8DecodeError::SizeOverflow)?,
+                    u64::try_from(partial_offset).map_err(|_| Int8DecodeError::SizeOverflow)?,
                 )
                 .ok_or(Int8DecodeError::SizeOverflow)?;
             let ops = encode_int8_mtile(
@@ -565,9 +574,7 @@ impl<'a> Int8DecodeExecutor<'a> {
             write_regcmd_at(&mut regcmd, reg_offset, &ops)?;
             let reg_addr = regcmd
                 .dma_address()
-                .checked_add(
-                    u64::try_from(reg_offset).map_err(|_| Int8DecodeError::SizeOverflow)?,
-                )
+                .checked_add(u64::try_from(reg_offset).map_err(|_| Int8DecodeError::SizeOverflow)?)
                 .ok_or(Int8DecodeError::SizeOverflow)?;
             tasks.push(Task {
                 regcmd: u32::try_from(reg_addr)
@@ -668,22 +675,30 @@ impl<'a> Int8DecodeExecutor<'a> {
 
         let pack_start = Instant::now();
         bo.prep_relative(0)?;
-        bo.as_mut_slice().fill(0);
         let mut offsets = Vec::with_capacity(slices);
         let mut weight_offset = 0usize;
-        for slice in 0..slices {
-            offsets.push(weight_offset);
-            let k0 = slice_k0(slices, slice);
-            let kp = slice_kp(k, slices, slice);
-            for kk in 0..kp {
-                for col in 0..n {
-                    let dst = weight_offset + weight_i8_fullk_index(kp, n, kk, col);
-                    bo.as_mut_slice()[dst] = b_nk[col * k + k0 + kk] as u8;
+        let b_bytes: &[u8] = bytemuck::cast_slice(b_nk);
+        {
+            let packed = bo.as_mut_slice();
+            for slice in 0..slices {
+                offsets.push(weight_offset);
+                let k0 = slice_k0(slices, slice);
+                let kp = slice_kp(k, slices, slice);
+                let kt = kp / 32;
+                for nt in 0..n / 32 {
+                    for kb in 0..kt {
+                        for nl in 0..32 {
+                            let col = nt * 32 + nl;
+                            let src = col * k + k0 + kb * 32;
+                            let dst = weight_offset + nt * kt * 32 * 32 + kb * 32 * 32 + nl * 32;
+                            packed[dst..dst + 32].copy_from_slice(&b_bytes[src..src + 32]);
+                        }
+                    }
                 }
+                weight_offset = weight_offset
+                    .checked_add(kp.checked_mul(n).ok_or(Int8DecodeError::SizeOverflow)?)
+                    .ok_or(Int8DecodeError::SizeOverflow)?;
             }
-            weight_offset = weight_offset
-                .checked_add(kp.checked_mul(n).ok_or(Int8DecodeError::SizeOverflow)?)
-                .ok_or(Int8DecodeError::SizeOverflow)?;
         }
         bo.fini()?;
         let pack_ns = pack_start.elapsed().as_nanos();
