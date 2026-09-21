@@ -2,6 +2,15 @@
 
 Purpose: stop future agents from re-running already-decided RockNPU/RK3588 experiments. Prefer new HW evidence over argument.
 
+## 2026-09-22 — project-scope correction: kernel optimization is out of scope
+
+- RockNPU is a userspace runtime/reverse-engineering project. Do not create or maintain Rocket kernel optimizations as part of the project.
+- Historical IOMMU-domain cache, IRQ-affinity, scheduler/locality, custom workqueue, multi-entity, DVFS-driver, and voltage-probe experiments remain historical evidence only. Their performance figures are not project toplines and are not future optimization targets.
+- The local unpublished Rocket commit historically recorded as `3345d5f` was created during RockNPU research and must not be treated as a required or maintained dependency.
+- If a required capability exists only in an external kernel driver, use a publicly maintained/reachable driver as an external dependency or leave the capability unsupported. Do not solve it by growing a RockNPU kernel fork.
+- Any performance data collected after an NPU timeout in the same boot is invalid. Reboot before further measurement; do not attempt to recover benchmark credibility by additional runs in that boot.
+- Current userspace mechanisms must be validated against the packaged stock Rocket driver wherever the stock UAPI can execute them.
+
 ## 2026-09-22 — shared-host research Rocket incident / transient userspace corruption
 
 - **Observed:** o8g entered a state where unrelated userspace programs failed nondeterministically with SIGSEGV. During diagnosis, `cargo --version`, a real `rustc` compile, and even `/usr/bin/tail` failed at different times; `/etc/profile` also emitted an integer-expression error because its ordinary `id -u` substitution was no longer reliable. This was not a persistent toolchain-file failure: after reboot, 20 repeated cargo/rustc/tail probes and a fresh `cargo check -p rocknpu-regcmd` all passed.

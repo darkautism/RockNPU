@@ -67,7 +67,7 @@ All results below used the same prompt, draft limit 63, and reported 100% accept
 
 Conservative repeated **lookup-speculative verifier/decode** result: **127.181 tok/s**, about **2.42x** the measured CPU throughput under the same lookup-speculative workload. This is not a claim that ordinary M=1 autoregressive decode runs at 127 tok/s: the benchmark drafted 504 tokens in 63-token lookup batches and accepted 100% of them.
 
-The earlier highest controlled lookup-speculative result was **148.761 tok/s**, but that checkpoint did not fully preserve the RK3588 DSU/cpufreq state. After discovering that `policy0` also controls the shared DSU clock, the same 100%-acceptance M64 workload was repeated with `policy0`, `policy4`, and `policy6` all fixed to `performance`, and NPU fixed at 1 GHz. Two fresh RockNPU processes measured **174.507 tok/s** and **177.756 tok/s**. The corrected CPU target for the same lookup workload measured **62.130 tok/s**. The corrected verifier/decode speedup is therefore about **2.81x to 2.86x CPU**, with the two RockNPU runs centered around ~176 tok/s.
+The earlier highest controlled lookup-speculative result was **148.761 tok/s**, but that checkpoint did not fully preserve the RK3588 DSU/cpufreq state. Later reruns reported **174.507** and **177.756 tok/s** after fixing the CPU policy/DSU state, but those measurements are now **invalidated**: the board had already recorded three `NPU job timed out` events earlier in the same boot, and unrelated userspace later showed random SIGSEGVs. Keep the M64 mechanism and DSU finding; do not quote the 174-178 tok/s values as an authoritative baseline.
 
 Prompt + decode total time:
 - CPU: 10.972 s
@@ -191,11 +191,13 @@ These should not be reintroduced without a new reason:
 
 ## Pending hypotheses
 
-### P1: keep the corrected ~176 tok/s M64 baseline reproducible
+### P1: rebuild an authoritative fresh-boot M64 baseline
 
-A major source of the old 127-149 tok/s variance was an incomplete cpufreq contract: `policy0` changes the shared RK3588 DSU clock even when work is pinned to A76 cores. With all three CPU policies fixed to `performance`, two fresh 100%-acceptance runs measured 174.507 and 177.756 tok/s.
+A major source of the old 127-149 tok/s variance was an incomplete cpufreq contract: `policy0` changes the shared RK3588 DSU clock even when work is pinned to A76 cores. The later 174.507/177.756 tok/s runs cannot be used because they were taken after NPU timeouts in the same boot.
 
-Future variance work should begin only after recording `policy0/4/6`, DSU state when available, NPU frequency, model hash, and plugin provenance. If material variance remains under that contract, then investigate per-core Rocket wait variance, worker wakeup, NPU core synchronization, K-split serialization, and IRQ placement. Do not change the kernel/module merely to investigate this.
+A fresh-boot packaged-Rocket revalidation was completed on 2026-09-22 from a clean main build. At 100% acceptance, stock-driver A-B-B-A measured M64 at 126.174 / 122.309 tok/s and M128 at 137.932 / 136.478 tok/s. This establishes the M128 userspace gain independently of any custom kernel work. These absolute values are stock-200-MHz characterization only, not a replacement full-speed topline.
+
+Any future full-speed baseline must keep the same fresh-boot/provenance discipline, record `policy0/4/6`, DSU state when available, model hash, and plugin provenance, and must not depend on RockNPU-maintained kernel modifications.
 
 ### P2: eliminate the remaining three decode cache misses
 

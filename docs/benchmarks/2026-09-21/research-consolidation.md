@@ -10,15 +10,13 @@ All comparable RK3588 CPU/NPU measurements must set **all** CPU cpufreq policies
 - `policy0=performance`: DSU 1.8 GHz, 4xA76 sequential read about 25.29 GB/s, native CPU `tg128` about 34.29 tok/s.
 - Changing the NPU clock between 200 and 700 MHz did not cause this CPU throughput change. DDR remained at 2.112 GHz.
 
-With the corrected all-policy performance state and NPU fixed at 1 GHz, the repeated 100%-acceptance lookup-speculative M64 workload measured:
+The later 1 GHz / all-policy-performance M64 reruns that reported **174.507** and **177.756 tok/s** are **invalidated as performance evidence**. The board had already logged three `NPU job timed out` events earlier in the same boot, and unrelated userspace later became unstable. Those numbers must not supersede the earlier checkpoint or be used as a project topline.
 
-- RockNPU run 1: 513 decoded tokens in 2.940 s = **174.507 tok/s**, 504/504 accepted.
-- RockNPU run 2: 513 decoded tokens in 2.886 s = **177.756 tok/s**, 504/504 accepted.
-- CPU target: 513 decoded tokens in 8.257 s = **62.130 tok/s**, 504/504 accepted.
+The M64 userspace mechanism itself remains valid, but its corrected fresh-boot performance must be remeasured on a clean driver/boot before quoting a new speedup.
 
-Therefore the corrected verifier/decode speedup is about **2.81x to 2.86x CPU** on this workload. The two fresh-process RockNPU runs center around ~176 tok/s. This supersedes the older 127-149 tok/s checkpoint figures that were taken without a complete DSU/cpufreq contract.
+After the 2026-09-22 reboot, current main was rebuilt from a clean detached worktree and validated against the packaged stock Rocket driver with no module swap, no NPU devfreq node, and no voltage probe. The following userspace/hardware contracts passed again: M=1 K=5632 N=2048 full-K decode, M=128 K=2048 N=2048, fused residual M=16 K=2048 N=2048, and same-job WEIGHT_REUSE for two M128 tasks. These exact gates confirm that the mechanisms do not depend on the unpublished kernel experiments.
 
-For ordinary one-token generation, the corrected native CPU baseline is about **34.2-34.4 tok/s**. The current RockNPU M=1 direct-submit/persistent-scratch path measured **17.11 +/- 0.69 tok/s** in the corrected governor state. Ordinary M=1 remains a separate problem from the validated M64 verifier win.
+For ordinary one-token generation, the native CPU baseline is independently confirmed. The 2026-09-20 record was about 33.37 tok/s, and a fresh post-reboot 2026-09-22 rerun on the packaged stock Rocket boot measured **33.88 +/- 0.08 tok/s** with all CPU policies on `performance`. This CPU result does not depend on any Rocket kernel modification. The later post-timeout RockNPU M=1 toplines are invalidated and must be remeasured before quotation. Ordinary M=1 remains a separate problem from the M-tile verifier path.
 
 ## Branch/worktree audit
 

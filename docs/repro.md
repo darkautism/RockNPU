@@ -958,7 +958,9 @@ A second opt-in, `ROCKNPU_EXPERIMENT_DIRECT_SCRATCH=1`, keeps per-worker, per-pr
 
 For TinyLlama decode, forcing llama.cpp flash attention with `-fa on` also avoids the classic CPU attention chain (`KQ MUL_MAT -> SOFT_MAX -> KQV MUL_MAT -> CONT`) that `auto` selected in this mixed RockNPU/CPU configuration. The deterministic 24-token continuation remains exact. Two order-swapped `tg32,r=12` comparisons measured `15.84 ± 1.45` auto versus `16.40 ± 2.09 tok/s` with flash attention (+3.5% center), then `17.24 ± 1.96` with flash attention versus `15.51 ± 1.42 tok/s` auto (+11.2% center). This is a llama.cpp execution-mode result, not a new RockNPU NPU kernel. Applicability may vary by model/attention shape; unsupported or slower cases should retain the existing classic-attention fallback rather than globally forcing the mode without validation.
 
-### Experimental Rocket IOMMU-domain cache
+### Historical kernel experiment: Rocket IOMMU-domain cache
+
+> **Out of RockNPU scope.** This section records a past GPL Rocket-driver experiment. Its performance numbers must not be used as the current RockNPU userspace baseline, and the project will not maintain or reproduce this kernel optimization.
 
 The current Rocket scheduler attaches the submitting file's IOMMU domain to the selected NPU core for each job and detaches it again on completion. Low-overhead kprobes measured roughly `9.5 us` median attach plus `11.0 us` median detach on a small cached job. For M=1 decode, where RockNPU submits many short jobs, that fixed kernel cost is large enough to matter.
 
@@ -1082,4 +1084,4 @@ A55 IRQ tune   19.33 +/- 1.81 tok/s
 baseline       17.86 +/- 2.06 tok/s
 ```
 
-The `r=24` pair is about +8.2% in center. Across these three blocks the rough unweighted centers are `18.07` baseline versus `19.36 tok/s` tuned (~+7.1%). Treat approximately `19.3-19.4 tok/s` as the repeatable candidate center, not the single `19.57` block. The known CPU TinyLlama reference is about `21.23 tok/s`, so this tuning closes the NPU path to roughly 91% of CPU throughput.
+The `r=24` pair is about +8.2% in center. Across these three blocks the rough unweighted centers are `18.07` baseline versus `19.36 tok/s` tuned (~+7.1%). These `19.3-19.4 tok/s` figures are historical results from a custom Rocket/IOMMU-cache plus IRQ-tuning environment. They are not a RockNPU project topline and should not be compared with the later corrected native CPU baseline. The kernel-side tuning path is closed as out of project scope.

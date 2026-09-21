@@ -23,7 +23,7 @@ Standalone K5632/N2048:
 - 3-core N-split median: 2.780 ms
 - speedup: 1.57x
 
-In the real TinyLlama ordinary-generation path, the existing worker tuner now compares N-split full-K against K-split rather than forcing the old K3 workaround. A short trace after tuning reported worker_calls=[0,44,792], ksplit_calls=0, confirming that most calls selected 3-core N-split/full-K. Correct-governor tg128 measured 17.69 +/- 0.16 tok/s versus the prior 17.11 +/- 0.69 checkpoint.
+In the real TinyLlama ordinary-generation path, the existing worker tuner compares N-split full-K against K-split rather than forcing the old K3 workaround. The previously quoted 17.69 +/- 0.16 tok/s whole-model result is invalidated because it was measured after NPU timeouts in the same boot. After rebooting back to the packaged stock Rocket driver, the current code was rebuilt from clean main and M=1 K=5632 N=2048 passed an exact prepared-decode gate again. Keep the capability; remeasure any whole-model topline only on a clean boot.
 
 ### Native W8A8 M128
 
@@ -35,12 +35,9 @@ On-silicon:
 
 The M128 shape is now admitted through the existing persistent M-tile, pool, C ABI, and ggml-rocknpu native-Mtile router. M128 is restricted to per-submit K<=2048; K5632 FFN-down still uses the validated 3-core K-split, whose individual slices fit the M128 envelope.
 
-100%-acceptance lookup-speculative A/B, all CPU policies=performance and NPU=1 GHz:
-- M64 / draft-max 63: 174.324 tok/s, 504/504 accepted.
-- M128 / draft-max 127: 190.577 tok/s, 508/508 accepted.
-- fresh M128 repeat: 190.289 tok/s, 508/508 accepted.
+The later 1 GHz lookup-speculative A/B that reported 174.324 tok/s for M64 and about 190.3-190.6 tok/s for M128 is invalidated as performance evidence because the board had already experienced NPU timeouts earlier in that boot. The relative userspace mechanism remains worth testing, but those percentages are no longer authoritative.
 
-M128 therefore improves this verifier workload by about 9.2-9.3% over M64.
+After rebooting to the packaged stock Rocket driver, M=128 K=2048 N=2048 was rebuilt from clean main and passed bit-exact again, with five stock-driver submit/wait samples around 3.40-3.53 ms. A fresh-stock A-B-B-A lookup test at 100% acceptance measured M64 at 126.174 / 122.309 tok/s and M128 at 137.932 / 136.478 tok/s, or about +10.4% by the two-run centers. This clean-driver relative result replaces the discarded post-timeout +9.2-9.3% claim; the absolute values are stock-200-MHz characterization, not full-speed toplines.
 
 ### Fused FP16 matmul + residual add
 
@@ -67,11 +64,13 @@ An important negative result came first: setting bit13 inside a standalone M128 
 
 RockNPU now exposes a fail-closed `encode_int8_mtile_weight_reuse()` encoder and a hardware smoke that submits multiple same-weight tasks in one job. The encoder sets bit13 only after validating the weight tile against the task's 0x1040 bank geometry.
 
-On-silicon exact checks on o16g:
+Historical stock-driver exact checks included:
 - 2 x M64, K2048/N64: PASS with and without reuse.
 - 4 x M32, K2048/N64: PASS with and without reuse.
 - 8 x M16, K2048/N64: PASS with and without reuse.
 - 2 x M128 = total M256, K2048/N64: PASS with and without reuse.
+
+A fresh post-reboot o8g stock-driver rebuild revalidated the 2 x M128 = total M256 reuse path exactly.
 
 CPU-big-core performance-governor ABBA medians for total M128:
 - 2 x M64: baseline 388.8/411.5 us, reuse 356.4/391.4 us.
