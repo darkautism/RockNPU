@@ -49,6 +49,7 @@ For controlled performance work on a **dedicated benchmark host**, RockNPU has u
 - Do not load `npu_volt_probe.ko` or raise the NPU rail as part of ordinary RockNPU reproduction. Historical 1 GHz / 850 mV experiments are silicon-characterization data, not the supported baseline.
 - If the experimental driver reports any `NPU job timed out`, stop the benchmark immediately. Do not continue using that boot for performance work or unrelated long-lived services; reboot back to the packaged driver before continuing.
 - After any experiment, restore CPU governors and NPU frequency. Prefer a reboot to the packaged driver before returning the board to normal service.
+- **Provenance rule:** a benchmark that depends on a modified GPL Rocket driver must point to a publicly reachable repository/branch/commit (or an equivalently published patch source). A local-only Git hash is not reproducible provenance and must not be presented as a checkout instruction.
 - Do **not** request more than 700 MHz at 800 mV. The experimental driver refuses rates above 700 MHz unless the NPU rail is at least 850 mV.
 - Do **not** change the RK3588 NPU clock with `/dev/mem` or raw CRU writes. The NPU power domains must return to the 200 MHz safe rate around power-domain transitions; the devfreq driver handles that guard.
 - The debugfs `clk_summary` SCMI entry may remain stale. Use the devfreq `cur_freq` / `target_freq` values and workload measurements to verify the requested clock.

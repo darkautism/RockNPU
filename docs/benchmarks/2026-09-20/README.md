@@ -20,7 +20,7 @@
 - 同一未修改的 llama.cpp source：`391fac16460f15233a7740550d858ac96df3419d`。o8 正式比較共用 `build-native-0920/bin/llama-bench`，Release、`GGML_NATIVE=ON`、`GGML_BACKEND_DL=ON`。
 - 模型：TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf，667,814,880 bytes；SHA-256 `5c66751b61537f9e55177b1b67e06af88e0e2df88f86de4909f5bf87fb1ae583`。
 - CPU 使用四個 A76（`taskset -c 4-7`、`-t 4`）、performance governor、flash attention on。額外測過全八核心，速度較慢，因此比較採用較快的四核心設定。
-- NPU 固定 700 MHz／既有 800 mV。o8 使用公開的 devfreq Rocket 研究模組 `sky-rk3588/rk3588-npu-gpu@ed52a89afa8e68fedf636c8e891bd8fc47e82d26`。o16 當時使用一個額外含 IOMMU-domain cache 的**本機研究 patch**（歷史工作樹 tip 曾記為 `3345d5f472e30b66b6c0d9640518c5315c99add5`），但該 commit 未發布、目前不能由讀者 checkout，因此 o16 數字只作歷史交叉驗證，不能視為可重現基線。這不是封裝版 200 MHz stock Rocket 的性能。
+- NPU 固定 700 MHz／既有 800 mV。o8 使用公開的 devfreq Rocket 研究模組 `sky-rk3588/rk3588-npu-gpu@ed52a89afa8e68fedf636c8e891bd8fc47e82d26`。o16 當時使用的是 **RockNPU 研究過程中為了測試滿速 decode 而自行修改出的 GPL Rocket 工作樹**，其中加入 IOMMU-domain cache；當時本機 commit 曾記為 `3345d5f472e30b66b6c0d9640518c5315c99add5`。這個 commit 從未發布到公開 repo，因此讀者不可能只靠該 hash 重現。相關 o16 數字只能視為歷史研究資料，不能當成可 checkout 的公開基線。這不是封裝版 200 MHz stock Rocket 的性能。
 - CPU process 清除 `GGML_BACKEND_PATH` 與所有 `ROCKNPU_*`，指定 `-dev none -nopo 1` 並核對 CPU-only loader。載入 ACCEL plugin 時單獨 `-dev none` 不足以隔離 CPU。
 - 混合模式為 `ROCKNPU_PREFILL_CACHE=1 ROCKNPU_DECODE=0`：NPU 執行對齊的 prompt matmul，CPU 逐字生成。無 W8 sidecar、無額外 W8A8 量化。權重與啟動值在 prefill 轉為 FP16，NPU partial 為 FP32，K 累加使用 host f64。
 

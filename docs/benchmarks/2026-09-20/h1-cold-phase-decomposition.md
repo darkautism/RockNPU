@@ -15,7 +15,7 @@ This note is diagnostic evidence only. The profiling build is **not** used for f
 
 o8g ran at NPU 700 MHz with all CPU policies on `performance`. Its external Rocket research tree was clean at `ed52a89afa8e68fedf636c8e891bd8fc47e82d26`; NPU IRQs 97-99 were on CPU0.
 
-o16g independently rebuilt the same profiler commit, also at NPU 700 MHz with all CPU policies on `performance`. Its Rocket tree was a local, unpublished IOMMU-domain-cache research patch whose historical tip was recorded as `3345d5f472e30b66b6c0d9640518c5315c99add5`; that hash is not available from the public upstream and must not be presented as a reproducible checkout target. The three NPU IRQs were distributed over CPU0/CPU1/CPU2. This remains useful only as a historical cross-machine check across different driver/IRQ states.
+o16g independently rebuilt the same profiler commit, also at NPU 700 MHz with all CPU policies on `performance`. Its Rocket tree was a **RockNPU-created local GPL research modification made to test higher-throughput decode**, including an IOMMU-domain cache; the local tip was recorded as `3345d5f472e30b66b6c0d9640518c5315c99add5`. That commit was never published, so the hash is not a reproducible checkout target by itself. The three NPU IRQs were distributed over CPU0/CPU1/CPU2. This remains useful only as a historical cross-machine check across different driver/IRQ states.
 
 Targeted correctness before profiling passed independently on both boards: rocknpu-capi 8/8 and rocknpu-matmul 20/20.
 
