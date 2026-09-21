@@ -304,6 +304,25 @@ mod tests {
     }
 
     #[test]
+    fn mtile_updates_every_repeated_reduction_schedule_register() {
+        let ops = encode_int8_mtile(
+            64,
+            Int8DecodeDesc::new(2048, 2048, 0x1111_1000, 0x2222_2000, 0x3333_3000),
+        )
+        .unwrap();
+        let values = ops
+            .iter()
+            .filter(|word| (**word as u16) == 0x1040)
+            .map(|word| ((*word >> 16) & 0xffff_ffff) as u32)
+            .collect::<Vec<_>>();
+        assert!(
+            values.len() >= 2,
+            "INT8 template must retain repeated 0x1040 writes"
+        );
+        assert!(values.iter().all(|&value| value == values[0]));
+    }
+
+    #[test]
     fn m1_k2048_n2048_geometry_matches_ork_synth_contract() {
         let ops = encode_int8_decode_m1(Int8DecodeDesc::new(
             2048,

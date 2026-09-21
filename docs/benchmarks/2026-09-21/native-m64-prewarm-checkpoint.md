@@ -1,0 +1,254 @@
+# RK3588 TinyLlama decode checkpoint — 2026-09-21
+
+## Scope
+
+This checkpoint consolidates the M16 verifier-split work, native wider INT8 M-tile work, FFN-down K-split work, and decode-cache prewarm experiments into one self-contained research branch: `research/native-m64-prewarm-0921`.
+
+Target workload:
+- TinyLlama GGUF
+- speculative decode with `--spec-draft-n-max 63`
+- `-n 512`
+- `-t 4 -tb 4`
+- `taskset -c 4-7`
+- deterministic sampling: `--temp 0 --top-k 1 --seed 1`
+- model and llama binaries copied to `/tmp` tmpfs for benchmark stability
+- no eMMC migration; `/build` remains the intentional NVMe/TCP workspace
+
+No kernel source or Rocket kernel module changes are part of this checkpoint.
+
+## Current best path
+
+Required research toggles:
+
+```text
+ROCKNPU_RUNTIME_M16_ROUTER=1
+ROCKNPU_NATIVE_MTILE=1
+ROCKNPU_NATIVE_MTILE_DOWN=1
+ROCKNPU_RUNTIME_M16_PREWARM=1
+ROCKNPU_MTILE_MC=1
+ROCKNPU_W8_MTILE=1
+ROCKNPU_W8_MTILE_SCOPE=all
+ROCKNPU_MTILE_PERSIST=1
+ROCKNPU_PREFILL_CACHE=1
+ROCKNPU_DECODE=0
+```
+
+Do not enable `ROCKNPU_MTILE_QO_GROUP` for the current best configuration.
+
+For controlled comparison only, the benchmark temporarily fixed:
+- NPU minimum frequency to 1 GHz through the existing devfreq node
+- big CPU clusters to `performance`
+
+The benchmark command restored the previous governors afterward.
+
+## Verified results
+
+All results below used the same prompt, draft limit 63, and reported 100% acceptance with `n_accept=504`.
+
+| Path | Encode | Decode | Decode throughput |
+|---|---:|---:|---:|
+| CPU, big cores performance | 1.223 s | 9.749 s | 52.619 tok/s |
+| Native M64 + FFN-down K-split, no prewarm | 1.833 s | 5.988 s | 85.666 tok/s |
+| Native M64 + FFN-down K-split + prewarm, run 1 | 3.486 s | 3.448 s | 148.761 tok/s |
+| Native M64 + FFN-down K-split + prewarm, repeat | 3.509 s | 4.034 s | 127.181 tok/s |
+
+Conservative repeated decode result: **127.181 tok/s**, about **2.42x** the measured CPU decode throughput.
+
+The highest observed controlled decode result is **148.761 tok/s**, about **2.83x** CPU, but this is not yet treated as the stable floor because the repeated run was lower.
+
+Prompt + decode total time:
+- CPU: 10.972 s
+- NPU no-prewarm: 7.821 s
+- NPU prewarm run 1: 6.934 s
+- NPU prewarm repeat: 7.543 s
+
+Prewarm therefore moves substantial preparation work before decode, but it did not merely hide the cost: both controlled prewarm runs were still faster end-to-end than CPU, and both were faster end-to-end than the measured no-prewarm NPU run.
+
+## Confirmed findings
+
+### Native M64 is real and correct
+
+The previous M32 wrap failure was caused by RockNPU patching only the first matching `0x1040` register in the INT8 template. The template contains repeated `0x1040` writes.
+
+Changing the research M-tile path to patch every matching `0x1040` entry made M32 and M64 pass the on-silicon bit-exact smoke test.
+
+Latest smoke:
+
+```text
+INT8 MTILE PASS M=16 K=2048 N=2048
+INT8 MTILE PASS M=32 K=2048 N=2048
+INT8 MTILE PASS M=64 K=2048 N=2048
+```
+
+The merge candidate intentionally exposes only M=16/32/48/64. Wider M values were not promoted merely because the register formula accepts them.
+
+### Native M64 removes repeated M16 orchestration
+
+On the same adapter/runtime binary, short A/B:
+
+- native M64: 34.696 tok/s
+- 4x sequential M16: 28.652 tok/s
+- improvement: about 21%
+- acceptance: 100% on both
+
+Profile delta:
+
+- projection calls: 1056 -> 264
+- wait time: 1862 ms -> 890 ms
+- execute time: 946 ms -> 517 ms
+
+Long A/B:
+
+- native M64: 73.664 tok/s
+- 4x sequential M16: 57.000 tok/s
+- improvement: about 29%
+- acceptance: 100%
+
+### M64 is the useful native batch size for this workload
+
+Measured native long runs:
+
+- M32 / draft31: 61.661 tok/s
+- M48 / draft47: 57.355 tok/s
+- M64 / draft63: 73.664 tok/s
+
+A hybrid M80 attempt using M64 + M16 fell to 25.049 tok/s and was stopped. Do not continue increasing speculative batch merely to create a larger M.
+
+### FFN-down K=5632 is now accelerated with 3-core K-split
+
+The previous single-core M16 FFN-down K-split experiment was slower because it allocated partial buffers and performed host accumulation on an already-small M16 tile.
+
+The new path uses native M64 and splits K=5632 across three NPU workers:
+
+```text
+K slices = 2048 + 2048 + 1536
+```
+
+Each worker runs a hardware-validated M64 tile, and the pool accumulates the three int32 partial outputs.
+
+n128 A/B:
+- base native M64: 38.514 tok/s
+- + native FFN-down K-split: 47.600 tok/s
+- about +23.6%
+- acceptance 100%
+
+n512 A/B under normal ondemand conditions:
+- base: 72.943 tok/s
+- + FFN-down K-split: 82.071 tok/s
+- about +12.5%
+- acceptance 100%
+
+Controlled fixed-frequency run without prewarm:
+- 85.666 tok/s
+- acceptance 100%
+
+### Prewarm is now effective
+
+The earlier prewarm attempt was ineffective because:
+- the adapter hook was not on the actual split/router path used by the best benchmark;
+- it only considered a subset of K/N shapes;
+- it did not prepare the new K=5632,N=2048 FFN-down K-split form.
+
+The consolidated path prewarms:
+- K=2048,N=256
+- K=2048,N=2048
+- K=2048,N=5632
+- K=5632,N=2048
+
+and selects N-split or K-split resident preparation to match the runtime path.
+
+Measured decode cache:
+- before effective prewarm: 154 misses
+- after effective prewarm: 3 misses, 1229 hits
+
+This is the main reason decode throughput jumped from the mid-80s to 127-149 tok/s in controlled runs.
+
+## Negative / closed-for-now experiments
+
+These should not be reintroduced without a new reason:
+
+- grouped Q/O M16 (`ROCKNPU_MTILE_QO_GROUP=1024`) — worse than ungrouped native routing
+- process/global/little-core/phase affinity experiments — worse
+- NEON + prefetch weight-layout experiment — microbenchmark gain did not survive real A/B
+- Q6 W8 preparation via Rayon — reduced preparation time but hurt end-to-end runtime through CPU/NPU contention
+- M80 hybrid speculative batch — major regression
+- old single-core `ROCKNPU_MTILE_DOWN` path — superseded by native M64 + 3-core K-split
+
+## Pending hypotheses
+
+### P1: explain 127-149 tok/s controlled-run variance
+
+Both runs used fixed NPU/CPU frequency and 100% acceptance, but decode varied materially.
+
+The profile difference is dominated by wait/input timing rather than cache misses. Investigate:
+- per-core Rocket wait variance
+- worker scheduling/wakeup latency
+- NPU core synchronization behavior
+- whether the three K-split workers create occasional serialization
+- IRQ / kernel worker placement
+
+Do not change the kernel/module merely to investigate this; profile userspace and existing driver behavior first.
+
+### P2: eliminate the remaining three decode cache misses
+
+Prewarm reduces 154 misses to 3. Identify exactly which weights/shapes remain cold. If they are stable graph weights, add them to prewarm. If they are genuinely dynamic, leave them alone.
+
+### P3: reduce prewarm cost without reintroducing contention
+
+Prewarm improves decode dramatically but increases encode/prefill time from ~1.8 s to ~3.5 s in the measured NPU run.
+
+Potential directions:
+- move preparation earlier than first prompt execution when model lifetime allows
+- persist prepared W8 layout safely across repeated sessions/process lifetime
+- avoid duplicate host conversions between N-split and K-split cache forms
+- reuse prepared source weights when the same tensor is needed by multiple execution geometries
+
+Do not repeat the rejected Q6 Rayon conversion as-is.
+
+### P4: promote native M64 out of research gating
+
+Before changing defaults:
+- repeat across different prompts
+- repeat after process restart
+- validate at least one additional compatible model/shape set
+- keep M32/M48/M64 bit-exact smoke in CI or hardware-gated validation
+
+### P5: PRIME/shared-BO remains pending
+
+The earlier cross-fd PRIME/shared-BO experiment functioned but teardown coincided with system-wide userspace instability on o16g. It remains pending, not rejected.
+
+Do not revisit until lifetime/teardown ownership is explicitly designed and tested.
+
+## External research
+
+ORK research was useful for re-checking the INT8 M-tile assumptions and the duplicated register patch behavior. This checkpoint does not copy external kernel/driver code into the MIT RockNPU tree.
+
+## Safe benchmark notes
+
+- Keep model/binaries in `/tmp` tmpfs when measuring; this avoids NVMe/TCP read stalls.
+- Do not move the workload to eMMC.
+- Do not persist experimental clock/governor settings as part of the code change.
+- Do not reload/replace Rocket kernel modules for ordinary M64/prewarm validation.
+
+## Consolidated-branch validation
+
+The final self-contained branch was rebuilt from a fresh CMake build directory using its own CAPI source tree. Final gates:
+
+- repeated-register regression test: PASS
+- hardware smoke M16: PASS
+- hardware smoke M32: PASS
+- hardware smoke M64: PASS
+- consolidated plugin short sanity: 155.356 tok/s, `n_accept=126`, 100% acceptance, 3 cache misses
+- no external RockNPU source override in CMake
+
+## Stage conclusion
+
+This checkpoint changes the project conclusion materially:
+
+- RockNPU no longer merely edges out CPU on TinyLlama decode.
+- Native M64 is hardware-correct and materially reduces submit/wait overhead.
+- FFN-down K=5632 is profitably accelerated with 3-core K-split.
+- Effective prewarm removes almost all first-decode M-tile cache misses.
+- A conservative repeated controlled result is 127.181 tok/s versus 52.619 tok/s CPU, with 100% speculative acceptance.
+
+The next optimization stage should focus on variance and the final three misses, not larger speculative M values or another round of generic host micro-optimizations.

@@ -438,6 +438,10 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
         bool all_m16 = true;
         bool all_w8_m16 = true;
         const bool split_m32 = rocknpu_env_enabled("ROCKNPU_M32_AS_2X16");
+        const bool chunk_m16 = rocknpu_env_enabled("ROCKNPU_M16_CHUNK_BATCH");
+        const bool native_mtile = rocknpu_env_enabled("ROCKNPU_NATIVE_MTILE");
+        const bool prewarm_mtile = rocknpu_env_enabled("ROCKNPU_RUNTIME_M16_PREWARM");
+        std::vector<const ggml_tensor *> prewarm_weights;
         bool force_cpu_shape = false;
         const bool cpu_kv = rocknpu_env_enabled("ROCKNPU_RUNTIME_CPU_KV");
         const bool cpu_qo = rocknpu_env_enabled("ROCKNPU_RUNTIME_CPU_QO");
@@ -450,18 +454,39 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
             has_mul_mat = true;
             const ggml_tensor * weights = node->src[0];
             const ggml_tensor * activations = node->src[1];
+            const bool quantized = weights != nullptr &&
+                (weights->type == GGML_TYPE_Q4_K || weights->type == GGML_TYPE_Q6_K);
+            if (prewarm_mtile && quantized) {
+                const size_t k = static_cast<size_t>(weights->ne[0]);
+                const size_t n = static_cast<size_t>(weights->ne[1]);
+                const bool prewarm_shape =
+                    (k == 2048 && (n == 256 || n == 2048 || n == 5632)) ||
+                    (k == 5632 && n == 2048);
+                if (prewarm_shape) {
+                    prewarm_weights.push_back(weights);
+                }
+            }
+            const bool native_batch = native_mtile && quantized && activations != nullptr &&
+                activations->ne[1] >= 32 && activations->ne[1] <= 64 && activations->ne[1] % 16 == 0;
             const bool supported_batch = activations != nullptr &&
-                (activations->ne[1] == 16 || (split_m32 && activations->ne[1] == 32));
+                (activations->ne[1] == 16 || native_batch ||
+                 (split_m32 && activations->ne[1] == 32) ||
+                 (chunk_m16 && activations->ne[1] >= 32 && activations->ne[1] <= 128 &&
+                  activations->ne[1] % 16 == 0));
             if (!supported_batch) {
                 all_m16 = false;
             }
-            const bool quantized = weights != nullptr &&
-                (weights->type == GGML_TYPE_Q4_K || weights->type == GGML_TYPE_Q6_K);
-            const bool w8_shape = quantized && activations != nullptr && activations->ne[1] == 16 &&
+            const bool w8_shape = quantized && activations != nullptr &&
+                (activations->ne[1] == 16 || native_batch) &&
                 weights->ne[0] > 0 && weights->ne[0] <= 4096 && weights->ne[0] % 512 == 0 &&
                 weights->ne[1] > 0 && weights->ne[1] <= 8192 && weights->ne[1] % 32 == 0;
             all_w8_m16 = all_w8_m16 && w8_shape;
-            if (quantized && activations != nullptr && activations->ne[1] == 16 && weights->ne[0] == 2048) {
+            const bool routed_batch = activations != nullptr &&
+                (activations->ne[1] == 16 || native_batch ||
+                 (split_m32 && activations->ne[1] == 32) ||
+                 (chunk_m16 && activations->ne[1] >= 32 && activations->ne[1] <= 128 &&
+                  activations->ne[1] % 16 == 0));
+            if (quantized && routed_batch && weights->ne[0] == 2048) {
                 force_cpu_shape = force_cpu_shape || (cpu_kv && weights->ne[1] == 256);
                 force_cpu_shape = force_cpu_shape || (cpu_qo && weights->ne[1] == 2048);
                 force_cpu_shape = force_cpu_shape || (cpu_ffn && weights->ne[1] == 5632);
@@ -469,6 +494,24 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
         }
         const bool route_w8_only = rocknpu_env_enabled("ROCKNPU_RUNTIME_M16_W8_ONLY");
         if (has_mul_mat && (!all_m16 || (route_w8_only && !all_w8_m16) || force_cpu_shape)) {
+            if (prewarm_mtile) {
+                for (const ggml_tensor * weights : prewarm_weights) {
+                    uint32_t kind = 0;
+                    if (!rocknpu_quant_kind(weights, &kind)) {
+                        continue;
+                    }
+                    const int status = rocknpu_prewarm_quantized_m16(
+                        context->runtime,
+                        static_cast<const uint8_t *>(weights->data),
+                        ggml_nbytes(weights),
+                        kind,
+                        static_cast<size_t>(weights->ne[0]),
+                        static_cast<size_t>(weights->ne[1]));
+                    if (status != ROCKNPU_STATUS_OK) {
+                        return GGML_STATUS_FAILED;
+                    }
+                }
+            }
             context->cpu_fallback_calls++;
             return ggml_backend_graph_compute(context->cpu_fallback, graph);
         }
@@ -750,20 +793,25 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                         m == 1 ? (w4a4_m1 ? "w4a4_m1" : "w8a8_m1") : "fp16_bridge");
                 }
                 int status;
-                const bool split_m32 = m == 32 && rocknpu_env_enabled("ROCKNPU_M32_AS_2X16");
-                if (split_m32) {
+                const bool native_mtile = m >= 32 && m <= 64 && m % 16 == 0 &&
+                    rocknpu_env_enabled("ROCKNPU_NATIVE_MTILE") &&
+                    (weights->type == GGML_TYPE_Q4_K || weights->type == GGML_TYPE_Q6_K);
+                const bool split_m32 = !native_mtile && m == 32 && rocknpu_env_enabled("ROCKNPU_M32_AS_2X16");
+                const bool split_chunked = !native_mtile && m >= 32 && m <= 128 && m % 16 == 0 &&
+                    rocknpu_env_enabled("ROCKNPU_M16_CHUNK_BATCH");
+                if (split_m32 || split_chunked) {
                     const float * input = static_cast<const float *>(activations->data);
                     float * output = static_cast<float *>(node->data);
                     const size_t input_stride = 16 * k;
                     const size_t output_stride = 16 * n;
-                    const auto run_half = [&](const float * half_input, float * half_output) -> int {
+                    const auto run_chunk = [&](const float * chunk_input, float * chunk_output) -> int {
                         if (weights->type == GGML_TYPE_Q4_K) {
                             return rocknpu_matmul_q4_k_f32_f32(
                                 context->runtime,
                                 static_cast<const uint8_t *>(weights->data),
                                 ggml_nbytes(weights),
-                                half_input,
-                                half_output,
+                                chunk_input,
+                                chunk_output,
                                 16,
                                 k,
                                 n);
@@ -773,8 +821,8 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                                 context->runtime,
                                 static_cast<const uint8_t *>(weights->data),
                                 ggml_nbytes(weights),
-                                half_input,
-                                half_output,
+                                chunk_input,
+                                chunk_output,
                                 16,
                                 k,
                                 n);
@@ -782,15 +830,17 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                         return rocknpu_matmul_f16_f32_f32(
                             context->runtime,
                             static_cast<const uint16_t *>(weights->data),
-                            half_input,
-                            half_output,
+                            chunk_input,
+                            chunk_output,
                             16,
                             k,
                             n);
                     };
-                    status = run_half(input, output);
-                    if (status == ROCKNPU_STATUS_OK) {
-                        status = run_half(input + input_stride, output + output_stride);
+                    status = ROCKNPU_STATUS_OK;
+                    for (size_t chunk = 0; chunk < m / 16 && status == ROCKNPU_STATUS_OK; ++chunk) {
+                        status = run_chunk(
+                            input + chunk * input_stride,
+                            output + chunk * output_stride);
                     }
                 } else {
                     rocknpu_w8_tensor * native_w8 = (m == 1 || m == 16) ? rocknpu_w8_sidecar_get(
