@@ -52,9 +52,9 @@ All results below used the same prompt, draft limit 63, and reported 100% accept
 | Native M64 + FFN-down K-split + prewarm, run 1 | 3.486 s | 3.448 s | 148.761 tok/s |
 | Native M64 + FFN-down K-split + prewarm, repeat | 3.509 s | 4.034 s | 127.181 tok/s |
 
-Conservative repeated decode result: **127.181 tok/s**, about **2.42x** the measured CPU decode throughput.
+Conservative repeated **lookup-speculative verifier/decode** result: **127.181 tok/s**, about **2.42x** the measured CPU throughput under the same lookup-speculative workload. This is not a claim that ordinary M=1 autoregressive decode runs at 127 tok/s: the benchmark drafted 504 tokens in 63-token lookup batches and accepted 100% of them.
 
-The highest observed controlled decode result is **148.761 tok/s**, about **2.83x** CPU, but this is not yet treated as the stable floor because the repeated run was lower.
+The highest observed controlled lookup-speculative result is **148.761 tok/s**, about **2.83x** the same CPU workload, but this is not yet treated as the stable floor because the repeated run was lower.
 
 Prompt + decode total time:
 - CPU: 10.972 s
@@ -62,7 +62,9 @@ Prompt + decode total time:
 - NPU prewarm run 1: 6.934 s
 - NPU prewarm repeat: 7.543 s
 
-Prewarm therefore moves substantial preparation work before decode, but it did not merely hide the cost: both controlled prewarm runs were still faster end-to-end than CPU, and both were faster end-to-end than the measured no-prewarm NPU run.
+Prewarm therefore moves substantial preparation work before decode, but it did not merely hide the cost: both controlled prewarm runs were still faster end-to-end than CPU, and both were faster end-to-end than the measured no-prewarm NPU run. On the repeated run, total prompt+decode time was 7.543 s versus 10.972 s for CPU, about a 1.45x end-to-end request speedup; the 2.42x figure applies to the lookup-speculative decode phase only.
+
+A separate ordinary non-speculative `llama-bench tg128` sanity run at the same controlled 1 GHz NPU / performance big-core setting measured **13.79 +/- 0.85 tok/s** on RockNPU versus **10.45 +/- 0.09 tok/s** on the four-core CPU for this Q4_K_M GGUF. This serial-generation result is the appropriate local number to consider when comparing against conventional one-token-at-a-time runtimes; it is not directly interchangeable with the 127-149 tok/s lookup-speculative numbers.
 
 ## Confirmed findings
 
