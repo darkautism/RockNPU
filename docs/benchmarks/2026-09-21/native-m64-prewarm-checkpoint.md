@@ -67,7 +67,7 @@ All results below used the same prompt, draft limit 63, and reported 100% accept
 
 Conservative repeated **lookup-speculative verifier/decode** result: **127.181 tok/s**, about **2.42x** the measured CPU throughput under the same lookup-speculative workload. This is not a claim that ordinary M=1 autoregressive decode runs at 127 tok/s: the benchmark drafted 504 tokens in 63-token lookup batches and accepted 100% of them.
 
-The highest observed controlled lookup-speculative result is **148.761 tok/s**, about **2.83x** the same CPU workload, but this is not yet treated as the stable floor because the repeated run was lower.
+The earlier highest controlled lookup-speculative result was **148.761 tok/s**, but that checkpoint did not fully preserve the RK3588 DSU/cpufreq state. After discovering that `policy0` also controls the shared DSU clock, the same 100%-acceptance M64 workload was repeated with `policy0`, `policy4`, and `policy6` all fixed to `performance`, and NPU fixed at 1 GHz. Two fresh RockNPU processes measured **174.507 tok/s** and **177.756 tok/s**. The corrected CPU target for the same lookup workload measured **62.130 tok/s**. The corrected verifier/decode speedup is therefore about **2.81x to 2.86x CPU**, with the two RockNPU runs centered around ~176 tok/s.
 
 Prompt + decode total time:
 - CPU: 10.972 s
@@ -77,7 +77,7 @@ Prompt + decode total time:
 
 Prewarm therefore moves substantial preparation work before decode, but it did not merely hide the cost: both controlled prewarm runs were still faster end-to-end than CPU, and both were faster end-to-end than the measured no-prewarm NPU run. On the repeated run, total prompt+decode time was 7.543 s versus 10.972 s for CPU, about a 1.45x end-to-end request speedup; the 2.42x figure applies to the lookup-speculative decode phase only.
 
-A separate ordinary non-speculative `llama-bench tg128` sanity run in the speculative-checkpoint environment measured **13.79 +/- 0.85 tok/s** on RockNPU versus **10.45 +/- 0.09 tok/s** on the four-core CPU for this Q4_K_M GGUF. That CPU number is **not a valid native CPU baseline** because this checkpoint did not preserve a complete all-policy cpufreq contract; on this RK3588 board, leaving `policy0` on `ondemand` throttles the shared DSU/L3 path even when the A76 clusters are fixed at 2.4 GHz. This was a sanity measurement under the speculative-checkpoint environment, **not the best known ordinary-generation configuration**. Earlier validated M=1 work on the same project reached about **16 tok/s** with caller-thread direct submit + persistent scratch, and about **19.3-19.4 tok/s** in the research-driver configuration with per-core IOMMU-domain caching plus the validated A55 IRQ-latency tune at 700 MHz / 800 mV. The native-M64 path only applies to M=32..64 and does not accelerate ordinary M=1 generation. Therefore 13.79 must not be used as the project-wide ordinary-generation ceiling. None of these ordinary-generation figures is directly interchangeable with the 127-149 tok/s lookup-speculative verifier numbers.
+A separate ordinary non-speculative `llama-bench tg128` sanity run in the original speculative-checkpoint environment measured **13.79 +/- 0.85 tok/s** on RockNPU versus **10.45 +/- 0.09 tok/s** on the four-core CPU. Those numbers are invalid as current baselines because the checkpoint did not preserve the all-policy cpufreq/DSU contract. After fixing `policy0`, `policy4`, and `policy6` to `performance`, native CPU ordinary generation returned to about **34.2-34.4 tok/s**, matching the earlier 2026-09-20 record, while the current RockNPU M=1 direct-submit/persistent-scratch path measured **17.11 +/- 0.69 tok/s**. The native-M64 path only applies to M=32..64 and does not accelerate ordinary M=1 generation. Ordinary M=1 and lookup-speculative verifier throughput must therefore remain separate metrics.
 
 ## Confirmed findings
 
@@ -191,18 +191,11 @@ These should not be reintroduced without a new reason:
 
 ## Pending hypotheses
 
-### P1: explain 127-149 tok/s controlled-run variance
+### P1: keep the corrected ~176 tok/s M64 baseline reproducible
 
-Both runs used fixed NPU/CPU frequency and 100% acceptance, but decode varied materially.
+A major source of the old 127-149 tok/s variance was an incomplete cpufreq contract: `policy0` changes the shared RK3588 DSU clock even when work is pinned to A76 cores. With all three CPU policies fixed to `performance`, two fresh 100%-acceptance runs measured 174.507 and 177.756 tok/s.
 
-The profile difference is dominated by wait/input timing rather than cache misses. Investigate:
-- per-core Rocket wait variance
-- worker scheduling/wakeup latency
-- NPU core synchronization behavior
-- whether the three K-split workers create occasional serialization
-- IRQ / kernel worker placement
-
-Do not change the kernel/module merely to investigate this; profile userspace and existing driver behavior first.
+Future variance work should begin only after recording `policy0/4/6`, DSU state when available, NPU frequency, model hash, and plugin provenance. If material variance remains under that contract, then investigate per-core Rocket wait variance, worker wakeup, NPU core synchronization, K-split serialization, and IRQ placement. Do not change the kernel/module merely to investigate this.
 
 ### P2: eliminate the remaining three decode cache misses
 
