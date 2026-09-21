@@ -750,7 +750,8 @@ Build the adapter and its Rust C ABI sidecar:
 ```sh
 cmake -S adapters/ggml-rocknpu \
   -B target/ggml-rocknpu \
-  -DGGML_SOURCE_DIR=/build/llama.cpp-reference/ggml
+  -DGGML_SOURCE_DIR=/build/llama.cpp-reference/ggml \
+  -DGGML_CPU_LIBRARY=/build/llama.cpp-reference/build-native-0920/bin/libggml-cpu.so
 cmake --build target/ggml-rocknpu -j 8
 ```
 

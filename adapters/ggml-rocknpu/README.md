@@ -6,7 +6,7 @@ The adapter is the only layer allowed to depend on GGML backend ABI types. RockN
 
 Validated against unmodified llama.cpp commit `391fac16460f15233a7740550d858ac96df3419d`.
 
-For normal `GGML_BACKEND_PATH` auto-loading, build llama.cpp with its stock dynamic-backend option enabled (`-DGGML_BACKEND_DL=ON`). A build with static CPU registration (`GGML_BACKEND_DL=OFF`) can still load this plugin through tools that explicitly call `ggml_backend_load_all`, such as `--list-devices` and `test-backend-ops`, but ordinary completion does not automatically load the environment-provided plugin in that configuration.
+For normal `GGML_BACKEND_PATH` auto-loading, build llama.cpp with its stock dynamic-backend option enabled (`-DGGML_BACKEND_DL=ON`). The adapter also links the matching `libggml-cpu.so` because its CPU fallback and shared host-buffer path call the public GGML CPU backend API; use the library from the same pinned llama.cpp build as `GGML_SOURCE_DIR`. A build with static CPU registration (`GGML_BACKEND_DL=OFF`) can still load this plugin through tools that explicitly call `ggml_backend_load_all`, such as `--list-devices` and `test-backend-ops`, but ordinary completion does not automatically load the environment-provided plugin in that configuration.
 
 ## Build and discovery
 
@@ -14,7 +14,8 @@ For normal `GGML_BACKEND_PATH` auto-loading, build llama.cpp with its stock dyna
 cmake -S adapters/ggml-rocknpu \
   -B target/ggml-rocknpu \
   -DCMAKE_BUILD_TYPE=Release \
-  -DGGML_SOURCE_DIR=/build/llama.cpp-reference/ggml
+  -DGGML_SOURCE_DIR=/build/llama.cpp-reference/ggml \
+  -DGGML_CPU_LIBRARY=/build/llama.cpp-reference/build-native-0920/bin/libggml-cpu.so
 cmake --build target/ggml-rocknpu -j
 
 GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" \
