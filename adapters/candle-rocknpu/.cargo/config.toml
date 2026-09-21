@@ -1,0 +1,5 @@
+[build]
+target-dir = "../../target/candle-rocknpu"
+
+[target.'cfg(target_arch = "aarch64")']
+rustflags = ["-C", "target-feature=+fp16"]

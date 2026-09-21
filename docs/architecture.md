@@ -134,6 +134,21 @@ It is responsible for:
 - backend-local caches/stashes;
 - calling the C ABI.
 
+### adapters/candle-rocknpu
+
+Thin Candle eager/module frontend adapter.
+
+The first supported module is RockNpuLinear. It converts Candle tensors only at
+the adapter boundary, then executes through shared rocknpu-ops,
+rocknpu-tensor, and rocket-runtime primitives. Static weights are prepared once;
+dynamic leading dimensions are flattened/restored around the shared MatMul
+contract.
+
+The adapter deliberately does not depend on rocknpu-onnx or ONNX protobufs, and
+RockNPU core crates do not depend on Candle. Future Candle graph/module support
+should continue lowering onto shared IR/ops rather than introducing a
+Candle-specific execution engine.
+
 Frontend adapters may link frontend-specific libraries when required by that
 frontend's ABI, host-buffer contract, or fallback path. That linkage must stop
 at the adapter boundary. Shared operators, dataflow optimizations, scheduling,

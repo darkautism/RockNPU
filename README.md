@@ -39,6 +39,7 @@ Validated areas include:
 - resident/prepacked static weights;
 - ONNX dense/CNN subsets;
 - stock llama.cpp dynamic backend integration;
+- Candle eager/module adapter with a real prepared RockNpuLinear NPU path;
 - TinyLlama Q4_K_M prefill and decode;
 - W8A8 M=1 decode;
 - K=5632 full-K decode;
@@ -55,7 +56,7 @@ The canonical research direction is docs/research-status.md.
 
 ## Architecture
 
-    llama.cpp / GGUF / ONNX / future framework frontend
+    llama.cpp / GGUF / Candle / ONNX / future framework frontend
                          |
                          v
                     adapter/importer
@@ -267,6 +268,8 @@ ONNX import is one frontend over this contract.
 
 GGML integration is another.
 
+Candle integration is a third: Candle tensors/modules stay in the adapter, while execution uses the same frontend-neutral RockNPU userspace ops/runtime primitives. The first supported Candle module is prepared Linear; this is not yet a full Candle graph compiler.
+
 ## Correctness policy
 
 A successful build is not proof that an NPU path works.
@@ -334,6 +337,8 @@ See docs/research-status.md for hypotheses, evidence, and closed directions.
     rocket-smoke      real-hardware gates
     adapters/ggml-rocknpu
                       stock llama.cpp dynamic backend
+    adapters/candle-rocknpu
+                      Candle Tensor/Module frontend adapter
 
 ## Documentation
 
