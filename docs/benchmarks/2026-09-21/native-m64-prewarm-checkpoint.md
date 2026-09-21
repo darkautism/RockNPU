@@ -37,9 +37,22 @@ Do not enable `ROCKNPU_MTILE_QO_GROUP` for the current best configuration.
 
 For controlled comparison only, the benchmark temporarily fixed:
 - NPU minimum frequency to 1 GHz through the existing devfreq node
-- big CPU clusters to `performance`
+- **all CPU cpufreq policies** (`policy0`, `policy4`, `policy6`) to `performance`; do not set only the A76 clusters
 
 The benchmark command restored the previous governors afterward.
+
+### RK3588 DSU governor trap
+
+On this board, `policy0` is not irrelevant just because the workload is pinned to A76 cores 4-7. A controlled 2x2 check on 2026-09-21 found that changing only the A55 `policy0` governor changes the shared SCMI DSU clock and roughly doubles available memory bandwidth:
+
+| State | NPU clock | `policy0` | `scmi_clk_dsu` | 4xA76 aggregate sequential read | native CPU `tg128` |
+|---|---:|---|---:|---:|---:|
+| low-DSU | 200 MHz | `ondemand` | 1.2 GHz | 12.47 GB/s | 14.62 tok/s |
+| high-DSU | 200 MHz | `performance` | 1.8 GHz | 25.29 GB/s | 34.29 tok/s |
+| low-DSU control | 700 MHz | `ondemand` | 1.2 GHz | - | 14.19 tok/s |
+| high-DSU control | 700 MHz | `performance` | 1.8 GHz | - | 34.25 tok/s |
+
+The NPU clock does not cause the CPU throughput change. DDR remained at 2.112 GHz and the A76 cores remained at 2.4 GHz. The performance switch is the A55 cpufreq policy indirectly raising the shared DSU/L3 path. Therefore every CPU/NPU comparison on RK3588 must set **all** CPU policies to `performance` or explicitly record and compare the DSU state; setting only the big cores invalidates the comparison.
 
 ## Verified results
 
@@ -47,7 +60,7 @@ All results below used the same prompt, draft limit 63, and reported 100% accept
 
 | Path | Encode | Decode | Decode throughput |
 |---|---:|---:|---:|
-| CPU, big cores performance | 1.223 s | 9.749 s | 52.619 tok/s |
+| CPU, controlled CPU state | 1.223 s | 9.749 s | 52.619 tok/s |
 | Native M64 + FFN-down K-split, no prewarm | 1.833 s | 5.988 s | 85.666 tok/s |
 | Native M64 + FFN-down K-split + prewarm, run 1 | 3.486 s | 3.448 s | 148.761 tok/s |
 | Native M64 + FFN-down K-split + prewarm, repeat | 3.509 s | 4.034 s | 127.181 tok/s |
@@ -64,7 +77,7 @@ Prompt + decode total time:
 
 Prewarm therefore moves substantial preparation work before decode, but it did not merely hide the cost: both controlled prewarm runs were still faster end-to-end than CPU, and both were faster end-to-end than the measured no-prewarm NPU run. On the repeated run, total prompt+decode time was 7.543 s versus 10.972 s for CPU, about a 1.45x end-to-end request speedup; the 2.42x figure applies to the lookup-speculative decode phase only.
 
-A separate ordinary non-speculative `llama-bench tg128` sanity run at the same controlled 1 GHz NPU / performance big-core setting measured **13.79 +/- 0.85 tok/s** on RockNPU versus **10.45 +/- 0.09 tok/s** on the four-core CPU for this Q4_K_M GGUF. This was a sanity measurement under the speculative-checkpoint environment, **not the best known ordinary-generation configuration**. Earlier validated M=1 work on the same project reached about **16 tok/s** with caller-thread direct submit + persistent scratch, and about **19.3-19.4 tok/s** in the research-driver configuration with per-core IOMMU-domain caching plus the validated A55 IRQ-latency tune at 700 MHz / 800 mV. The native-M64 path only applies to M=32..64 and does not accelerate ordinary M=1 generation. Therefore 13.79 must not be used as the project-wide ordinary-generation ceiling. None of these ordinary-generation figures is directly interchangeable with the 127-149 tok/s lookup-speculative verifier numbers.
+A separate ordinary non-speculative `llama-bench tg128` sanity run in the speculative-checkpoint environment measured **13.79 +/- 0.85 tok/s** on RockNPU versus **10.45 +/- 0.09 tok/s** on the four-core CPU for this Q4_K_M GGUF. That CPU number is **not a valid native CPU baseline** because this checkpoint did not preserve a complete all-policy cpufreq contract; on this RK3588 board, leaving `policy0` on `ondemand` throttles the shared DSU/L3 path even when the A76 clusters are fixed at 2.4 GHz. This was a sanity measurement under the speculative-checkpoint environment, **not the best known ordinary-generation configuration**. Earlier validated M=1 work on the same project reached about **16 tok/s** with caller-thread direct submit + persistent scratch, and about **19.3-19.4 tok/s** in the research-driver configuration with per-core IOMMU-domain caching plus the validated A55 IRQ-latency tune at 700 MHz / 800 mV. The native-M64 path only applies to M=32..64 and does not accelerate ordinary M=1 generation. Therefore 13.79 must not be used as the project-wide ordinary-generation ceiling. None of these ordinary-generation figures is directly interchangeable with the 127-149 tok/s lookup-speculative verifier numbers.
 
 ## Confirmed findings
 
