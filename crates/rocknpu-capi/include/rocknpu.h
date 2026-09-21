@@ -56,6 +56,15 @@ int rocknpu_matmul_w8a8_f32_f32_m1(
     size_t k,
     size_t n);
 
+int rocknpu_matmul_w8a8_f32_f32_m16(
+    rocknpu_context * context,
+    const int8_t * weights_nk_i8,
+    const float * weight_scales_n_f32,
+    const float * activations_mk_f32,
+    float * output_mn_f32,
+    size_t k,
+    size_t n);
+
 int rocknpu_matmul_w8a8_pair_f32_f32_m1(
     rocknpu_context * context,
     const int8_t * first_weights_nk_i8,
