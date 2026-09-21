@@ -42,13 +42,30 @@ The M128 shape is now admitted through the existing persistent M-tile, pool, C A
 
 M128 therefore improves this verifier workload by about 9.2-9.3% over M64.
 
+### Fused FP16 matmul + residual add
+
+RockNPU already had an independently implemented MIT `encode_fp16_matmul_accumulate()` path used internally for NPU K-split accumulation, but it was not exposed as a model-level fused residual operation.
+
+The prepacked M-compatible executor now accepts an optional row-major residual and seeds the existing DPU EW ping-pong path with it. This works both for one-K-tile projections and for NPU K-split accumulation; tiny-M host-accumulation geometry remains rejected because its EW surface mapping is not validated.
+
+On-silicon comparisons against `plain NPU matmul + CPU fp16 residual add`:
+- M=16 K=256 N=64: PASS, max_abs=0.000244.
+- M=16 K=2048 N=64: PASS, max_abs=0.000488.
+- M=16 K=2048 N=2048: PASS, max_abs=0.000610.
+
+`rocknpu-llm` prefill now uses the fused path for the attention output projection residual and FFN down projection residual when M geometry permits. Decode M=1 intentionally keeps the CPU residual fallback.
+
+### NONBLOCK doorbell status
+
+The live stock Rocket UAPI/kernel headers expose no Rocket/RKNPU NONBLOCK submit flag, and the loaded module exposes no matching runtime parameter. RockNPU already separates submit and completion through `begin_execute_prepared()` / `finish_execute_prepared()`, but that is not equivalent to ork-driver's NONBLOCK doorbell capability. This remains a driver-side capability gap; no kernel/module change was made during this audit.
+
 ## Existing RockNPU capabilities that already overlap ork-driver
 
 - resident packed W8 weights / reuse across calls;
 - direct submit with separated begin/finish;
 - persistent activation/output scratch;
 - up to 3 NPU workers and N/K split;
-- W8A8 M=1 and native M16/M32/M48/M64;
+- W8A8 M=1 and native M16/M32/M48/M64/M128;
 - W4A4 primitive and grouped experiments;
 - Q/K/V and gate/up same-input grouping at the ggml adapter level;
 - prewarm / resident prepared layouts;
@@ -62,11 +79,11 @@ The current ork-driver matrix exposes several mechanisms RockNPU does not yet ha
 
 - resident KV on the NPU;
 - general hardware PC-chain / M-fold chain;
-- NONBLOCK doorbell and general async-stream API;
+- NONBLOCK doorbell at the driver level; userspace begin/finish overlap already exists;
 - general batched GEMM surface;
-- fused matmul + activation output stage;
+- fused nonlinear activation output stage;
 - standalone SDP activation path;
-- NPU elementwise add and multiply;
+- standalone NPU elementwise add and multiply beyond the validated fused residual-add path;
 - per-channel multiply;
 - general zero-copy dma-buf import/adopt;
 - persistent serialized packed-weight format / streaming pool;

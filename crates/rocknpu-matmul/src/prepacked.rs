@@ -393,7 +393,7 @@ impl<'a> Fp16MatmulExecutor<'a> {
         if plan != weights.plan || weights.compatible_m {
             return Err(MatmulError::InvalidInput("prepacked weight plan mismatch"));
         }
-        self.execute_prepacked_plan(a, weights, plan, plan_ns, total_start)
+        self.execute_prepacked_plan(a, weights, plan, plan_ns, total_start, None)
     }
 
     /// Execute an aligned A[M,K] against M-compatible resident weights.
@@ -428,7 +428,61 @@ impl<'a> Fp16MatmulExecutor<'a> {
                 "M-compatible resident weight geometry mismatch",
             ));
         }
-        self.execute_prepacked_plan(a, weights, plan, plan_ns, total_start)
+        self.execute_prepacked_plan(a, weights, plan, plan_ns, total_start, None)
+    }
+
+    /// Execute against M-compatible resident weights and fuse a row-major
+    /// residual add into the NPU DPU EW path. The validated EW geometry requires
+    /// every M tile to be at least 12 rows; tiny-M decode remains unsupported.
+    pub fn execute_prepacked_compatible_m_add(
+        &mut self,
+        a: &[f16],
+        m: usize,
+        weights: &Fp16PrepackedWeights<'a>,
+        residual: &[f16],
+    ) -> Result<Fp16MatmulOutput, MatmulError> {
+        let total_start = Instant::now();
+        if !weights.compatible_m {
+            return Err(MatmulError::InvalidInput(
+                "resident weights were not prepared for M-compatible execution",
+            ));
+        }
+        let k = weights.plan.k;
+        let n = weights.plan.n;
+        if a.len() != m.checked_mul(k).ok_or(MatmulError::InvalidInput("A size overflow"))? {
+            return Err(MatmulError::InvalidInput(
+                "A must contain exactly M*K elements",
+            ));
+        }
+        if residual.len()
+            != m.checked_mul(n)
+                .ok_or(MatmulError::InvalidInput("residual size overflow"))?
+        {
+            return Err(MatmulError::InvalidInput(
+                "residual must contain exactly M*N elements",
+            ));
+        }
+        let plan_start = Instant::now();
+        let plan = plan_fp16_matmul_compatible_m(m, k, n)?;
+        let plan_ns = plan_start.elapsed().as_nanos();
+        if plan.kt != weights.plan.kt || plan.nt != weights.plan.nt {
+            return Err(MatmulError::InvalidInput(
+                "M-compatible resident weight geometry mismatch",
+            ));
+        }
+        if plan.tiles.iter().any(|tile| tile.m < 12) {
+            return Err(MatmulError::InvalidInput(
+                "fused residual requires every M tile to have M>=12",
+            ));
+        }
+        self.execute_prepacked_plan(
+            a,
+            weights,
+            plan,
+            plan_ns,
+            total_start,
+            Some(residual),
+        )
     }
 
     fn execute_prepacked_plan(
@@ -438,6 +492,7 @@ impl<'a> Fp16MatmulExecutor<'a> {
         plan: Fp16MatmulPlan,
         plan_ns: u128,
         total_start: Instant,
+        residual: Option<&[f16]>,
     ) -> Result<Fp16MatmulOutput, MatmulError> {
         if self.device.fd() != weights.device_fd {
             return Err(MatmulError::InvalidInput(
@@ -468,21 +523,35 @@ impl<'a> Fp16MatmulExecutor<'a> {
             validate_group(group, k)?;
             match accumulation_mode(group) {
                 KAccumulation::None => {
-                    self.execute_prepacked_single(
-                        a,
-                        weights,
-                        k,
-                        n,
-                        group[0],
-                        &mut values,
-                        &mut timing,
-                    )?;
+                    if let Some(residual) = residual {
+                        self.execute_prepacked_single_add(
+                            a,
+                            weights,
+                            residual,
+                            k,
+                            n,
+                            group[0],
+                            &mut values,
+                            &mut timing,
+                        )?;
+                    } else {
+                        self.execute_prepacked_single(
+                            a,
+                            weights,
+                            k,
+                            n,
+                            group[0],
+                            &mut values,
+                            &mut timing,
+                        )?;
+                    }
                     jobs += 1;
                 }
                 KAccumulation::NpuFp16PingPong => {
                     self.execute_prepacked_npu_kacc(
                         a,
                         weights,
+                        residual,
                         k,
                         n,
                         group,
@@ -493,6 +562,11 @@ impl<'a> Fp16MatmulExecutor<'a> {
                     npu_kacc_groups += 1;
                 }
                 KAccumulation::HostFp32TinyM => {
+                    if residual.is_some() {
+                        return Err(MatmulError::InvalidInput(
+                            "fused residual is not validated for tiny-M host K accumulation",
+                        ));
+                    }
                     self.execute_prepacked_host_kacc(
                         a,
                         weights,
@@ -574,10 +648,85 @@ impl<'a> Fp16MatmulExecutor<'a> {
         Ok(())
     }
 
+    fn execute_prepacked_single_add(
+        &mut self,
+        a: &[f16],
+        weights: &Fp16PrepackedWeights<'a>,
+        residual: &[f16],
+        k_total: usize,
+        n_total: usize,
+        tile: Fp16MatmulTile,
+        dst: &mut [f16],
+        timing: &mut ExecutionTiming,
+    ) -> Result<(), MatmulError> {
+        if tile.m < 12 {
+            return Err(MatmulError::InvalidInput(
+                "fused residual single-tile path requires M>=12",
+            ));
+        }
+        let phase = Instant::now();
+        self.ensure_scratch(tile, 2, true)?;
+        timing.scratch_ns += phase.elapsed().as_nanos();
+        let (weight_dma, weight_handle) = weights.tile(tile)?;
+        let ExecutorScratch {
+            regcmd: Some(regcmd),
+            input: Some(input),
+            output0: Some(output),
+            output1: Some(add),
+            ..
+        } = &mut self.scratch
+        else {
+            return Err(MatmulError::Internal(
+                "prepacked fused-add scratch invariant",
+            ));
+        };
+        let phase = Instant::now();
+        pack_input(input, a, k_total, tile)?;
+        pack_output_tile(add, residual, n_total, tile)?;
+        prepare_output(output)?;
+        timing.pack_ns += phase.elapsed().as_nanos();
+        let phase = Instant::now();
+        let ops = encode_fp16_matmul_accumulate(
+            Fp16MatmulDesc::new(
+                tile.m,
+                tile.k,
+                tile.n,
+                input.dma_address(),
+                weight_dma,
+                output.dma_address(),
+            ),
+            add.dma_address(),
+        )?;
+        timing.encode_ns += phase.elapsed().as_nanos();
+        let phase = Instant::now();
+        write_regcmd(regcmd, &ops)?;
+        timing.regcmd_write_ns += phase.elapsed().as_nanos();
+        let phase = Instant::now();
+        submit_accumulate_weight(
+            self.device,
+            regcmd,
+            input,
+            weight_handle,
+            add,
+            output,
+            ops.len(),
+        )?;
+        timing.submit_ns += phase.elapsed().as_nanos();
+        let phase = Instant::now();
+        output.prep_relative(WAIT_NS)?;
+        timing.wait_ns += phase.elapsed().as_nanos();
+        let phase = Instant::now();
+        gather_tile(output.as_slice(), tile, n_total, dst);
+        timing.gather_ns += phase.elapsed().as_nanos();
+        output.fini()?;
+        Ok(())
+    }
+
     fn execute_prepacked_npu_kacc(
         &mut self,
         a: &[f16],
         weights: &Fp16PrepackedWeights<'a>,
+        residual: Option<&[f16]>,
         k_total: usize,
         n_total: usize,
         group: &[Fp16MatmulTile],
@@ -606,7 +755,11 @@ impl<'a> Fp16MatmulExecutor<'a> {
             };
             let phase = Instant::now();
             prepare_output(ping)?;
-            prepare_output(pong)?;
+            if let Some(residual) = residual {
+                pack_output_tile(pong, residual, n_total, first)?;
+            } else {
+                prepare_output(pong)?;
+            }
             timing.pack_ns += phase.elapsed().as_nanos();
         }
         for (ki, &tile) in group.iter().enumerate() {
@@ -643,7 +796,7 @@ impl<'a> Fp16MatmulExecutor<'a> {
                 out.dma_address(),
             );
             let phase = Instant::now();
-            let ops = if ki == 0 {
+            let ops = if ki == 0 && residual.is_none() {
                 encode_fp16_matmul(desc)?
             } else {
                 encode_fp16_matmul_accumulate(desc, add.dma_address())?
@@ -653,7 +806,7 @@ impl<'a> Fp16MatmulExecutor<'a> {
             write_regcmd(regcmd, &ops)?;
             timing.regcmd_write_ns += phase.elapsed().as_nanos();
             let phase = Instant::now();
-            if ki == 0 {
+            if ki == 0 && residual.is_none() {
                 submit_plain_weight(self.device, regcmd, input, weight_handle, out, ops.len())?;
             } else {
                 submit_accumulate_weight(

@@ -416,6 +416,42 @@ impl<'d> HybridLinear<'d> {
             MatmulOutput::F32(_) => unreachable!("Fp16Fast CPU path returned FP32"),
         }
     }
+
+    pub fn run_add_residual(
+        &self,
+        mut backend: Option<&mut SingleNpuBackend<'d>>,
+        input: &[f16],
+        residual: &[f16],
+        rows: usize,
+    ) -> Result<(Vec<f16>, LinearExecution), LlmError> {
+        let expected_residual = rows
+            .checked_mul(self.out_features())
+            .ok_or_else(|| LlmError::InvalidShape("residual size overflow".into()))?;
+        if residual.len() != expected_residual {
+            return Err(LlmError::InvalidShape(
+                "residual tensor must have shape [rows, out_features]".into(),
+            ));
+        }
+
+        if rows >= 12
+            && rows.is_multiple_of(4)
+            && let (Some(backend), Some(prepared)) =
+                (backend.as_deref_mut(), self.prepared.as_ref())
+        {
+            let input = Matrix::from_vec(rows, self.in_features(), input.to_vec())?;
+            let residual =
+                Matrix::from_vec(rows, self.out_features(), residual.to_vec())?;
+            let output =
+                backend.execute_prepared_fp16_compatible_m_add(prepared, &input, &residual)?;
+            return Ok((output.values().to_vec(), LinearExecution::Npu));
+        }
+
+        let (mut output, execution) = self.run(backend, input, rows)?;
+        for (dst, &add) in output.iter_mut().zip(residual) {
+            *dst = f16::from_f32(dst.to_f32() + add.to_f32());
+        }
+        Ok((output, execution))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -591,7 +627,8 @@ impl<'d> TransformerBlock<'d> {
     }
 
     /// Full prefill for one transformer block. Large projections may run on NPU;
-    /// normalization, RoPE, causal GQA, SwiGLU and residuals stay on CPU for now.
+    /// projection-following residual adds are fused into the validated NPU DPU EW path
+    /// when M geometry permits. Normalization, RoPE, causal GQA and SwiGLU remain on CPU.
     pub fn run_prefill(
         &self,
         backend: Option<&mut SingleNpuBackend<'d>>,
@@ -694,11 +731,13 @@ impl<'d> TransformerBlock<'d> {
                 head_dim: self.config.head_dim,
             },
         )?;
-        let (attention_output, execution) =
-            self.o_proj
-                .run(backend.as_deref_mut(), &attention, tokens)?;
+        let (after_attention, execution) = self.o_proj.run_add_residual(
+            backend.as_deref_mut(),
+            &attention,
+            input,
+            tokens,
+        )?;
         stats.record(execution);
-        let after_attention = residual_add(input, &attention_output)?;
 
         let normalized = rms_norm(
             &after_attention,
@@ -716,9 +755,14 @@ impl<'d> TransformerBlock<'d> {
             .run(backend.as_deref_mut(), &normalized, tokens)?;
         stats.record(execution);
         let activated = swiglu(&gate, &up)?;
-        let (ffn_output, execution) = self.down_proj.run(backend, &activated, tokens)?;
+        let (output, execution) = self.down_proj.run_add_residual(
+            backend,
+            &activated,
+            &after_attention,
+            tokens,
+        )?;
         stats.record(execution);
-        Ok((residual_add(&after_attention, &ffn_output)?, stats))
+        Ok((output, stats))
     }
 
     /// Decode one token against the retained per-layer KV cache.

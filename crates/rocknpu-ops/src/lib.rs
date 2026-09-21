@@ -321,6 +321,38 @@ impl<'d> SingleNpuBackend<'d> {
         Ok(Matrix::from_vec(a.rows(), prepared.spec.n, out.values)?)
     }
 
+    pub fn execute_prepared_fp16_compatible_m_add(
+        &mut self,
+        prepared: &PreparedFp16Matmul<'d>,
+        a: &Matrix<f16>,
+        residual: &Matrix<f16>,
+    ) -> Result<Matrix<f16>, OpError> {
+        if !prepared.compatible_m {
+            return Err(OpError::UnsupportedPolicy(
+                "prepared weights are fixed-M; fused residual requires M-compatible weights",
+            ));
+        }
+        if a.layout() != TensorLayout::RowMajor
+            || a.cols() != prepared.spec.k
+            || a.rows() == 0
+            || a.rows() % 4 != 0
+            || residual.layout() != TensorLayout::RowMajor
+            || residual.rows() != a.rows()
+            || residual.cols() != prepared.spec.n
+        {
+            return Err(OpError::InvalidShape(
+                "fused residual requires A[M,K] and residual[M,N] row-major with M%4==0",
+            ));
+        }
+        let out = self.executor.execute_prepacked_compatible_m_add(
+            a.values(),
+            a.rows(),
+            &prepared.weights,
+            residual.values(),
+        )?;
+        Ok(Matrix::from_vec(a.rows(), prepared.spec.n, out.values)?)
+    }
+
     pub fn execute_prepared_fp16(
         &mut self,
         prepared: &PreparedFp16Matmul<'d>,

@@ -1876,6 +1876,28 @@ fn pack_input(
     Ok(())
 }
 
+fn pack_output_tile(
+    bo: &mut RocketBuffer<'_>,
+    values: &[f16],
+    n_total: usize,
+    tile: Fp16MatmulTile,
+) -> Result<(), MatmulError> {
+    bo.prep_relative(0)?;
+    let dst = bo.as_mut_slice();
+    dst.fill(0);
+    for ng in 0..tile.n / 8 {
+        let tile_n0 = tile.n0 + ng * 8;
+        let dst_plane = ng * tile.m * 8;
+        for tm in 0..tile.m {
+            let src_base = (tile.m0 + tm) * n_total + tile_n0;
+            let dst_base = dst_plane + tm * 8;
+            copy_f16_block(dst, dst_base, &values[src_base..src_base + 8]);
+        }
+    }
+    bo.fini()?;
+    Ok(())
+}
+
 fn pack_weights(
     bo: &mut RocketBuffer<'_>,
     b: &[f16],
