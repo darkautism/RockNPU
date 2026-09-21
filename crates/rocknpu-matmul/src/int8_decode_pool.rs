@@ -125,9 +125,10 @@ enum WorkerCommand {
         activation: Arc<[i8]>,
         slice: WorkerSlice,
     },
-    RunPreparedM16 {
+    RunPreparedMtile {
         request_id: u64,
         weight_id: u64,
+        m: usize,
         activation: Arc<[i8]>,
         slice: WorkerSlice,
     },
@@ -198,7 +199,8 @@ impl Int8DecodePool {
                     }
                 };
                 let mut resident: HashMap<u64, Int8PreparedWeights> = HashMap::new();
-                let mut m16_scratch: HashMap<(usize, usize), Option<Int8MtileScratch>> = HashMap::new();
+                let mut mtile_scratch: HashMap<(usize, usize), Option<Int8MtileScratch>> =
+                    HashMap::new();
                 if init_tx.send(Ok(worker)).is_err() {
                     return;
                 }
@@ -274,32 +276,67 @@ impl Int8DecodePool {
                                 break;
                             }
                         }
-                        WorkerCommand::RunPreparedM16 {
+                        WorkerCommand::RunPreparedMtile {
                             request_id,
                             weight_id,
+                            m,
                             activation,
                             slice,
                         } => {
                             let output = match resident.get(&weight_id) {
                                 Some(prepared)
-                                    if slice.k0 == 0
+                                    if matches!(m, 16 | 32 | 48 | 64)
                                         && prepared.k() == slice.ksub
                                         && prepared.n() == slice.nsub
-                                        && activation.len() == 16usize.saturating_mul(slice.ksub) =>
+                                        && m != 0
+                                        && activation.len() % m == 0 =>
                                 {
-                                    let scratch_slot = m16_scratch
-                                        .entry((slice.ksub, slice.nsub))
-                                        .or_insert(None);
-                                    executor
-                                        .execute_prepared_m16_persistent(
-                                            &activation,
-                                            prepared,
-                                            scratch_slot,
-                                        )
-                                        .map_err(|err| format!("worker {worker}: {err}"))
+                                    let full_k = activation.len() / m;
+                                    let end_k = slice.k0.saturating_add(slice.ksub);
+                                    if end_k > full_k {
+                                        Err(format!(
+                                            "worker {worker}: M-tile activation slice out of range"
+                                        ))
+                                    } else {
+                                        let scratch_slot = mtile_scratch
+                                            .entry((slice.ksub, slice.nsub))
+                                            .or_insert(None);
+                                        if slice.k0 == 0 && slice.ksub == full_k {
+                                            executor
+                                                .execute_prepared_mtile_persistent(
+                                                    m,
+                                                    &activation,
+                                                    prepared,
+                                                    scratch_slot,
+                                                )
+                                                .map_err(|err| format!("worker {worker}: {err}"))
+                                        } else {
+                                            let mut sliced =
+                                                Vec::with_capacity(m.saturating_mul(slice.ksub));
+                                            for row in 0..m {
+                                                let begin = row
+                                                    .saturating_mul(full_k)
+                                                    .saturating_add(slice.k0);
+                                                let end = begin.saturating_add(slice.ksub);
+                                                sliced.extend_from_slice(&activation[begin..end]);
+                                            }
+                                            executor
+                                                .execute_prepared_mtile_persistent(
+                                                    m,
+                                                    &sliced,
+                                                    prepared,
+                                                    scratch_slot,
+                                                )
+                                                .map_err(|err| format!("worker {worker}: {err}"))
+                                        }
+                                    }
                                 }
-                                Some(_) => Err(format!("worker {worker}: resident M16 shape mismatch")),
-                                None => Err(format!("worker {worker}: resident weight id not found")),
+                                Some(_) => {
+                                    Err(format!("worker {worker}: resident M-tile shape mismatch"))
+                                }
+                                None => {
+                                    Err(format!("worker {worker}: resident weight id not found"))
+                                }
                             };
                             if result_tx
                                 .send(WorkerResult {
@@ -530,25 +567,25 @@ impl Int8DecodePool {
         })
     }
 
-    pub fn execute_prepared_m16(
+    pub fn execute_prepared_mtile(
         &mut self,
+        m: usize,
         activation: Arc<[i8]>,
         weights: &Int8DecodePoolPreparedWeights,
     ) -> Result<Int8DecodePoolOutput, Int8DecodePoolError> {
-        const M: usize = 16;
-        if weights.split != Int8DecodeSplit::N {
+        if !matches!(m, 16 | 32 | 48 | 64) {
             return Err(Int8DecodePoolError::InvalidInput(
-                "M16 pool path requires N-split prepared weights",
+                "M-tile pool path requires M in {16,32,48,64}",
             ));
         }
-        if activation.len() != M.saturating_mul(weights.k) {
+        if activation.len() != m.saturating_mul(weights.k) {
             return Err(Int8DecodePoolError::InvalidInput(
-                "M16 activation length must equal 16*K",
+                "M-tile activation length must equal M*K",
             ));
         }
         if weights.direct_prepared.is_some() {
             return Err(Int8DecodePoolError::InvalidInput(
-                "M16 pool path does not yet support ROCKNPU_W8_DIRECT_SUBMIT",
+                "M-tile pool path does not yet support ROCKNPU_W8_DIRECT_SUBMIT",
             ));
         }
 
@@ -556,18 +593,21 @@ impl Int8DecodePool {
         let start = Instant::now();
         for (worker, &slice) in weights.slices.iter().enumerate() {
             self.senders[worker]
-                .send(WorkerCommand::RunPreparedM16 {
+                .send(WorkerCommand::RunPreparedMtile {
                     request_id,
                     weight_id: weights.weight_id,
+                    m,
                     activation: Arc::clone(&activation),
                     slice,
                 })
                 .map_err(|_| Int8DecodePoolError::ChannelClosed)?;
         }
 
-        let total_values = M
+        let total_values = m
             .checked_mul(weights.n)
-            .ok_or(Int8DecodePoolError::InvalidInput("M16 output size overflow"))?;
+            .ok_or(Int8DecodePoolError::InvalidInput(
+                "M-tile output size overflow",
+            ))?;
         let mut values = vec![0i32; total_values];
         let mut npu_tasks = 0usize;
         let mut worker_total_ns = vec![0u128; weights.slices.len()];
@@ -579,24 +619,47 @@ impl Int8DecodePool {
                 WorkerResponse::Ran(Err(error)) => return Err(Int8DecodePoolError::Worker(error)),
                 _ => {
                     return Err(Int8DecodePoolError::Worker(
-                        "unexpected worker response while executing M16 INT8 weights".to_string(),
+                        "unexpected worker response while executing M-tile INT8 weights"
+                            .to_string(),
                     ));
                 }
             };
-            let expected_worker_values = M.saturating_mul(result.slice.nsub);
-            if output.values.len() != expected_worker_values
-                || result.slice.n0.saturating_add(result.slice.nsub) > weights.n
-            {
-                return Err(Int8DecodePoolError::Worker(format!(
-                    "worker {} returned invalid M16 output geometry",
-                    result.worker
-                )));
-            }
-            for row in 0..M {
-                let src_start = row * result.slice.nsub;
-                let dst_start = row * weights.n + result.slice.n0;
-                values[dst_start..dst_start + result.slice.nsub]
-                    .copy_from_slice(&output.values[src_start..src_start + result.slice.nsub]);
+            match weights.split {
+                Int8DecodeSplit::N => {
+                    let expected_worker_values = m.saturating_mul(result.slice.nsub);
+                    if output.values.len() != expected_worker_values
+                        || result.slice.n0.saturating_add(result.slice.nsub) > weights.n
+                    {
+                        return Err(Int8DecodePoolError::Worker(format!(
+                            "worker {} returned invalid N-split M-tile output geometry",
+                            result.worker
+                        )));
+                    }
+                    for row in 0..m {
+                        let src_start = row * result.slice.nsub;
+                        let dst_start = row * weights.n + result.slice.n0;
+                        values[dst_start..dst_start + result.slice.nsub].copy_from_slice(
+                            &output.values[src_start..src_start + result.slice.nsub],
+                        );
+                    }
+                }
+                Int8DecodeSplit::K => {
+                    if output.values.len() != total_values
+                        || result.slice.k0.saturating_add(result.slice.ksub) > weights.k
+                    {
+                        return Err(Int8DecodePoolError::Worker(format!(
+                            "worker {} returned invalid K-split M-tile output geometry",
+                            result.worker
+                        )));
+                    }
+                    for (sum, partial) in values.iter_mut().zip(output.values.iter().copied()) {
+                        *sum = sum.checked_add(partial).ok_or_else(|| {
+                            Int8DecodePoolError::Worker(
+                                "K-split M-tile int32 accumulation overflow".to_string(),
+                            )
+                        })?;
+                    }
+                }
             }
             npu_tasks = npu_tasks.saturating_add(output.stats.npu_tasks);
             worker_total_ns[result.worker] = output.stats.total_ns;
@@ -614,6 +677,14 @@ impl Int8DecodePool {
                 worker_stats,
             },
         })
+    }
+
+    pub fn execute_prepared_m16(
+        &mut self,
+        activation: Arc<[i8]>,
+        weights: &Int8DecodePoolPreparedWeights,
+    ) -> Result<Int8DecodePoolOutput, Int8DecodePoolError> {
+        self.execute_prepared_mtile(16, activation, weights)
     }
 
     pub fn execute_prepared(

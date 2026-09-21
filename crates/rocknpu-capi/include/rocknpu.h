@@ -38,6 +38,14 @@ int rocknpu_context_decode_cache_stats(
     rocknpu_decode_cache_stats * out);
 void rocknpu_context_destroy(rocknpu_context * context);
 
+int rocknpu_prewarm_quantized_m16(
+    rocknpu_context * context,
+    const uint8_t * weights,
+    size_t weights_bytes,
+    uint32_t quant_kind,
+    size_t k,
+    size_t n);
+
 int rocknpu_matmul_f16_f32_f32(
     rocknpu_context * context,
     const uint16_t * weights_nk_f16_bits,
@@ -53,6 +61,15 @@ int rocknpu_matmul_w8a8_f32_f32_m1(
     const float * weight_scales_n_f32,
     const float * activations_k_f32,
     float * output_n_f32,
+    size_t k,
+    size_t n);
+
+int rocknpu_matmul_w8a8_f32_f32_m16(
+    rocknpu_context * context,
+    const int8_t * weights_nk_i8,
+    const float * weight_scales_n_f32,
+    const float * activations_mk_f32,
+    float * output_mn_f32,
     size_t k,
     size_t n);
 
