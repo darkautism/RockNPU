@@ -38,7 +38,8 @@ Disposition:
 | Plain FP16 M=1 | Large mismatches; invalid production geometry. | C5 | CLOSED |
 | Pad FP16 M=1 to M=4 | Can be correct, but loses badly at whole-model scale. | C5 | CLOSED |
 | Generic CPU delegation inside RockNPU backend | Preserves work instead of removing it; slower. | C4 | CLOSED |
-| Same-input activation quantization cache | Real reuse opportunity, but too small to justify complexity at current latency. | C4 | CLOSED |
+| Same-input activation quantization cache | Real reuse opportunity, but too small to justify complexity at current latency. Current-main M=1 profiling puts all steady activation quantization at only about 0.68 ms/token. | C5 | CLOSED |
+| M=1 host quantize/rescale micro-optimization | Current-main hot profile shows about 0.68 ms/token quantize and 0.85 ms/token rescale across the effective steady projection set; not a primary lever. | C5 | CLOSED |
 | Forced N64 segmentation for weight reuse | M256/N2048 about 2.5x slower; M256/N256 about 1.73x slower. | C5 | CLOSED |
 | W8 output-head offload | Fails quality requirement. | C5 | CLOSED |
 | Padded high-precision M4 output head | Correct, but slower. | C4 | CLOSED |
@@ -99,7 +100,9 @@ The initial FP16 route was rejected. W8A8 became the useful decode route, then g
 - grouped projections;
 - native sidecar support.
 
-Ordinary M=1 decode remains the largest performance gap.
+Current-main profiling on 2026-09-22 found exactly 88 steady prepared projection entries, or four effective projection forms per layer. Per-call hot averages were about 0.802 ms Q/V/K, 0.784 ms attention-output, 2.804 ms gate/up, and 1.557 ms FFN-down. Gate/up plus down account for about 73% of projection time. Host quantize/rescale is negligible by comparison.
+
+Therefore ordinary M=1 remains the largest performance gap, but further host quantize/rescale tuning is closed. The next target is real FFN/dataflow work.
 
 ### Prefill / verifier evolution
 

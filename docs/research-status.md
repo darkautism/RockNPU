@@ -171,67 +171,94 @@ The verifier is capable; proposer acceptance remains the unresolved speculative-
 
 Large raw-FP16 persistence increased footprint/storage traffic too much. Do not trade steady-state memory and I/O for avoidable preparation work.
 
+## Current-main M=1 profile — 2026-09-22
+
+The first current-main profile closes the question of whether host quantization/rescale is still worth micro-optimizing.
+
+Steady resident decode converges to exactly 88 prepared projection entries: 22 layers times four effective projection forms:
+
+1. Q/V/K combined;
+2. attention output;
+3. gate/up combined;
+4. FFN down.
+
+For four hot decode tokens, 352 cache hits were observed: exactly 88 per token.
+
+Per-call hot averages:
+
+| Projection | Shape | Avg call |
+| --- | --- | ---: |
+| Q/V/K triple | K2048, total N2560 | 0.802 ms |
+| attention output | K2048, N2048 | 0.784 ms |
+| gate/up pair | K2048, total N11264 | 2.804 ms |
+| FFN down | K5632, N2048 | 1.557 ms |
+
+At 22 layers this is about 130.8 ms/token of projection time. Gate/up plus down account for about 95.9 ms/token, roughly 73% of the projection hot path.
+
+The same profile measured only about 0.68 ms/token of activation quantization and about 0.85 ms/token of output rescale across the effective steady projection set. Host-side quantize/rescale work is therefore no longer a meaningful primary lever.
+
+Conclusion: same-input projection grouping is already near its structural limit, and host micro-optimization of M=1 quantize/rescale is closed. Future gains must remove or restructure real model dataflow.
+
+The opt-in `ROCKNPU_M1_PROFILE=1` diagnostic records hot-cache M=1 costs by shape without changing routing.
+
 ## Current hypotheses
 
-### H1 — reduce ordinary M=1 projection cost from userspace
+### H1 — quality-equivalent userspace FFN dataflow
 
 Highest priority.
 
-Existing QKV and gate/up grouping prove that larger same-input work can help. Find remaining opportunities to reduce real projection work or repeated data movement while preserving current W8 semantics.
+FFN is about 73% of the measured M=1 projection hot path. Current execution is:
 
-Test requirements:
+`gate/up W8 projection -> F32 SwiGLU -> down W8 projection`.
 
-- same current-main binary family;
-- deterministic output gate;
-- whole-token A/B;
-- for gains below 5%, use same-process warm/interleaved ABBA.
+The next experiment should keep the exact current W8 projection semantics and F32 SwiGLU math, but execute the whole FFN sequence through one RockNPU userspace path so intermediate ownership and graph/backend handoffs can be removed.
 
-### H2 — end-to-end NPU attention
-
-Potentially high upside, but only useful as a complete dataflow change.
-
-A useful implementation would keep K/V in a representation directly consumed by QK^T, softmax or an equivalent numerically validated attention step, and AV.
-
-Simply mirroring KV state without moving its consumers is expected to lose.
-
-Start with a small exact attention oracle before integrating with TinyLlama.
-
-### H3 — quality-equivalent FFN intermediate retention
-
-Goal: avoid unnecessary host round-trips between gate/up, activation, multiply, and down projection.
-
-The next attempt must define a scale/intermediate domain that preserves model quality. Local integer exactness is insufficient.
+This is deliberately different from the rejected fully quantized FFN experiments. Do not introduce a new hidden-state quantization domain in the first attempt.
 
 Required order:
 
-1. numerical contract;
-2. primitive oracle;
-3. layer differential;
-4. deterministic generation;
-5. whole-token A/B.
+1. reproduce the exact GGML SWIGLU F32 contract;
+2. add a direct FFN primitive/oracle using current gate/up and down W8 paths;
+3. prove output equivalence against the existing graph path;
+4. integrate behind an opt-in route;
+5. deterministic TinyLlama generation gate;
+6. same-process whole-token A/B.
 
-### H4 — make M128 verifier capacity useful
+### H2 — end-to-end NPU attention
+
+Second priority.
+
+TinyLlama GQA gives a useful mapping for decode: eight query heads share one KV head. Treating those heads as an M=8 batch can map attention matmuls onto the already validated FP16 geometry instead of the invalid FP16 M=1 path.
+
+Candidate first slice for one GQA group:
+
+- QK^T: M=8, K=64, N padded to 16;
+- AV: M=8, K=context padded to 32, N=64;
+- softmax remains CPU initially.
+
+Start with a small exact/tolerance hardware oracle. Do not mirror KV state unless its consumers move with it.
+
+### H3 — make M128 verifier capacity useful
 
 M128 is a validated userspace win over M64. The remaining issue is workload generation: real speculative decoding needs a proposer with enough acceptance to exploit larger verification batches.
 
 Focus on proposer mechanisms, not further verifier micro-optimization, unless profiling shows verifier cost again dominates.
 
-### H5 — high-precision M=1 output head
+### H4 — high-precision M=1 output head
 
 Lower priority. Revisit only if a new M=1 high-precision mapping can avoid the four-row padding cost and the quality loss of W8.
 
-### H6 — persistent packed format for cold start
+### H5 — persistent packed format for cold start
 
 Only a cold-start project. It is not a steady-state decode priority. Any format must remain provenance-bound to the source GGUF and must not duplicate the model with an excessive footprint.
 
 ## Priority order
 
-1. profile current ordinary M=1 decode on current main;
-2. measure existing QKV / gate-up grouping and find the next userspace dataflow reduction;
-3. prototype a small exact NPU-attention slice;
-4. investigate a quality-equivalent FFN intermediate domain;
-5. improve speculative proposer acceptance so M128 matters in general generation;
-6. output-head and cold-start work only after the above.
+1. quality-equivalent userspace FFN dataflow;
+2. exact/tolerance M=8 GQA attention slice;
+3. improve speculative proposer acceptance so M128 matters in general generation;
+4. high-precision M=1 output head;
+5. cold-start packed format.
 
 ## Benchmark rules
 

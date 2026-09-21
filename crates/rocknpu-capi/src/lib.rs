@@ -2,16 +2,16 @@
 
 use bytemuck::pod_read_unaligned;
 use half::f16;
-use llama_gguf::tensor::quant::{BlockQ4K, BlockQ6K, dequantize_q4_k, dequantize_q6_k};
+use llama_gguf::tensor::quant::{dequantize_q4_k, dequantize_q6_k, BlockQ4K, BlockQ6K};
 use rayon::prelude::*;
 use rocket_runtime::RocketDevice;
 use rocknpu_matmul::{
     Fp16MatmulExecutor, Fp16MatmulPool, Fp16MatmulPoolPreparedWeights, Int4DecodeExecutor,
     Int4DecodePool, Int4DecodePoolPreparedWeights, Int4GroupedPreparedWeights, Int4PreparedWeights,
-    Int8DecodeExecutor, Int8DecodePool, Int8DecodePoolPreparedWeights, Int8DecodeSplit,
-    Int8MtileScratch, Int8PreparedWeights,
+    Int8DecodeExecutor, Int8DecodePool, Int8DecodePoolPreparedWeights, Int8DecodePoolStats,
+    Int8DecodeSplit, Int8MtileScratch, Int8PreparedWeights,
 };
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::{hash_map::Entry, HashMap};
 use std::env;
 use std::mem::size_of;
 use std::ptr;
@@ -99,6 +99,48 @@ struct CachedPoolW4A4Weight {
     workers: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum M1ProfileKind {
+    Single,
+    Pair,
+    Triple,
+}
+
+impl M1ProfileKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Pair => "pair",
+            Self::Triple => "triple",
+        }
+    }
+}
+
+#[derive(Default)]
+struct M1ShapeProfile {
+    calls: usize,
+    npu_tasks: usize,
+    worker_calls: [usize; 3],
+    ksplit_calls: usize,
+    quant_ns: u128,
+    execute_wall_ns: u128,
+    alloc_ns: u128,
+    input_stage_ns: u128,
+    partial_stage_ns: u128,
+    regcmd_stage_ns: u128,
+    output_fini_ns: u128,
+    submit_ns: u128,
+    wait_ns: u128,
+    host_accum_ns: u128,
+    rescale_ns: u128,
+    total_ns: u128,
+}
+
+#[derive(Default)]
+struct M1Profile {
+    shapes: HashMap<(M1ProfileKind, usize, usize), M1ShapeProfile>,
+}
+
 #[derive(Default)]
 struct MtileProfile {
     calls: usize,
@@ -149,6 +191,7 @@ pub struct RockNpuContext {
     prefill_weights: HashMap<DecodeWeightKey, (usize, Fp16MatmulPoolPreparedWeights)>,
     prefill_profile: Option<PrefillProfile>,
     mtile_profile: Option<MtileProfile>,
+    m1_profile: Option<M1Profile>,
     decode_pool: Int8DecodePool,
     decode_worker_cache: HashMap<(usize, usize), DecodeChoice>,
     decode_weights: HashMap<DecodeWeightKey, CachedW8A8Weight>,
@@ -247,6 +290,47 @@ fn mtile_shape_enabled(k: usize, n: usize) -> bool {
 
 fn ns_to_ms(value: u128) -> f64 {
     value as f64 / 1.0e6
+}
+
+fn record_m1_profile(
+    profile: &mut Option<M1Profile>,
+    kind: M1ProfileKind,
+    k: usize,
+    n: usize,
+    choice: DecodeChoice,
+    stats: &Int8DecodePoolStats,
+    quant_ns: u128,
+    rescale_ns: u128,
+    total_ns: u128,
+) {
+    let Some(profile) = profile.as_mut() else {
+        return;
+    };
+    let entry = profile.shapes.entry((kind, k, n)).or_default();
+    entry.calls = entry.calls.saturating_add(1);
+    entry.npu_tasks = entry.npu_tasks.saturating_add(stats.npu_tasks);
+    if let Some(calls) = entry.worker_calls.get_mut(choice.workers.saturating_sub(1)) {
+        *calls = calls.saturating_add(1);
+    }
+    if choice.split == Int8DecodeSplit::K {
+        entry.ksplit_calls = entry.ksplit_calls.saturating_add(1);
+    }
+    entry.quant_ns = entry.quant_ns.saturating_add(quant_ns);
+    entry.execute_wall_ns = entry.execute_wall_ns.saturating_add(stats.wall_ns);
+    entry.rescale_ns = entry.rescale_ns.saturating_add(rescale_ns);
+    entry.total_ns = entry.total_ns.saturating_add(total_ns);
+    for worker in &stats.worker_stats {
+        entry.alloc_ns = entry.alloc_ns.saturating_add(worker.alloc_ns);
+        entry.input_stage_ns = entry.input_stage_ns.saturating_add(worker.input_stage_ns);
+        entry.partial_stage_ns = entry
+            .partial_stage_ns
+            .saturating_add(worker.partial_stage_ns);
+        entry.regcmd_stage_ns = entry.regcmd_stage_ns.saturating_add(worker.regcmd_stage_ns);
+        entry.output_fini_ns = entry.output_fini_ns.saturating_add(worker.output_fini_ns);
+        entry.submit_ns = entry.submit_ns.saturating_add(worker.submit_ns);
+        entry.wait_ns = entry.wait_ns.saturating_add(worker.wait_ns);
+        entry.host_accum_ns = entry.host_accum_ns.saturating_add(worker.host_accum_ns);
+    }
 }
 
 const PARALLEL_DEQUANT_MIN_VALUES: usize = 1 << 20;
@@ -1395,9 +1479,11 @@ where
     {
         return STATUS_INVALID_ARGUMENT;
     }
+    let quant_started = context.m1_profile.as_ref().map(|_| Instant::now());
     let Some((activations_i8, activation_scale)) = quantize_symmetric(activations_k_f32) else {
         return STATUS_INVALID_ARGUMENT;
     };
+    let quant_ns = quant_started.map_or(0, |started| started.elapsed().as_nanos());
     let activation: Arc<[i8]> = Arc::from(activations_i8);
 
     let RockNpuContext {
@@ -1411,6 +1497,7 @@ where
         decode_cache_miss_ns,
         decode_worker_calls,
         decode_ksplit_calls,
+        m1_profile,
         ..
     } = context;
 
@@ -1473,6 +1560,7 @@ where
     if cached.choice.split == Int8DecodeSplit::K {
         *decode_ksplit_calls = decode_ksplit_calls.saturating_add(1);
     }
+    let rescale_started = m1_profile.as_ref().map(|_| Instant::now());
     for ((dst, &acc), &weight_scale) in output_n_f32
         .iter_mut()
         .zip(&result.values)
@@ -1480,9 +1568,22 @@ where
     {
         *dst = acc as f32 * activation_scale * weight_scale;
     }
-    let elapsed_ns = u64::try_from(call_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let rescale_ns = rescale_started.map_or(0, |started| started.elapsed().as_nanos());
+    let elapsed_total_ns = call_start.elapsed().as_nanos();
+    let elapsed_ns = u64::try_from(elapsed_total_ns).unwrap_or(u64::MAX);
     if cache_hit {
         *decode_cache_hit_ns = decode_cache_hit_ns.saturating_add(elapsed_ns);
+        record_m1_profile(
+            m1_profile,
+            M1ProfileKind::Single,
+            key.k,
+            key.n,
+            cached.choice,
+            &result.stats,
+            quant_ns,
+            rescale_ns,
+            elapsed_total_ns,
+        );
     } else {
         *decode_cache_miss_ns = decode_cache_miss_ns.saturating_add(elapsed_ns);
     }
@@ -2141,9 +2242,11 @@ where
     if total_n > 16384 {
         return STATUS_INVALID_ARGUMENT;
     }
+    let quant_started = context.m1_profile.as_ref().map(|_| Instant::now());
     let Some((activations_i8, activation_scale)) = quantize_symmetric(activations_k_f32) else {
         return STATUS_INVALID_ARGUMENT;
     };
+    let quant_ns = quant_started.map_or(0, |started| started.elapsed().as_nanos());
     let activation: Arc<[i8]> = Arc::from(activations_i8);
 
     let RockNpuContext {
@@ -2157,6 +2260,7 @@ where
         decode_cache_miss_ns,
         decode_worker_calls,
         decode_ksplit_calls,
+        m1_profile,
         ..
     } = context;
 
@@ -2240,6 +2344,7 @@ where
     if cached.choice.split == Int8DecodeSplit::K {
         *decode_ksplit_calls = decode_ksplit_calls.saturating_add(1);
     }
+    let rescale_started = m1_profile.as_ref().map(|_| Instant::now());
     for i in 0..key.first.n {
         output_first_f32[i] = result.values[i] as f32 * activation_scale * cached.scales[i];
     }
@@ -2247,9 +2352,22 @@ where
         let j = key.first.n + i;
         output_second_f32[i] = result.values[j] as f32 * activation_scale * cached.scales[j];
     }
-    let elapsed_ns = u64::try_from(call_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let rescale_ns = rescale_started.map_or(0, |started| started.elapsed().as_nanos());
+    let elapsed_total_ns = call_start.elapsed().as_nanos();
+    let elapsed_ns = u64::try_from(elapsed_total_ns).unwrap_or(u64::MAX);
     if cache_hit {
         *decode_cache_hit_ns = decode_cache_hit_ns.saturating_add(elapsed_ns);
+        record_m1_profile(
+            m1_profile,
+            M1ProfileKind::Pair,
+            key.first.k,
+            total_n,
+            cached.choice,
+            &result.stats,
+            quant_ns,
+            rescale_ns,
+            elapsed_total_ns,
+        );
     } else {
         *decode_cache_miss_ns = decode_cache_miss_ns.saturating_add(elapsed_ns);
     }
@@ -2293,9 +2411,11 @@ where
     if total_n > 16384 {
         return STATUS_INVALID_ARGUMENT;
     }
+    let quant_started = context.m1_profile.as_ref().map(|_| Instant::now());
     let Some((activations_i8, activation_scale)) = quantize_symmetric(activations_k_f32) else {
         return STATUS_INVALID_ARGUMENT;
     };
+    let quant_ns = quant_started.map_or(0, |started| started.elapsed().as_nanos());
     let activation: Arc<[i8]> = Arc::from(activations_i8);
 
     let RockNpuContext {
@@ -2311,6 +2431,7 @@ where
         decode_cache_miss_ns,
         decode_worker_calls,
         decode_ksplit_calls,
+        m1_profile,
         ..
     } = context;
 
@@ -2376,6 +2497,7 @@ where
     if cached.choice.split == Int8DecodeSplit::K {
         *decode_ksplit_calls = decode_ksplit_calls.saturating_add(1);
     }
+    let rescale_started = m1_profile.as_ref().map(|_| Instant::now());
     for i in 0..key.first.n {
         output_first_f32[i] = result.values[i] as f32 * activation_scale * cached.scales[i];
     }
@@ -2387,6 +2509,7 @@ where
         let j = key.first.n + key.second.n + i;
         output_third_f32[i] = result.values[j] as f32 * activation_scale * cached.scales[j];
     }
+    let rescale_ns = rescale_started.map_or(0, |started| started.elapsed().as_nanos());
 
     // Once the combined Q/V/K resident entry has executed successfully, the
     // old standalone-Q and V/K-pair prepared weights are redundant. Removing
@@ -2399,9 +2522,21 @@ where
         second: key.third,
     });
 
-    let elapsed_ns = u64::try_from(call_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let elapsed_total_ns = call_start.elapsed().as_nanos();
+    let elapsed_ns = u64::try_from(elapsed_total_ns).unwrap_or(u64::MAX);
     if cache_hit {
         *decode_cache_hit_ns = decode_cache_hit_ns.saturating_add(elapsed_ns);
+        record_m1_profile(
+            m1_profile,
+            M1ProfileKind::Triple,
+            key.first.k,
+            total_n,
+            cached.choice,
+            &result.stats,
+            quant_ns,
+            rescale_ns,
+            elapsed_total_ns,
+        );
     } else {
         *decode_cache_miss_ns = decode_cache_miss_ns.saturating_add(elapsed_ns);
     }
@@ -2547,6 +2682,7 @@ pub extern "C" fn rocknpu_context_create() -> *mut RockNpuContext {
             prefill_weights: HashMap::new(),
             prefill_profile: env_enabled("ROCKNPU_PREFILL_PROFILE").then(PrefillProfile::default),
             mtile_profile: env_enabled("ROCKNPU_MTILE_PROFILE").then(MtileProfile::default),
+            m1_profile: env_enabled("ROCKNPU_M1_PROFILE").then(M1Profile::default),
             decode_pool,
             decode_worker_cache: HashMap::new(),
             decode_weights: HashMap::new(),
@@ -2674,6 +2810,47 @@ pub unsafe extern "C" fn rocknpu_context_destroy(context: *mut RockNpuContext) {
                 context.w4a4_saturated_calls,
                 context.w4a4_saturated_outputs
             );
+        }
+        if let Some(profile) = &context.m1_profile {
+            let mut shapes: Vec<_> = profile.shapes.iter().collect();
+            shapes.sort_by_key(|((kind, k, n), _)| (*kind, *k, *n));
+            for ((kind, k, n), shape) in shapes {
+                let accounted_ns = shape
+                    .quant_ns
+                    .saturating_add(shape.execute_wall_ns)
+                    .saturating_add(shape.rescale_ns);
+                let other_ns = shape.total_ns.saturating_sub(accounted_ns);
+                eprintln!(
+                    "ROCKNPU M1 PROFILE kind={} k={} n={} calls={} npu_tasks={} workers=[{},{},{}] ksplit_calls={} total_ms={:.3} avg_call_ms={:.3} quant_ms={:.3} execute_wall_ms={:.3} rescale_ms={:.3} other_ms={:.3} worker_alloc_ms={:.3} worker_input_ms={:.3} worker_partial_ms={:.3} worker_regcmd_ms={:.3} worker_output_fini_ms={:.3} worker_submit_ms={:.3} worker_wait_ms={:.3} worker_host_accum_ms={:.3}",
+                    kind.as_str(),
+                    k,
+                    n,
+                    shape.calls,
+                    shape.npu_tasks,
+                    shape.worker_calls[0],
+                    shape.worker_calls[1],
+                    shape.worker_calls[2],
+                    shape.ksplit_calls,
+                    ns_to_ms(shape.total_ns),
+                    if shape.calls == 0 {
+                        0.0
+                    } else {
+                        ns_to_ms(shape.total_ns) / shape.calls as f64
+                    },
+                    ns_to_ms(shape.quant_ns),
+                    ns_to_ms(shape.execute_wall_ns),
+                    ns_to_ms(shape.rescale_ns),
+                    ns_to_ms(other_ns),
+                    ns_to_ms(shape.alloc_ns),
+                    ns_to_ms(shape.input_stage_ns),
+                    ns_to_ms(shape.partial_stage_ns),
+                    ns_to_ms(shape.regcmd_stage_ns),
+                    ns_to_ms(shape.output_fini_ns),
+                    ns_to_ms(shape.submit_ns),
+                    ns_to_ms(shape.wait_ns),
+                    ns_to_ms(shape.host_accum_ns),
+                );
+            }
         }
         if let Some(profile) = &context.mtile_profile {
             eprintln!(
