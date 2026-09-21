@@ -1112,8 +1112,8 @@ fn validate_shape(k: usize, n: usize) -> Result<(), Int8DecodeError> {
     if k == 0 || n == 0 {
         return Err(Int8DecodeError::InvalidInput("K and N must be non-zero"));
     }
-    if !k.is_multiple_of(512) {
-        return Err(Int8DecodeError::InvalidInput("K must be a multiple of 512"));
+    if !k.is_multiple_of(256) {
+        return Err(Int8DecodeError::InvalidInput("K must be a multiple of 256"));
     }
     if !n.is_multiple_of(32) || n > N_MAX {
         return Err(Int8DecodeError::InvalidInput(

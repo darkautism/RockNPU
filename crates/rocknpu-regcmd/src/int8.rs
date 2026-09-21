@@ -214,11 +214,11 @@ pub fn encode_int8_decode_m1(
             reason: "dimensions must be non-zero",
         });
     }
-    if !desc.k.is_multiple_of(512) || desc.k > 4096 {
+    if !desc.k.is_multiple_of(256) || desc.k > 4096 {
         return Err(Int8EncodeError::InvalidShape {
             k: desc.k,
             n: desc.n,
-            reason: "first full-K Rocket gate requires K%512==0 and K<=4096",
+            reason: "M=1 full-K Rocket gate requires K%256==0 and K<=4096",
         });
     }
     if !desc.n.is_multiple_of(32) || desc.n > RK3588_NMAX {
@@ -344,6 +344,22 @@ mod tests {
         assert_eq!(reg_value(&ops, 0x1110), 0x2222_2000);
         assert_eq!(reg_value(&ops, 0x4020), 0x3333_3000);
         assert_eq!(reg_value(&ops, 0x4034), 0);
+    }
+
+    #[test]
+    fn m1_k256_n64_geometry_is_encodable() {
+        let ops = encode_int8_decode_m1(Int8DecodeDesc::new(
+            256,
+            64,
+            0x1111_1000,
+            0x2222_2000,
+            0x3333_3000,
+        ))
+        .unwrap();
+        assert_eq!(reg_value(&ops, 0x1024), 0x00ff_0100);
+        assert_eq!(reg_value(&ops, 0x1030), 256 * 64);
+        assert_eq!(reg_value(&ops, 0x1040), 0xc0);
+        assert_eq!(reg_value(&ops, 0x107c), 16);
     }
 
     #[test]

@@ -809,7 +809,7 @@ GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" \
   test -b ROCKNPU0 -o MUL_MAT -p q4_K
 ```
 
-Accepted result: `7/7 tests passed`, `Backend ROCKNPU: OK`. The stock oracle's M=1 sample uses K=256 and remains intentionally outside the W8A8 M=1 contract; the real-model gate below verifies supported M=1 execution.
+Accepted result: `7/7 tests passed`, `Backend ROCKNPU: OK`. The stock oracle's M=1 sample uses K=256. K=256 is now inside the validated W8A8 M=1 full-K envelope; the hardware gates below include direct K=256 bit-exact checks as well as the real-model K=2048 path.
 
 Run the stock Q6_K oracle:
 
@@ -859,9 +859,11 @@ Build the two hardware gates:
 cargo build --release -p rocket-smoke --bin int8_decode_m1 --bin int8_decode_widek
 ```
 
-The single-submit M=1 gate accepts the current validated full-K envelope (`K % 512 == 0`, `K <= 4096`, `N % 32 == 0`, `N <= 8192`) and exact-compares every int32 output against a CPU dot-product oracle. TinyLlama projection shapes validated on the RK3588 host are:
+The single-submit M=1 gate accepts the current validated full-K envelope (`K % 256 == 0`, `K <= 4096`, `N % 32 == 0`, `N <= 8192`) and exact-compares every int32 output against a CPU dot-product oracle. K=256 was revalidated on current main with both a small and wide N shape; TinyLlama projection shapes use the same path:
 
 ```sh
+./target/release/int8_decode_m1 256 64
+./target/release/int8_decode_m1 256 2048
 ./target/release/int8_decode_m1 2048 256
 ./target/release/int8_decode_m1 2048 2048
 ./target/release/int8_decode_m1 2048 5632
@@ -870,6 +872,8 @@ The single-submit M=1 gate accepts the current validated full-K envelope (`K % 5
 Observed exact gates:
 
 ```text
+INT8 PREPARED DECODE PASS M=1 K=256 N=64 outputs=64 ...
+INT8 PREPARED DECODE PASS M=1 K=256 N=2048 outputs=2048 ...
 INT8 DECODE PASS M=1 K=2048 N=256  outputs=256  regcmd_count=112 submit_wait_us=660.9
 INT8 DECODE PASS M=1 K=2048 N=2048 outputs=2048 regcmd_count=112 submit_wait_us=1575.6
 INT8 DECODE PASS M=1 K=2048 N=5632 outputs=5632 regcmd_count=112 submit_wait_us=3905.9
