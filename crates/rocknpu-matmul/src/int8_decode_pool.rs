@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-use crate::int8_decode::Int8OwnedScratch;
+use crate::int8_decode::{Int8MtileScratch, Int8OwnedScratch};
 use crate::{
     Int8DecodeExecutor, Int8DecodeOutput, Int8DecodeStats, Int8PreparedWeightStats,
     Int8PreparedWeights,
@@ -125,6 +125,12 @@ enum WorkerCommand {
         activation: Arc<[i8]>,
         slice: WorkerSlice,
     },
+    RunPreparedM16 {
+        request_id: u64,
+        weight_id: u64,
+        activation: Arc<[i8]>,
+        slice: WorkerSlice,
+    },
     Release {
         request_id: u64,
         weight_id: u64,
@@ -192,6 +198,7 @@ impl Int8DecodePool {
                     }
                 };
                 let mut resident: HashMap<u64, Int8PreparedWeights> = HashMap::new();
+                let mut m16_scratch: HashMap<(usize, usize), Option<Int8MtileScratch>> = HashMap::new();
                 if init_tx.send(Ok(worker)).is_err() {
                     return;
                 }
@@ -254,6 +261,45 @@ impl Int8DecodePool {
                                 None => {
                                     Err(format!("worker {worker}: resident weight id not found"))
                                 }
+                            };
+                            if result_tx
+                                .send(WorkerResult {
+                                    request_id,
+                                    worker,
+                                    slice,
+                                    response: WorkerResponse::Ran(output),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        WorkerCommand::RunPreparedM16 {
+                            request_id,
+                            weight_id,
+                            activation,
+                            slice,
+                        } => {
+                            let output = match resident.get(&weight_id) {
+                                Some(prepared)
+                                    if slice.k0 == 0
+                                        && prepared.k() == slice.ksub
+                                        && prepared.n() == slice.nsub
+                                        && activation.len() == 16usize.saturating_mul(slice.ksub) =>
+                                {
+                                    let scratch_slot = m16_scratch
+                                        .entry((slice.ksub, slice.nsub))
+                                        .or_insert(None);
+                                    executor
+                                        .execute_prepared_m16_persistent(
+                                            &activation,
+                                            prepared,
+                                            scratch_slot,
+                                        )
+                                        .map_err(|err| format!("worker {worker}: {err}"))
+                                }
+                                Some(_) => Err(format!("worker {worker}: resident M16 shape mismatch")),
+                                None => Err(format!("worker {worker}: resident weight id not found")),
                             };
                             if result_tx
                                 .send(WorkerResult {
@@ -481,6 +527,92 @@ impl Int8DecodePool {
             slices,
             stats,
             direct_prepared: None,
+        })
+    }
+
+    pub fn execute_prepared_m16(
+        &mut self,
+        activation: Arc<[i8]>,
+        weights: &Int8DecodePoolPreparedWeights,
+    ) -> Result<Int8DecodePoolOutput, Int8DecodePoolError> {
+        const M: usize = 16;
+        if weights.split != Int8DecodeSplit::N {
+            return Err(Int8DecodePoolError::InvalidInput(
+                "M16 pool path requires N-split prepared weights",
+            ));
+        }
+        if activation.len() != M.saturating_mul(weights.k) {
+            return Err(Int8DecodePoolError::InvalidInput(
+                "M16 activation length must equal 16*K",
+            ));
+        }
+        if weights.direct_prepared.is_some() {
+            return Err(Int8DecodePoolError::InvalidInput(
+                "M16 pool path does not yet support ROCKNPU_W8_DIRECT_SUBMIT",
+            ));
+        }
+
+        let request_id = self.allocate_request_id();
+        let start = Instant::now();
+        for (worker, &slice) in weights.slices.iter().enumerate() {
+            self.senders[worker]
+                .send(WorkerCommand::RunPreparedM16 {
+                    request_id,
+                    weight_id: weights.weight_id,
+                    activation: Arc::clone(&activation),
+                    slice,
+                })
+                .map_err(|_| Int8DecodePoolError::ChannelClosed)?;
+        }
+
+        let total_values = M
+            .checked_mul(weights.n)
+            .ok_or(Int8DecodePoolError::InvalidInput("M16 output size overflow"))?;
+        let mut values = vec![0i32; total_values];
+        let mut npu_tasks = 0usize;
+        let mut worker_total_ns = vec![0u128; weights.slices.len()];
+        let mut worker_stats = vec![Int8DecodeStats::default(); weights.slices.len()];
+        for _ in 0..weights.slices.len() {
+            let result = self.recv_result(request_id, weights.slices.len())?;
+            let output = match result.response {
+                WorkerResponse::Ran(Ok(output)) => output,
+                WorkerResponse::Ran(Err(error)) => return Err(Int8DecodePoolError::Worker(error)),
+                _ => {
+                    return Err(Int8DecodePoolError::Worker(
+                        "unexpected worker response while executing M16 INT8 weights".to_string(),
+                    ));
+                }
+            };
+            let expected_worker_values = M.saturating_mul(result.slice.nsub);
+            if output.values.len() != expected_worker_values
+                || result.slice.n0.saturating_add(result.slice.nsub) > weights.n
+            {
+                return Err(Int8DecodePoolError::Worker(format!(
+                    "worker {} returned invalid M16 output geometry",
+                    result.worker
+                )));
+            }
+            for row in 0..M {
+                let src_start = row * result.slice.nsub;
+                let dst_start = row * weights.n + result.slice.n0;
+                values[dst_start..dst_start + result.slice.nsub]
+                    .copy_from_slice(&output.values[src_start..src_start + result.slice.nsub]);
+            }
+            npu_tasks = npu_tasks.saturating_add(output.stats.npu_tasks);
+            worker_total_ns[result.worker] = output.stats.total_ns;
+            worker_stats[result.worker] = output.stats;
+        }
+
+        Ok(Int8DecodePoolOutput {
+            values,
+            stats: Int8DecodePoolStats {
+                split: weights.split,
+                workers_used: weights.slices.len(),
+                npu_tasks,
+                wall_ns: start.elapsed().as_nanos(),
+                worker_total_ns,
+                worker_stats,
+            },
         })
     }
 
