@@ -198,6 +198,47 @@ pub fn encode_int8_mtile(
     Ok(ops)
 }
 
+/// Encode an M-tile that reuses the previous task's resident weight tile.
+/// RK3588 uses bit13 of CNA_CBUF_CON0 (0x1040) for WEIGHT_REUSE. The caller must
+/// submit this task after a task with the same weight tile, identical tile geometry,
+/// and in the same Rocket job. Reuse is only correct when the complete KxN weight
+/// segment fits the configured WEIGHT_BANK capacity; fail closed otherwise.
+pub fn encode_int8_mtile_weight_reuse(
+    m: usize,
+    desc: Int8DecodeDesc,
+) -> Result<[u64; INT8_REGCMD_COUNT], Int8EncodeError> {
+    let mut ops = encode_int8_mtile(m, desc)?;
+    let bank_cfg = ops
+        .iter()
+        .find(|word| (**word as u16) == 0x1040)
+        .map(|word| ((*word >> 16) & 0xffff_ffff) as u32)
+        .ok_or(Int8EncodeError::InvalidShape {
+            k: desc.k,
+            n: desc.n,
+            reason: "validated M-tile stream is missing CNA_CBUF_CON0",
+        })?;
+    let weight_banks = ((bank_cfg >> 4) & 0x0f) as usize;
+    let capacity = weight_banks
+        .checked_mul(32 * 1024)
+        .ok_or(Int8EncodeError::SizeOverflow)?;
+    let weight_bytes = desc
+        .k
+        .checked_mul(desc.n)
+        .ok_or(Int8EncodeError::SizeOverflow)?;
+    if weight_banks == 0 || weight_bytes > capacity {
+        return Err(Int8EncodeError::InvalidShape {
+            k: desc.k,
+            n: desc.n,
+            reason: "weight reuse requires K*N bytes to fit configured WEIGHT_BANK capacity",
+        });
+    }
+    for word in ops.iter_mut().filter(|word| (**word as u16) == 0x1040) {
+        let value = (((*word >> 16) & 0xffff_ffff) as u32) | (1 << 13);
+        *word = (*word & 0xffff_0000_0000_ffff) | ((value as u64) << 16);
+    }
+    Ok(ops)
+}
+
 /// Encode the current production-style W8A8 decode primitive:
 /// `C[1,N] i32 = A[1,K] i8 x B[K,N] i8`.
 ///
@@ -394,6 +435,27 @@ mod tests {
         assert!(encode_int8_mtile(
             128,
             Int8DecodeDesc::new(2560, 2048, 0x1111_1000, 0x2222_2000, 0x3333_3000),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn mtile_weight_reuse_is_capacity_gated() {
+        let ops = encode_int8_mtile_weight_reuse(
+            64,
+            Int8DecodeDesc::new(2048, 64, 0x1111_1000, 0x2222_2000, 0x3333_3000),
+        )
+        .unwrap();
+        let values = ops
+            .iter()
+            .filter(|word| (**word as u16) == 0x1040)
+            .map(|word| ((*word >> 16) & 0xffff_ffff) as u32)
+            .collect::<Vec<_>>();
+        assert!(!values.is_empty());
+        assert!(values.iter().all(|value| value & (1 << 13) != 0));
+        assert!(encode_int8_mtile_weight_reuse(
+            64,
+            Int8DecodeDesc::new(2048, 160, 0x1111_1000, 0x2222_2000, 0x3333_3000),
         )
         .is_err());
     }

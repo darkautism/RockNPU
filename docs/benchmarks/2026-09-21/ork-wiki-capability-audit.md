@@ -55,6 +55,37 @@ On-silicon comparisons against `plain NPU matmul + CPU fp16 residual add`:
 
 `rocknpu-llm` prefill now uses the fused path for the attention output projection residual and FFN down projection residual when M geometry permits. Decode M=1 intentionally keeps the CPU residual fallback.
 
+### INT8 CBUF WEIGHT_REUSE
+
+The ork reverse-engineering record identifies CNA_CBUF_CON0 (0x1040) bit13 as WEIGHT_REUSE: a later task in the same Rocket job may reuse the previous task's weight tile from CBUF instead of fetching it from DRAM again.
+
+An important negative result came first: setting bit13 inside a standalone M128 task is incorrect (first output observed expected 2048, got -3851). WEIGHT_REUSE is a cross-task contract, not an internal M-group flag. The correct contract requires:
+- the reuse task follows a task with the same weight tile;
+- identical M/N/K tile geometry so the CBUF bank split is unchanged;
+- both tasks execute in the same Rocket job;
+- the full KxN weight segment fits the configured WEIGHT_BANK capacity.
+
+RockNPU now exposes a fail-closed `encode_int8_mtile_weight_reuse()` encoder and a hardware smoke that submits multiple same-weight tasks in one job. The encoder sets bit13 only after validating the weight tile against the task's 0x1040 bank geometry.
+
+On-silicon exact checks on o16g:
+- 2 x M64, K2048/N64: PASS with and without reuse.
+- 4 x M32, K2048/N64: PASS with and without reuse.
+- 8 x M16, K2048/N64: PASS with and without reuse.
+- 2 x M128 = total M256, K2048/N64: PASS with and without reuse.
+
+CPU-big-core performance-governor ABBA medians for total M128:
+- 2 x M64: baseline 388.8/411.5 us, reuse 356.4/391.4 us.
+- 4 x M32: baseline 480.4/480.4 us, reuse 390.8/386.2 us.
+- 8 x M16: baseline 539.3/610.5 us, reuse 438.1/459.4 us.
+
+The deeper reuse runs show the expected larger benefit because more weight DMA fetches are skipped.
+
+For the immediately useful M256 case (2 x M128, K2048/N64), controlled ABBA medians were:
+- baseline 771.2 / 753.7 us;
+- WEIGHT_REUSE 694.4 / 701.7 us.
+
+That is about 8.4% lower latency, or roughly 9.2% higher throughput, while remaining bit-exact. The next production step is to lower M>128 verifier batches into same-job M128 tasks and enable WEIGHT_REUSE after the first task.
+
 ### NONBLOCK doorbell status
 
 The live stock Rocket UAPI/kernel headers expose no Rocket/RKNPU NONBLOCK submit flag, and the loaded module exposes no matching runtime parameter. RockNPU already separates submit and completion through `begin_execute_prepared()` / `finish_execute_prepared()`, but that is not equivalent to ork-driver's NONBLOCK doorbell capability. This remains a driver-side capability gap; no kernel/module change was made during this audit.
