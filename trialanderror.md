@@ -38,6 +38,7 @@ Disposition:
 | Plain FP16 M=1 | Large mismatches; invalid production geometry. | C5 | CLOSED |
 | Pad FP16 M=1 to M=4 | Can be correct, but loses badly at whole-model scale. | C5 | CLOSED |
 | Generic CPU delegation inside RockNPU backend | Preserves work instead of removing it; slower. | C4 | CLOSED |
+| GGML-only SwiGLU boundary collapse | Directly calling libggml-cpu from the adapter violates the frontend-neutral core direction. A corrected Rust/C-ABI SwiGLU version preserved an 8-token greedy output byte-for-byte, but adjacent n=8 A/B orders were inconsistent (+3.84% then -0.28%; about +1.8% two-pair center). No validated speed win. | C4 | CLOSED |
 | Same-input activation quantization cache | Real reuse opportunity, but too small to justify complexity at current latency. Current-main M=1 profiling puts all steady activation quantization at only about 0.68 ms/token. | C5 | CLOSED |
 | M=1 host quantize/rescale micro-optimization | Current-main hot profile shows about 0.68 ms/token quantize and 0.85 ms/token rescale across the effective steady projection set; not a primary lever. | C5 | CLOSED |
 | Forced N64 segmentation for weight reuse | M256/N2048 about 2.5x slower; M256/N256 about 1.73x slower. | C5 | CLOSED |

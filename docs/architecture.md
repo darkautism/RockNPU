@@ -134,6 +134,13 @@ It is responsible for:
 - backend-local caches/stashes;
 - calling the C ABI.
 
+Frontend adapters may link frontend-specific libraries when required by that
+frontend's ABI, host-buffer contract, or fallback path. That linkage must stop
+at the adapter boundary. Shared operators, dataflow optimizations, scheduling,
+quantization, layout transforms, and reusable execution primitives belong in
+the frontend-neutral Rust core/C ABI and must not require GGML, llama.cpp, ONNX,
+Candle, or another frontend library to function.
+
 ### rocket-smoke
 
 Real-hardware primitive and model gates.

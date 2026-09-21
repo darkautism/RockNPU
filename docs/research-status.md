@@ -217,12 +217,27 @@ This is deliberately different from the rejected fully quantized FFN experiments
 
 Required order:
 
-1. reproduce the exact GGML SWIGLU F32 contract;
+1. define a frontend-neutral F32 SwiGLU numerical contract;
 2. add a direct FFN primitive/oracle using current gate/up and down W8 paths;
 3. prove output equivalence against the existing graph path;
 4. integrate behind an opt-in route;
 5. deterministic TinyLlama generation gate;
 6. same-process whole-token A/B.
+
+A narrower 2026-09-22 subexperiment only moved split F32 SwiGLU into the
+RockNPU GGML graph so gate/up, SwiGLU, and down no longer crossed a scheduler
+partition. An initial adapter-side prototype called llama.cpp's
+`ggml_vec_swiglu_f32`; that implementation was rejected because shared
+execution must not depend on a frontend library. The experiment was then
+reimplemented as a frontend-neutral Rust/C-ABI SwiGLU primitive. Its 8-token
+greedy output was byte-identical to the baseline, but short adjacent n=8
+performance pairs were inconsistent: about +3.84% in one order and -0.28% in
+the reverse order, with a two-pair center of only about +1.8%. This is not a
+validated speed win and the code was discarded.
+
+Do not repeat the scheduler-boundary-only variant unchanged. H1 remains useful
+only if the next composite FFN path removes more real work or intermediate
+ownership than merely relabeling the CPU SwiGLU under the RockNPU backend.
 
 ### H2 — end-to-end NPU attention
 
