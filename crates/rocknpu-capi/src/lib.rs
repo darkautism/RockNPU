@@ -268,23 +268,16 @@ fn host_neon_enabled() -> bool {
     }
 }
 
-fn mtile_qo_group_size_from_override(k: usize, n: usize, value: Option<&str>) -> Option<usize> {
+fn mtile_qo_group_size(k: usize, n: usize) -> Option<usize> {
     if k != 2048 || n != 2048 {
         return None;
     }
-    let group = match value {
-        Some("") | Some("0") => return None,
-        Some(value) if value.eq_ignore_ascii_case("off") => return None,
-        Some(value) => value.parse::<usize>().ok()?,
-        None => 1024,
-    };
+    let group = env::var("ROCKNPU_MTILE_QO_GROUP")
+        .ok()?
+        .parse::<usize>()
+        .ok()?;
     (group >= 512 && group <= k && group.is_multiple_of(512) && k.is_multiple_of(group))
         .then_some(group)
-}
-
-fn mtile_qo_group_size(k: usize, n: usize) -> Option<usize> {
-    let value = env::var("ROCKNPU_MTILE_QO_GROUP").ok();
-    mtile_qo_group_size_from_override(k, n, value.as_deref())
 }
 
 fn mtile_shape_enabled(k: usize, n: usize) -> bool {
@@ -4375,15 +4368,6 @@ pub unsafe extern "C" fn rocknpu_matmul_q6_k_f32_f32(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn m16_qo_group_defaults_to_promoted_1024_and_allows_opt_out() {
-        assert_eq!(mtile_qo_group_size_from_override(2048, 2048, None), Some(1024));
-        assert_eq!(mtile_qo_group_size_from_override(2048, 2048, Some("1024")), Some(1024));
-        assert_eq!(mtile_qo_group_size_from_override(2048, 2048, Some("0")), None);
-        assert_eq!(mtile_qo_group_size_from_override(2048, 2048, Some("off")), None);
-        assert_eq!(mtile_qo_group_size_from_override(2048, 5632, None), None);
-    }
 
     #[cfg(target_arch = "aarch64")]
     #[test]

@@ -76,7 +76,7 @@ The combined paths preserve the existing per-output W8 scaling semantics. Histor
 
 Do not reimplement these as superficial grouping: they already execute as larger combined matmuls.
 
-For M16 Q/O projections, the validated 2-way K grouping (`2048 -> 2x1024`) is now the product default. `ROCKNPU_MTILE_QO_GROUP=0` or `off` remains an explicit diagnostic opt-out. On o8, a fresh fair-hot Ollama c16 check measured 79.30 and 79.65 aggregate tok/s with the default grouping versus a 34.94 tok/s CPU c16 reference. This reproduces the earlier cross-board grouped-M16 result and closes the gap between the promoted research route and the default product route.
+For M16 Q/O projections, the validated 2-way K grouping (`2048 -> 2x1024`) remains an opt-in research route via `ROCKNPU_MTILE_QO_GROUP=1024`. A 2026-09-23 Ollama recheck found that an apparent large c16 win was entirely caused by mismatched warm/cache state. With identical `16-way warm -> 16-way measure`, CPU was 79.60/79.86 tok/s, grouped NPU was 79.17/79.56 tok/s, and ungrouped NPU was 79.87/79.37 tok/s. Therefore grouping has no validated hot whole-model Ollama speed benefit and must not be promoted from the older pp16 result alone.
 
 ### FP16 fused residual
 
