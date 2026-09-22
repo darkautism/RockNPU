@@ -113,18 +113,18 @@ pub fn encode_int8_mtile(
     m: usize,
     desc: Int8DecodeDesc,
 ) -> Result<[u64; INT8_REGCMD_COUNT], Int8EncodeError> {
-    if !matches!(m, 16 | 32 | 48 | 64 | 128) || desc.k == 0 || desc.n == 0 {
+    if !matches!(m, 4 | 8 | 12 | 16 | 32 | 48 | 64 | 128) || desc.k == 0 || desc.n == 0 {
         return Err(Int8EncodeError::InvalidShape {
             k: desc.k,
             n: desc.n,
-            reason: "research M-tile requires M in {16,32,48,64,128} and non-zero K/N",
+            reason: "M-tile requires M in {4,8,12,16,32,48,64,128} and non-zero K/N",
         });
     }
-    if !desc.k.is_multiple_of(512) || desc.k > 4096 || (m == 128 && desc.k > 2048) {
+    if !desc.k.is_multiple_of(512) || desc.k > 4096 || (m > 64 && desc.k > 2048) {
         return Err(Int8EncodeError::InvalidShape {
             k: desc.k,
             n: desc.n,
-            reason: "M-tile full-K gate requires K%512==0, K<=4096, and M128 requires K<=2048",
+            reason: "M-tile full-K gate requires K%512==0, K<=4096, and M>64 requires K<=2048",
         });
     }
     if !desc.n.is_multiple_of(32) || desc.n > RK3588_NMAX {

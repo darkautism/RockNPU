@@ -135,6 +135,18 @@ pub struct Int8MtileScratch {
     output: RocketOwnedBuffer,
 }
 
+pub struct Int8MtileBatchScratch {
+    regcmd: RocketOwnedBuffer,
+    input: RocketOwnedBuffer,
+    output: RocketOwnedBuffer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Int8MtileBatchOutput {
+    pub values: Vec<Vec<i32>>,
+    pub stats: Int8DecodeStats,
+}
+
 pub(crate) struct Int8OwnedPending {
     slices: usize,
     n: usize,
@@ -188,9 +200,9 @@ impl<'a> Int8DecodeExecutor<'a> {
         weights: &Int8PreparedWeights,
         scratch_slot: &mut Option<Int8MtileScratch>,
     ) -> Result<Int8DecodeOutput, Int8DecodeError> {
-        if !matches!(m, 16 | 32 | 48 | 64 | 128) {
+        if !matches!(m, 4 | 8 | 12 | 16 | 32 | 48 | 64 | 128) {
             return Err(Int8DecodeError::InvalidInput(
-                "persistent M-tile path requires M in {16,32,48,64,128}",
+                "persistent M-tile path requires M in {4,8,12,16,32,48,64,128}",
             ));
         }
         let total_start = Instant::now();
@@ -320,6 +332,199 @@ impl<'a> Int8DecodeExecutor<'a> {
                 submit_ns,
                 wait_ns,
                 submit_wait_ns,
+                host_accum_ns: 0,
+                total_ns: total_start.elapsed().as_nanos(),
+            },
+        })
+    }
+
+    /// Execute several same-shape resident W8A8 M-tiles as one Rocket job.
+    /// Each entry keeps its own resident weight BO and activation slice while
+    /// sharing one job so grouped quantization pays the submit floor once.
+    pub fn execute_prepared_mtile_batch_persistent(
+        &self,
+        m: usize,
+        activations: &[&[i8]],
+        weights: &[&Int8PreparedWeights],
+        scratch_slot: &mut Option<Int8MtileBatchScratch>,
+    ) -> Result<Int8MtileBatchOutput, Int8DecodeError> {
+        let total_start = Instant::now();
+        if !matches!(m, 4 | 8 | 12 | 16 | 32 | 48 | 64 | 128) {
+            return Err(Int8DecodeError::InvalidInput(
+                "persistent M-tile batch requires M in {4,8,12,16,32,48,64,128}",
+            ));
+        }
+        if activations.is_empty() || activations.len() != weights.len() || activations.len() > 64 {
+            return Err(Int8DecodeError::InvalidInput(
+                "persistent M-tile batch requires 1..=64 matching activation/weight entries",
+            ));
+        }
+        let first = weights[0];
+        let k = first.k;
+        let n = first.n;
+        if first.slices != 1 || k > SINGLE_SUBMIT_K_MAX {
+            return Err(Int8DecodeError::InvalidInput(
+                "persistent M-tile batch requires one full-K weight slice",
+            ));
+        }
+        let expected_a = m.checked_mul(k).ok_or(Int8DecodeError::SizeOverflow)?;
+        for (activation, prepared) in activations.iter().zip(weights.iter().copied()) {
+            if prepared.device_fd != self.device.fd()
+                || prepared.k != k
+                || prepared.n != n
+                || prepared.slices != 1
+            {
+                return Err(Int8DecodeError::InvalidInput(
+                    "persistent M-tile batch weights must share device and shape",
+                ));
+            }
+            if activation.len() != expected_a {
+                return Err(Int8DecodeError::InvalidInput(
+                    "persistent M-tile batch activation length must equal M*K",
+                ));
+            }
+        }
+
+        let count = weights.len();
+        let input_stride = expected_a
+            .checked_add(4095)
+            .map(|v| v & !4095)
+            .ok_or(Int8DecodeError::SizeOverflow)?;
+        let output_values = m.checked_mul(n).ok_or(Int8DecodeError::SizeOverflow)?;
+        let output_stride = output_values
+            .checked_mul(4)
+            .and_then(|v| v.checked_add(4095))
+            .map(|v| v & !4095)
+            .ok_or(Int8DecodeError::SizeOverflow)?;
+        let regcmd_stride = REGCMD_BYTES;
+        let input_bytes = input_stride.checked_mul(count).ok_or(Int8DecodeError::SizeOverflow)?;
+        let output_bytes = output_stride.checked_mul(count).ok_or(Int8DecodeError::SizeOverflow)?;
+        let regcmd_bytes = regcmd_stride.checked_mul(count).ok_or(Int8DecodeError::SizeOverflow)?;
+
+        let alloc_start = Instant::now();
+        let needs_grow = scratch_slot.as_ref().is_none_or(|scratch| {
+            scratch.regcmd.len() < regcmd_bytes
+                || scratch.input.len() < input_bytes
+                || scratch.output.len() < output_bytes
+        });
+        if needs_grow {
+            let old = scratch_slot.as_ref();
+            let regcmd_capacity = old.map_or(regcmd_bytes, |s| s.regcmd.len().max(regcmd_bytes));
+            let input_capacity = old.map_or(input_bytes, |s| s.input.len().max(input_bytes));
+            let output_capacity = old.map_or(output_bytes, |s| s.output.len().max(output_bytes));
+            let scratch = Int8MtileBatchScratch {
+                regcmd: self.device.alloc_owned_buffer(regcmd_capacity)?,
+                input: self.device.alloc_owned_buffer(input_capacity)?,
+                output: self.device.alloc_owned_buffer(output_capacity)?,
+            };
+            for (addr, len) in [
+                (scratch.regcmd.dma_address(), scratch.regcmd.len()),
+                (scratch.input.dma_address(), scratch.input.len()),
+                (scratch.output.dma_address(), scratch.output.len()),
+            ] {
+                check_dma32_range(addr, len)?;
+            }
+            *scratch_slot = Some(scratch);
+        }
+        let alloc_ns = alloc_start.elapsed().as_nanos();
+        let scratch = scratch_slot.as_mut().ok_or(Int8DecodeError::InvalidInput(
+            "persistent M-tile batch scratch missing",
+        ))?;
+
+        let input_stage_start = Instant::now();
+        scratch.input.prep_relative(0)?;
+        for (index, activation) in activations.iter().enumerate() {
+            let begin = index * input_stride;
+            let end = begin + activation.len();
+            for (dst, src) in scratch.input.as_mut_slice()[begin..end]
+                .iter_mut()
+                .zip(activation.iter().copied())
+            {
+                *dst = src as u8;
+            }
+        }
+        scratch.input.fini()?;
+        let input_stage_ns = input_stage_start.elapsed().as_nanos();
+
+        let regcmd_stage_start = Instant::now();
+        scratch.regcmd.prep_relative(0)?;
+        scratch.regcmd.as_mut_slice()[..regcmd_bytes].fill(0);
+        let mut tasks = Vec::with_capacity(count);
+        for (index, prepared) in weights.iter().copied().enumerate() {
+            let input_addr = scratch
+                .input
+                .dma_address()
+                .checked_add((index * input_stride) as u64)
+                .ok_or(Int8DecodeError::SizeOverflow)?;
+            let output_addr = scratch
+                .output
+                .dma_address()
+                .checked_add((index * output_stride) as u64)
+                .ok_or(Int8DecodeError::SizeOverflow)?;
+            let reg_addr = scratch
+                .regcmd
+                .dma_address()
+                .checked_add((index * regcmd_stride) as u64)
+                .ok_or(Int8DecodeError::SizeOverflow)?;
+            let ops = encode_int8_mtile(
+                m,
+                Int8DecodeDesc::new(k, n, input_addr, prepared.bo.dma_address(), output_addr),
+            )?;
+            write_regcmd_bytes(scratch.regcmd.as_mut_slice(), index * regcmd_stride, &ops)?;
+            tasks.push(Task {
+                regcmd: u32::try_from(reg_addr)
+                    .map_err(|_| Int8DecodeError::AddressAbove32Bit(reg_addr))?,
+                regcmd_count: u32::try_from(ops.len())
+                    .map_err(|_| Int8DecodeError::SizeOverflow)?,
+            });
+        }
+        scratch.regcmd.fini()?;
+        let regcmd_stage_ns = regcmd_stage_start.elapsed().as_nanos();
+
+        let mut input_handles = Vec::with_capacity(count + 2);
+        input_handles.push(scratch.input.handle());
+        input_handles.push(scratch.regcmd.handle());
+        for prepared in weights.iter().copied() {
+            input_handles.push(prepared.bo.handle());
+        }
+
+        let submit_wait_start = Instant::now();
+        let submit_start = Instant::now();
+        self.device
+            .submit(&tasks, &input_handles, &[scratch.output.handle()])?;
+        let submit_ns = submit_start.elapsed().as_nanos();
+        let wait_start = Instant::now();
+        scratch.output.prep_relative(WAIT_NS)?;
+        let wait_ns = wait_start.elapsed().as_nanos();
+
+        let mut values = Vec::with_capacity(count);
+        for index in 0..count {
+            let begin = index * output_stride;
+            let slice = &scratch.output.as_slice()[begin..begin + output_values * 4];
+            let mut group = Vec::with_capacity(output_values);
+            for i in 0..output_values {
+                group.push(read_i32(slice, i));
+            }
+            values.push(group);
+        }
+        let output_fini_start = Instant::now();
+        scratch.output.fini()?;
+        let output_fini_ns = output_fini_start.elapsed().as_nanos();
+
+        Ok(Int8MtileBatchOutput {
+            values,
+            stats: Int8DecodeStats {
+                k_slices: count,
+                npu_tasks: count,
+                pack_ns: input_stage_ns + regcmd_stage_ns,
+                alloc_ns,
+                input_stage_ns,
+                partial_stage_ns: 0,
+                regcmd_stage_ns,
+                output_fini_ns,
+                submit_ns,
+                wait_ns,
+                submit_wait_ns: submit_wait_start.elapsed().as_nanos(),
                 host_accum_ns: 0,
                 total_ns: total_start.elapsed().as_nanos(),
             },

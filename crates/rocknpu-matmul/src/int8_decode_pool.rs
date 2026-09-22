@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 
-use crate::int8_decode::{Int8MtileScratch, Int8OwnedScratch};
+use crate::int8_decode::{
+    Int8MtileBatchOutput, Int8MtileBatchScratch, Int8MtileScratch, Int8OwnedScratch,
+};
 use crate::{
     Int8DecodeExecutor, Int8DecodeOutput, Int8DecodeStats, Int8PreparedWeightStats,
     Int8PreparedWeights,
@@ -111,6 +113,12 @@ pub struct Int8DecodePoolOutput {
     pub stats: Int8DecodePoolStats,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Int8DecodePoolMtileBatchOutput {
+    pub values: Vec<Vec<i32>>,
+    pub stats: Int8DecodePoolStats,
+}
+
 enum WorkerCommand {
     Prepare {
         request_id: u64,
@@ -133,6 +141,11 @@ enum WorkerCommand {
         activation: Arc<[i8]>,
         slice: WorkerSlice,
     },
+    RunPreparedMtileBatch {
+        request_id: u64,
+        m: usize,
+        items: Vec<(u64, Arc<[i8]>, WorkerSlice)>,
+    },
     Release {
         request_id: u64,
         weight_id: u64,
@@ -144,6 +157,7 @@ enum WorkerCommand {
 enum WorkerResponse {
     Prepared(Result<Int8PreparedWeightStats, String>),
     Ran(Result<Int8DecodeOutput, String>),
+    RanMtileBatch(Result<Int8MtileBatchOutput, String>),
     Released,
 }
 
@@ -202,6 +216,8 @@ impl Int8DecodePool {
                 let mut resident: HashMap<u64, Int8PreparedWeights> = HashMap::new();
                 let mut mtile_scratch: HashMap<(usize, usize), Option<Int8MtileScratch>> =
                     HashMap::new();
+                let mut mtile_batch_scratch:
+                    HashMap<(usize, usize), Option<Int8MtileBatchScratch>> = HashMap::new();
                 if init_tx.send(Ok(worker)).is_err() {
                     return;
                 }
@@ -293,7 +309,7 @@ impl Int8DecodePool {
                         } => {
                             let output = match resident.get(&weight_id) {
                                 Some(prepared)
-                                    if matches!(m, 16 | 32 | 48 | 64 | 128)
+                                    if matches!(m, 4 | 8 | 12 | 16 | 32 | 48 | 64 | 128)
                                         && prepared.k() == slice.ksub
                                         && prepared.n() == slice.nsub
                                         && m != 0
@@ -352,6 +368,76 @@ impl Int8DecodePool {
                                     worker,
                                     slice,
                                     response: WorkerResponse::Ran(output),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        WorkerCommand::RunPreparedMtileBatch {
+                            request_id,
+                            m,
+                            items,
+                        } => {
+                            let slice = items.first().map(|item| item.2).unwrap_or(WorkerSlice {
+                                k0: 0,
+                                ksub: 0,
+                                n0: 0,
+                                nsub: 0,
+                            });
+                            let output = if items.is_empty() {
+                                Err(format!("worker {worker}: empty M-tile batch"))
+                            } else {
+                                let mut activation_refs = Vec::with_capacity(items.len());
+                                let mut prepared_refs = Vec::with_capacity(items.len());
+                                let mut error = None;
+                                for (weight_id, activation, item_slice) in &items {
+                                    match resident.get(weight_id) {
+                                        Some(prepared)
+                                            if item_slice.k0 == 0
+                                                && prepared.k() == item_slice.ksub
+                                                && prepared.n() == item_slice.nsub
+                                                && activation.len() == m.saturating_mul(item_slice.ksub) =>
+                                        {
+                                            activation_refs.push(activation.as_ref());
+                                            prepared_refs.push(prepared);
+                                        }
+                                        Some(_) => {
+                                            error = Some(format!(
+                                                "worker {worker}: resident M-tile batch shape mismatch"
+                                            ));
+                                            break;
+                                        }
+                                        None => {
+                                            error = Some(format!(
+                                                "worker {worker}: resident M-tile batch weight id not found"
+                                            ));
+                                            break;
+                                        }
+                                    }
+                                }
+                                if let Some(error) = error {
+                                    Err(error)
+                                } else {
+                                    let scratch_slot = mtile_batch_scratch
+                                        .entry((slice.ksub, slice.nsub))
+                                        .or_insert(None);
+                                    executor
+                                        .execute_prepared_mtile_batch_persistent(
+                                            m,
+                                            &activation_refs,
+                                            &prepared_refs,
+                                            scratch_slot,
+                                        )
+                                        .map_err(|err| format!("worker {worker}: {err}"))
+                                }
+                            };
+                            if result_tx
+                                .send(WorkerResult {
+                                    request_id,
+                                    worker,
+                                    slice,
+                                    response: WorkerResponse::RanMtileBatch(output),
                                 })
                                 .is_err()
                             {
@@ -605,9 +691,9 @@ impl Int8DecodePool {
         activation: Arc<[i8]>,
         weights: &Int8DecodePoolPreparedWeights,
     ) -> Result<Int8DecodePoolOutput, Int8DecodePoolError> {
-        if !matches!(m, 16 | 32 | 48 | 64 | 128) {
+        if !matches!(m, 4 | 8 | 12 | 16 | 32 | 48 | 64 | 128) {
             return Err(Int8DecodePoolError::InvalidInput(
-                "M-tile pool path requires M in {16,32,48,64,128}",
+                "M-tile pool path requires M in {4,8,12,16,32,48,64,128}",
             ));
         }
         if activation.len() != m.saturating_mul(weights.k) {
@@ -703,6 +789,122 @@ impl Int8DecodePool {
             stats: Int8DecodePoolStats {
                 split: weights.split,
                 workers_used: weights.slices.len(),
+                npu_tasks,
+                wall_ns: start.elapsed().as_nanos(),
+                worker_total_ns,
+                worker_stats,
+            },
+        })
+    }
+
+    pub fn execute_prepared_mtile_batch(
+        &mut self,
+        m: usize,
+        activations: &[Arc<[i8]>],
+        weights: &[&Int8DecodePoolPreparedWeights],
+    ) -> Result<Int8DecodePoolMtileBatchOutput, Int8DecodePoolError> {
+        if !matches!(m, 4 | 8 | 12 | 16 | 32 | 48 | 64 | 128) {
+            return Err(Int8DecodePoolError::InvalidInput(
+                "M-tile batch pool path requires M in {4,8,12,16,32,48,64,128}",
+            ));
+        }
+        if activations.is_empty() || activations.len() != weights.len() || activations.len() > 64 {
+            return Err(Int8DecodePoolError::InvalidInput(
+                "M-tile batch pool path requires 1..=64 matching entries",
+            ));
+        }
+        let first = weights[0];
+        if first.split != Int8DecodeSplit::N || first.direct_prepared.is_some() {
+            return Err(Int8DecodePoolError::InvalidInput(
+                "M-tile batch pool path requires resident N-split weights",
+            ));
+        }
+        let workers = first.slices.len();
+        for (activation, prepared) in activations.iter().zip(weights.iter().copied()) {
+            if prepared.split != Int8DecodeSplit::N
+                || prepared.k != first.k
+                || prepared.n != first.n
+                || prepared.slices != first.slices
+                || prepared.direct_prepared.is_some()
+                || activation.len() != m.saturating_mul(first.k)
+            {
+                return Err(Int8DecodePoolError::InvalidInput(
+                    "M-tile batch pool entries must share N-split geometry",
+                ));
+            }
+        }
+
+        let request_id = self.allocate_request_id();
+        let start = Instant::now();
+        for worker in 0..workers {
+            let mut items = Vec::with_capacity(weights.len());
+            for (activation, prepared) in activations.iter().zip(weights.iter().copied()) {
+                items.push((
+                    prepared.weight_id,
+                    Arc::clone(activation),
+                    prepared.slices[worker],
+                ));
+            }
+            self.senders[worker]
+                .send(WorkerCommand::RunPreparedMtileBatch {
+                    request_id,
+                    m,
+                    items,
+                })
+                .map_err(|_| Int8DecodePoolError::ChannelClosed)?;
+        }
+
+        let mut values = (0..weights.len())
+            .map(|_| vec![0i32; m.saturating_mul(first.n)])
+            .collect::<Vec<_>>();
+        let mut npu_tasks = 0usize;
+        let mut worker_total_ns = vec![0u128; workers];
+        let mut worker_stats = vec![Int8DecodeStats::default(); workers];
+        for _ in 0..workers {
+            let result = self.recv_result(request_id, workers)?;
+            let output = match result.response {
+                WorkerResponse::RanMtileBatch(Ok(output)) => output,
+                WorkerResponse::RanMtileBatch(Err(error)) => {
+                    return Err(Int8DecodePoolError::Worker(error));
+                }
+                _ => {
+                    return Err(Int8DecodePoolError::Worker(
+                        "unexpected worker response while executing M-tile batch".to_string(),
+                    ));
+                }
+            };
+            if output.values.len() != weights.len()
+                || result.slice.n0.saturating_add(result.slice.nsub) > first.n
+            {
+                return Err(Int8DecodePoolError::Worker(format!(
+                    "worker {} returned invalid M-tile batch geometry",
+                    result.worker
+                )));
+            }
+            for (group_index, partial) in output.values.iter().enumerate() {
+                if partial.len() != m.saturating_mul(result.slice.nsub) {
+                    return Err(Int8DecodePoolError::Worker(format!(
+                        "worker {} returned invalid M-tile batch group size",
+                        result.worker
+                    )));
+                }
+                for row in 0..m {
+                    let src = row * result.slice.nsub;
+                    let dst = row * first.n + result.slice.n0;
+                    values[group_index][dst..dst + result.slice.nsub]
+                        .copy_from_slice(&partial[src..src + result.slice.nsub]);
+                }
+            }
+            npu_tasks = npu_tasks.saturating_add(output.stats.npu_tasks);
+            worker_total_ns[result.worker] = output.stats.total_ns;
+            worker_stats[result.worker] = output.stats;
+        }
+
+        Ok(Int8DecodePoolMtileBatchOutput {
+            values,
+            stats: Int8DecodePoolStats {
+                split: Int8DecodeSplit::N,
+                workers_used: workers,
                 npu_tasks,
                 wall_ns: start.elapsed().as_nanos(),
                 worker_total_ns,

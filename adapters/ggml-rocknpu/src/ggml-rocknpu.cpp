@@ -45,6 +45,11 @@ struct rocknpu_w8_tensor {
     std::vector<float> scales;
 };
 
+struct rocknpu_shape_profile {
+    size_t calls = 0;
+    uint64_t ns = 0;
+};
+
 struct rocknpu_backend_context {
     rocknpu_context * runtime;
     ggml_backend_t cpu_fallback = nullptr;
@@ -68,6 +73,7 @@ struct rocknpu_backend_context {
     size_t graph_compute_nodes = 0;
     uint64_t graph_compute_ns = 0;
     std::vector<uint64_t> graph_compute_samples_ns;
+    std::unordered_map<std::string, rocknpu_shape_profile> shape_profile;
     std::unordered_map<std::string, rocknpu_w8_tensor> w8_sidecar;
     rocknpu_qkv_layer_state qkv[ROCKNPU_QKV_MAX_LAYERS] = {};
 };
@@ -172,6 +178,36 @@ bool rocknpu_env_enabled_default(const char * name, bool default_value) {
         return default_value;
     }
     return value[0] != '0';
+}
+
+bool rocknpu_w8_mtile_shape_enabled(size_t k, size_t n) {
+    if (!rocknpu_env_enabled("ROCKNPU_W8_MTILE")) {
+        return false;
+    }
+    const char * scope = std::getenv("ROCKNPU_W8_MTILE_SCOPE");
+    if (scope == nullptr || scope[0] == '\0' || std::strcmp(scope, "all") == 0) {
+        return true;
+    }
+    if (std::strcmp(scope, "kv") == 0) return k == 2048 && n == 256;
+    if (std::strcmp(scope, "qo") == 0) return k == 2048 && n == 2048;
+    if (std::strcmp(scope, "ffn") == 0) return (k == 2048 && n == 5632) || (k == 5632 && n == 2048);
+    if (std::strcmp(scope, "attn") == 0) return k == 2048 && (n == 256 || n == 2048);
+    if (std::strcmp(scope, "safe") == 0) return k == 2048 && (n == 256 || n == 5632);
+    return false;
+}
+
+bool rocknpu_small_native_mtile_supported(size_t m, size_t k, size_t n) {
+    if (!(m == 4 || m == 8 || m == 12) ||
+        !rocknpu_env_enabled("ROCKNPU_NATIVE_MTILE") ||
+        !rocknpu_env_enabled("ROCKNPU_MTILE_PERSIST") ||
+        !rocknpu_w8_mtile_shape_enabled(k, n)) {
+        return false;
+    }
+    if (k == 5632 && n == 2048) {
+        return rocknpu_env_enabled("ROCKNPU_NATIVE_MTILE_DOWN") &&
+               rocknpu_env_enabled("ROCKNPU_MTILE_MC");
+    }
+    return k > 0 && k <= 4096 && k % 512 == 0 && n > 0 && n <= 8192 && n % 32 == 0;
 }
 
 bool rocknpu_vk_pair_enabled() {
@@ -336,6 +372,29 @@ bool rocknpu_mul_mat_supported(const ggml_tensor * op) {
     const int64_t n = weights->ne[1];
     const int64_t m = activations->ne[1];
     const bool quantized = weights->type == GGML_TYPE_Q4_K || weights->type == GGML_TYPE_Q6_K;
+    // The native W8 M-tile path is validated only up to N=8192. In particular,
+    // TinyLlama's N=32000 vocabulary head is dramatically slower through the
+    // generic FP16 bridge, so leave it on the optimized CPU backend.
+    if (quantized && m > 1 && n > 8192) {
+        return false;
+    }
+    // Large quantized prompt batches are dramatically slower through the
+    // uncached FP16 bridge.  The persistent NPU prefill path is an explicit
+    // opt-in; otherwise leave M>128 prompt work on the optimized CPU backend.
+    if (quantized && m > 128 && !rocknpu_env_enabled("ROCKNPU_PREFILL_CACHE")) {
+        return false;
+    }
+    if (quantized && m > 1 && rocknpu_env_enabled("ROCKNPU_SCHED_FFN_ONLY")) {
+        const bool gate_up = k == 2048 && n == 5632;
+        const bool down = k == 5632 && n == 2048;
+        const char * part = std::getenv("ROCKNPU_SCHED_FFN_PART");
+        const bool ffn = part != nullptr && std::strcmp(part, "gateup") == 0 ? gate_up
+            : part != nullptr && std::strcmp(part, "down") == 0 ? down
+            : gate_up || down;
+        if (!ffn) {
+            return false;
+        }
+    }
     if (rocknpu_env_enabled("ROCKNPU_SCHED_CPU_QO") && quantized && m == 16 && k == 2048 && n == 2048) {
         return false;
     }
@@ -349,6 +408,12 @@ bool rocknpu_mul_mat_supported(const ggml_tensor * op) {
             return false;
         }
         return quantized && k > 0 && n > 0 && k % 512 == 0 && n % 32 == 0 && n <= 8192;
+    }
+    if (quantized && (m == 4 || m == 8 || m == 12)) {
+        // Small-M decode is only useful through the validated persistent W8 path.
+        // Never assign these graphs to RockNPU merely to fall back to the FP16 bridge.
+        return rocknpu_small_native_mtile_supported(
+            static_cast<size_t>(m), static_cast<size_t>(k), static_cast<size_t>(n));
     }
     const int64_t k_alignment = quantized ? 256 : 32;
     return m > 0 && k > 0 && n > 0 && m % 4 == 0 && k % k_alignment == 0 && n % 16 == 0;
@@ -417,6 +482,14 @@ void rocknpu_backend_free(ggml_backend_t backend) {
             quarter_ns[quarter] += ns;
             quarter_slow20[quarter] += size_t(ns >= 20'000'000);
             if (i < 111) first_batch_ns += ns; else warm_ns += ns;
+        }
+        for (const auto & entry : context->shape_profile) {
+            const auto & profile = entry.second;
+            std::fprintf(stderr,
+                "ROCKNPU SHAPE PROFILE %s calls=%zu total_ms=%.3f avg_ms=%.3f\n",
+                entry.first.c_str(), profile.calls,
+                static_cast<double>(profile.ns) / 1.0e6,
+                profile.calls == 0 ? 0.0 : static_cast<double>(profile.ns) / 1.0e6 / static_cast<double>(profile.calls));
         }
         std::fprintf(stderr,
             "ROCKNPU SPLIT PROFILE graph_calls=%zu graph_nodes=%zu graph_ms=%.3f avg_call_ms=%.3f avg_nodes=%.2f cpu_fallback=%zu q4=%zu q6=%zu f16=%zu native_w8=%zu m=[4:%zu,8:%zu,12:%zu,16:%zu,other:%zu] slow5=%zu slow20=%zu last_slow5=%zu max_ms=%.3f first111_ms=%.3f rest_ms=%.3f q_ms=[%.3f,%.3f,%.3f,%.3f] q_slow20=[%zu,%zu,%zu,%zu]\n",
@@ -490,8 +563,14 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                     prewarm_weights.push_back(weights);
                 }
             }
-            const bool native_batch = native_mtile && quantized && activations != nullptr &&
-                activations->ne[1] >= 32 && activations->ne[1] <= 128 && activations->ne[1] % 16 == 0;
+            const bool native_small_batch = quantized && activations != nullptr &&
+                rocknpu_small_native_mtile_supported(
+                    static_cast<size_t>(activations->ne[1]),
+                    static_cast<size_t>(weights->ne[0]),
+                    static_cast<size_t>(weights->ne[1]));
+            const bool native_batch = native_small_batch ||
+                (native_mtile && quantized && activations != nullptr &&
+                 activations->ne[1] >= 32 && activations->ne[1] <= 128 && activations->ne[1] % 16 == 0);
             const bool supported_batch = activations != nullptr &&
                 (activations->ne[1] == 16 || native_batch ||
                  (split_m32 && activations->ne[1] == 32) ||
@@ -639,48 +718,80 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                         const ggml_tensor * second_activations = second->src[1];
                         uint32_t first_kind = 0;
                         uint32_t second_kind = 0;
+                        const size_t pair_m = static_cast<size_t>(first_activations->ne[1]);
+                        const bool native_mtile_pair =
+                            (pair_m == 4 || pair_m == 8 || pair_m == 12 || pair_m == 16) &&
+                            rocknpu_env_enabled("ROCKNPU_NATIVE_MTILE") &&
+                            rocknpu_env_enabled("ROCKNPU_W8_MTILE") &&
+                            rocknpu_env_enabled("ROCKNPU_MTILE_PERSIST") &&
+                            rocknpu_env_enabled("ROCKNPU_MTILE_MC");
                         const bool ffn_pair =
                             rocknpu_weight_name_contains(first_weights, ".ffn_gate.weight") &&
                             rocknpu_weight_name_contains(second_weights, ".ffn_up.weight") &&
                             first_activations == second_activations &&
-                            first_activations->ne[1] == 1 &&
+                            (pair_m == 1 || native_mtile_pair) &&
                             first_weights->ne[0] == second_weights->ne[0] &&
                             first_weights->ne[1] == 5632 && second_weights->ne[1] == 5632 &&
                             rocknpu_quant_kind(first_weights, &first_kind) &&
                             rocknpu_quant_kind(second_weights, &second_kind);
                         if (ffn_pair) {
                             const size_t k_pair = static_cast<size_t>(first_weights->ne[0]);
-                            rocknpu_w8_tensor * first_w8 = rocknpu_w8_sidecar_get(
-                                context, first_weights->name, k_pair, 5632,
-                                static_cast<const uint8_t *>(first_weights->data), ggml_nbytes(first_weights));
-                            rocknpu_w8_tensor * second_w8 = rocknpu_w8_sidecar_get(
-                                context, second_weights->name, k_pair, 5632,
-                                static_cast<const uint8_t *>(second_weights->data), ggml_nbytes(second_weights));
-                            const bool native_w8 = first_w8 != nullptr && second_w8 != nullptr;
-                            const int status = native_w8 ? rocknpu_matmul_w8a8_pair_f32_f32_m1(
-                                context->runtime,
-                                first_w8->weights.data(), first_w8->scales.data(), 5632,
-                                second_w8->weights.data(), second_w8->scales.data(), 5632,
-                                static_cast<const float *>(first_activations->data),
-                                static_cast<float *>(node->data), static_cast<float *>(second->data), k_pair)
-                                : rocknpu_matmul_q_pair_f32_f32_m1(
-                                context->runtime,
-                                static_cast<const uint8_t *>(first_weights->data), ggml_nbytes(first_weights), first_kind, 5632,
-                                static_cast<const uint8_t *>(second_weights->data), ggml_nbytes(second_weights), second_kind, 5632,
-                                static_cast<const float *>(first_activations->data),
-                                static_cast<float *>(node->data), static_cast<float *>(second->data), k_pair);
+                            bool native_w8 = false;
+                            int status = ROCKNPU_STATUS_INVALID_ARGUMENT;
+                            if (pair_m == 1) {
+                                rocknpu_w8_tensor * first_w8 = rocknpu_w8_sidecar_get(
+                                    context, first_weights->name, k_pair, 5632,
+                                    static_cast<const uint8_t *>(first_weights->data), ggml_nbytes(first_weights));
+                                rocknpu_w8_tensor * second_w8 = rocknpu_w8_sidecar_get(
+                                    context, second_weights->name, k_pair, 5632,
+                                    static_cast<const uint8_t *>(second_weights->data), ggml_nbytes(second_weights));
+                                native_w8 = first_w8 != nullptr && second_w8 != nullptr;
+                                status = native_w8 ? rocknpu_matmul_w8a8_pair_f32_f32_m1(
+                                    context->runtime,
+                                    first_w8->weights.data(), first_w8->scales.data(), 5632,
+                                    second_w8->weights.data(), second_w8->scales.data(), 5632,
+                                    static_cast<const float *>(first_activations->data),
+                                    static_cast<float *>(node->data), static_cast<float *>(second->data), k_pair)
+                                    : rocknpu_matmul_q_pair_f32_f32_m1(
+                                    context->runtime,
+                                    static_cast<const uint8_t *>(first_weights->data), ggml_nbytes(first_weights), first_kind, 5632,
+                                    static_cast<const uint8_t *>(second_weights->data), ggml_nbytes(second_weights), second_kind, 5632,
+                                    static_cast<const float *>(first_activations->data),
+                                    static_cast<float *>(node->data), static_cast<float *>(second->data), k_pair);
+                            } else {
+                                status = rocknpu_matmul_q_pair_f32_f32_mtile(
+                                    context->runtime,
+                                    static_cast<const uint8_t *>(first_weights->data), ggml_nbytes(first_weights), first_kind, 5632,
+                                    static_cast<const uint8_t *>(second_weights->data), ggml_nbytes(second_weights), second_kind, 5632,
+                                    static_cast<const float *>(first_activations->data),
+                                    static_cast<float *>(node->data), static_cast<float *>(second->data),
+                                    pair_m, k_pair);
+                            }
                             if (status != ROCKNPU_STATUS_OK) {
                                 return GGML_STATUS_FAILED;
                             }
                             context->ffn_pair_calls++;
-                            context->w8a8_m1_mul_mat_calls += 2;
-                            if (native_w8) context->native_w8_calls += 2;
+                            if (pair_m == 1) {
+                                context->w8a8_m1_mul_mat_calls += 2;
+                                if (native_w8) context->native_w8_calls += 2;
+                            } else if (pair_m == 4) {
+                                context->m4_calls += 2;
+                            } else if (pair_m == 8) {
+                                context->m8_calls += 2;
+                            } else if (pair_m == 12) {
+                                context->m12_calls += 2;
+                            } else if (pair_m == 16) {
+                                context->m16_calls += 2;
+                            } else {
+                                context->m_other_calls += 2;
+                            }
                             if (first_weights->type == GGML_TYPE_Q4_K) context->q4_k_mul_mat_calls++; else context->q6_k_mul_mat_calls++;
                             if (second_weights->type == GGML_TYPE_Q4_K) context->q4_k_mul_mat_calls++; else context->q6_k_mul_mat_calls++;
                             if (rocknpu_trace_enabled()) {
                                 std::fprintf(stderr,
-                                    "ROCKNPU GGML TRACE ffn_pair first=%s second=%s K=%zu N=5632+5632 kinds=%u/%u\n",
-                                    first_weights->name, second_weights->name, k_pair, first_kind, second_kind);
+                                    "ROCKNPU GGML TRACE ffn_pair first=%s second=%s M=%zu K=%zu N=5632+5632 kinds=%u/%u path=%s\n",
+                                    first_weights->name, second_weights->name, pair_m, k_pair, first_kind, second_kind,
+                                    pair_m == 1 ? "m1_pair" : "mtile_pair");
                             }
                             i += 1;
                             break;
@@ -814,12 +925,15 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                         m,
                         k,
                         n,
-                        m == 1 ? (w4a4_m1 ? "w4a4_m1" : "w8a8_m1") : "fp16_bridge");
+                        m == 1 ? (w4a4_m1 ? "w4a4_m1" : "w8a8_m1") :
+                        (rocknpu_small_native_mtile_supported(m, k, n) ? "native_mtile" : "fp16_bridge"));
                 }
+                const auto node_started = std::chrono::steady_clock::now();
                 int status;
-                const bool native_mtile = m >= 32 && m <= 128 && m % 16 == 0 &&
-                    rocknpu_env_enabled("ROCKNPU_NATIVE_MTILE") &&
-                    (weights->type == GGML_TYPE_Q4_K || weights->type == GGML_TYPE_Q6_K);
+                const bool quantized_mtile = weights->type == GGML_TYPE_Q4_K || weights->type == GGML_TYPE_Q6_K;
+                const bool native_mtile = quantized_mtile &&
+                    (rocknpu_small_native_mtile_supported(m, k, n) ||
+                     (m >= 32 && m <= 128 && m % 16 == 0 && rocknpu_env_enabled("ROCKNPU_NATIVE_MTILE")));
                 const bool split_m32 = !native_mtile && m == 32 && rocknpu_env_enabled("ROCKNPU_M32_AS_2X16");
                 const bool split_chunked = !native_mtile && m >= 32 && m <= 128 && m % 16 == 0 &&
                     rocknpu_env_enabled("ROCKNPU_M16_CHUNK_BATCH");
@@ -867,7 +981,11 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                             output + chunk * output_stride);
                     }
                 } else {
-                    rocknpu_w8_tensor * native_w8 = (m == 1 || m == 16) ? rocknpu_w8_sidecar_get(
+                    // M=16 must use the q4/q6 C API below so ROCKNPU_MTILE_MC can
+                    // select the persistent multi-core M-tile pool.  The legacy
+                    // sidecar M16 entry point is single-executor and is slower at
+                    // server concurrency despite avoiding first-use conversion.
+                    rocknpu_w8_tensor * native_w8 = m == 1 ? rocknpu_w8_sidecar_get(
                         context, weights->name, k, n,
                         static_cast<const uint8_t *>(weights->data), ggml_nbytes(weights)) : nullptr;
                     if (native_w8 != nullptr) {
@@ -909,6 +1027,15 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                             k,
                             n);
                     }
+                }
+                if (rocknpu_env_enabled("ROCKNPU_SPLIT_PROFILE") && context->graph_compute_calls >= 111) {
+                    const uint64_t node_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - node_started).count());
+                    char key[96];
+                    std::snprintf(key, sizeof(key), "M=%zu K=%zu N=%zu", m, k, n);
+                    auto & profile = context->shape_profile[std::string(key)];
+                    profile.calls++;
+                    profile.ns += node_ns;
                 }
                 if (status != ROCKNPU_STATUS_OK) {
                     return GGML_STATUS_FAILED;
@@ -997,6 +1124,20 @@ ggml_backend_buffer_type_t rocknpu_device_buffer_type(ggml_backend_dev_t) {
 }
 
 bool rocknpu_device_supports_op(ggml_backend_dev_t, const ggml_tensor * op) {
+    if (rocknpu_env_enabled("ROCKNPU_SUPPORT_TRACE") && op != nullptr && op->op == GGML_OP_FLASH_ATTN_EXT) {
+        const ggml_tensor * q = op->src[0];
+        const ggml_tensor * k = op->src[1];
+        const ggml_tensor * v = op->src[2];
+        const ggml_tensor * mask = op->src[3];
+        std::fprintf(stderr,
+            "ROCKNPU SUPPORT FLASH name=%s q=%s[%lld,%lld,%lld,%lld] k=%s[%lld,%lld,%lld,%lld] v=%s[%lld,%lld,%lld,%lld] mask=%s[%lld,%lld,%lld,%lld] dst=%s[%lld,%lld,%lld,%lld]\n",
+            op->name,
+            q ? ggml_type_name(q->type) : "null", q ? (long long) q->ne[0] : 0, q ? (long long) q->ne[1] : 0, q ? (long long) q->ne[2] : 0, q ? (long long) q->ne[3] : 0,
+            k ? ggml_type_name(k->type) : "null", k ? (long long) k->ne[0] : 0, k ? (long long) k->ne[1] : 0, k ? (long long) k->ne[2] : 0, k ? (long long) k->ne[3] : 0,
+            v ? ggml_type_name(v->type) : "null", v ? (long long) v->ne[0] : 0, v ? (long long) v->ne[1] : 0, v ? (long long) v->ne[2] : 0, v ? (long long) v->ne[3] : 0,
+            mask ? ggml_type_name(mask->type) : "null", mask ? (long long) mask->ne[0] : 0, mask ? (long long) mask->ne[1] : 0, mask ? (long long) mask->ne[2] : 0, mask ? (long long) mask->ne[3] : 0,
+            ggml_type_name(op->type), (long long) op->ne[0], (long long) op->ne[1], (long long) op->ne[2], (long long) op->ne[3]);
+    }
     switch (op->op) {
         case GGML_OP_MUL_MAT:
             return rocknpu_mul_mat_supported(op);

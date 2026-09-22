@@ -73,6 +73,13 @@ struct CachedW8MtilePoolWeight {
     scales: Vec<f32>,
 }
 
+struct CachedW8MtilePairPoolWeight {
+    first: Int8DecodePoolPreparedWeights,
+    second: Int8DecodePoolPreparedWeights,
+    first_scales: Vec<f32>,
+    second_scales: Vec<f32>,
+}
+
 struct CachedGroupedW8MtileWeight {
     prepared: Vec<Int8PreparedWeights>,
     scales: Vec<f32>,
@@ -197,6 +204,7 @@ pub struct RockNpuContext {
     decode_weights: HashMap<DecodeWeightKey, CachedW8A8Weight>,
     decode_mtile_weights: HashMap<DecodeWeightKey, CachedW8MtileWeight>,
     decode_mtile_pool_weights: HashMap<DecodeWeightKey, CachedW8MtilePoolWeight>,
+    decode_mtile_pair_pool_weights: HashMap<DecodePairKey, CachedW8MtilePairPoolWeight>,
     decode_grouped_mtile_weights: HashMap<(DecodeWeightKey, usize), CachedGroupedW8MtileWeight>,
     decode_grouped_mtile_pool_weights:
         HashMap<(DecodeWeightKey, usize), CachedGroupedW8MtilePoolWeight>,
@@ -280,7 +288,7 @@ fn mtile_shape_enabled(k: usize, n: usize) -> bool {
         None | Some("") | Some("all") => true,
         Some("kv") => k == 2048 && n == 256,
         Some("qo") => k == 2048 && n == 2048,
-        Some("ffn") => k == 2048 && n == 5632,
+        Some("ffn") => (k == 2048 && n == 5632) || (k == 5632 && n == 2048),
         Some("attn") => k == 2048 && (n == 256 || n == 2048),
         Some("safe") => k == 2048 && (n == 256 || n == 5632),
         Some("none") => false,
@@ -1602,7 +1610,7 @@ fn execute_cached_w8a8_mtile_pool<F>(
 where
     F: FnOnce() -> Option<(Vec<i8>, Vec<f32>)>,
 {
-    if !matches!(m, 16 | 32 | 48 | 64 | 128) {
+    if !matches!(m, 4 | 8 | 12 | 16 | 32 | 48 | 64 | 128) {
         return STATUS_INVALID_ARGUMENT;
     }
     let Some(expected_a) = m.checked_mul(key.k) else {
@@ -1678,7 +1686,12 @@ where
                 split,
             ) {
                 Ok(prepared) => prepared,
-                Err(_) => return STATUS_EXECUTION_ERROR,
+                Err(err) => {
+                    if env_enabled("ROCKNPU_MTILE_TRACE") {
+                        eprintln!("ROCKNPU MTILE ERROR prepare M={m} K={} N={} split={split:?}: {err}", key.k, key.n);
+                    }
+                    return STATUS_EXECUTION_ERROR;
+                }
             };
             weight_pack_ns = started.elapsed().as_nanos();
             entry.insert(CachedW8MtilePoolWeight { prepared, scales })
@@ -1701,7 +1714,12 @@ where
         &cached.prepared,
     ) {
         Ok(result) => result,
-        Err(_) => return STATUS_EXECUTION_ERROR,
+        Err(err) => {
+            if env_enabled("ROCKNPU_MTILE_TRACE") {
+                eprintln!("ROCKNPU MTILE ERROR execute M={m} K={} N={} split={split:?}: {err}", key.k, key.n);
+            }
+            return STATUS_EXECUTION_ERROR;
+        }
     };
 
     if let Some(profile) = mtile_profile.as_mut() {
@@ -1726,6 +1744,173 @@ where
             &cached.scales,
             activation_scales[row],
             &mut output_mn_f32[start..end],
+        );
+    }
+    if let (Some(profile), Some(started)) = (mtile_profile.as_mut(), rescale_started) {
+        profile.rescale_ns += started.elapsed().as_nanos();
+    }
+    STATUS_OK
+}
+
+fn execute_cached_w8a8_mtile_pair_pool<F>(
+    context: &mut RockNpuContext,
+    key: DecodePairKey,
+    m: usize,
+    activations_mk_f32: &[f32],
+    first_output_mn_f32: &mut [f32],
+    second_output_mn_f32: &mut [f32],
+    prepare: F,
+) -> i32
+where
+    F: FnOnce() -> Option<((Vec<i8>, Vec<f32>), (Vec<i8>, Vec<f32>))>,
+{
+    if !matches!(m, 4 | 8 | 12 | 16 | 32 | 48 | 64 | 128)
+        || key.first.k != key.second.k
+        || key.first.n != key.second.n
+        || key.first.k == 0
+        || key.first.k > 4096
+        || !key.first.k.is_multiple_of(512)
+        || key.first.n < 2048
+        || key.first.n > 8192
+        || !key.first.n.is_multiple_of(32)
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let k = key.first.k;
+    let n = key.first.n;
+    let Some(expected_a) = m.checked_mul(k) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let Some(expected_out) = m.checked_mul(n) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    if activations_mk_f32.len() != expected_a
+        || first_output_mn_f32.len() != expected_out
+        || second_output_mn_f32.len() != expected_out
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    let quant_started = context.mtile_profile.as_ref().map(|_| Instant::now());
+    let mut activations_i8 = vec![0i8; expected_a];
+    let mut activation_scales = vec![0.0f32; m];
+    for ((row, out), scale) in activations_mk_f32
+        .chunks_exact(k)
+        .zip(activations_i8.chunks_exact_mut(k))
+        .zip(activation_scales.iter_mut())
+    {
+        let Some(row_scale) = quantize_symmetric_into(row, out) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        *scale = row_scale;
+    }
+    if let (Some(profile), Some(started)) = (context.mtile_profile.as_mut(), quant_started) {
+        profile.quant_ns += started.elapsed().as_nanos();
+    }
+    let activation: Arc<[i8]> = Arc::from(activations_i8);
+
+    let RockNpuContext {
+        decode_pool,
+        decode_mtile_pair_pool_weights,
+        mtile_profile,
+        ..
+    } = context;
+
+    let mut cache_miss = false;
+    let mut weight_prepare_ns = 0u128;
+    let mut weight_pack_ns = 0u128;
+    let cached = match decode_mtile_pair_pool_weights.entry(key) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => {
+            cache_miss = true;
+            let started = Instant::now();
+            let Some(((first_weights, first_scales), (second_weights, second_scales))) = prepare() else {
+                return STATUS_INVALID_ARGUMENT;
+            };
+            if first_weights.len() != n.saturating_mul(k)
+                || second_weights.len() != n.saturating_mul(k)
+                || first_scales.len() != n
+                || second_scales.len() != n
+            {
+                return STATUS_INVALID_ARGUMENT;
+            }
+            weight_prepare_ns = started.elapsed().as_nanos();
+            let started = Instant::now();
+            let first = match decode_pool.prepare_weights_with_split(
+                Arc::<[i8]>::from(first_weights),
+                k,
+                n,
+                3,
+                Int8DecodeSplit::N,
+            ) {
+                Ok(prepared) => prepared,
+                Err(_) => return STATUS_EXECUTION_ERROR,
+            };
+            let second = match decode_pool.prepare_weights_with_split(
+                Arc::<[i8]>::from(second_weights),
+                k,
+                n,
+                3,
+                Int8DecodeSplit::N,
+            ) {
+                Ok(prepared) => prepared,
+                Err(_) => return STATUS_EXECUTION_ERROR,
+            };
+            weight_pack_ns = started.elapsed().as_nanos();
+            entry.insert(CachedW8MtilePairPoolWeight {
+                first,
+                second,
+                first_scales,
+                second_scales,
+            })
+        }
+    };
+
+    if let Some(profile) = mtile_profile.as_mut() {
+        if cache_miss {
+            profile.cache_misses += 2;
+            profile.weight_prepare_ns += weight_prepare_ns;
+            profile.weight_pack_ns += weight_pack_ns;
+        } else {
+            profile.cache_hits += 2;
+        }
+    }
+
+    let activations = [Arc::clone(&activation), activation];
+    let weights = [&cached.first, &cached.second];
+    let result = match decode_pool.execute_prepared_mtile_batch(m, &activations, &weights) {
+        Ok(result) => result,
+        Err(_) => return STATUS_EXECUTION_ERROR,
+    };
+
+    if let Some(profile) = mtile_profile.as_mut() {
+        profile.calls += 2;
+        profile.execute_total_ns += result.stats.wall_ns;
+        for stats in &result.stats.worker_stats {
+            profile.alloc_ns += stats.alloc_ns;
+            profile.input_stage_ns += stats.input_stage_ns;
+            profile.regcmd_stage_ns += stats.regcmd_stage_ns;
+            profile.submit_ns += stats.submit_ns;
+            profile.wait_ns += stats.wait_ns;
+            profile.host_accum_ns += stats.host_accum_ns;
+        }
+    }
+
+    let rescale_started = mtile_profile.as_ref().map(|_| Instant::now());
+    for row in 0..m {
+        let start = row * n;
+        let end = start + n;
+        rescale_i32_row(
+            &result.values[0][start..end],
+            &cached.first_scales,
+            activation_scales[row],
+            &mut first_output_mn_f32[start..end],
+        );
+        rescale_i32_row(
+            &result.values[1][start..end],
+            &cached.second_scales,
+            activation_scales[row],
+            &mut second_output_mn_f32[start..end],
         );
     }
     if let (Some(profile), Some(started)) = (mtile_profile.as_mut(), rescale_started) {
@@ -1766,7 +1951,7 @@ fn execute_cached_w8a8_mtile<F>(
 where
     F: FnOnce() -> Option<(Vec<i8>, Vec<f32>)>,
 {
-    if !matches!(m, 16 | 32 | 48 | 64 | 128) {
+    if !matches!(m, 4 | 8 | 12 | 16 | 32 | 48 | 64 | 128) {
         return STATUS_INVALID_ARGUMENT;
     }
     let Some(expected_a) = m.checked_mul(key.k) else {
@@ -2688,6 +2873,7 @@ pub extern "C" fn rocknpu_context_create() -> *mut RockNpuContext {
             decode_weights: HashMap::new(),
             decode_mtile_weights: HashMap::new(),
             decode_mtile_pool_weights: HashMap::new(),
+            decode_mtile_pair_pool_weights: HashMap::new(),
             decode_grouped_mtile_weights: HashMap::new(),
             decode_grouped_mtile_pool_weights: HashMap::new(),
             decode_mtile_scratch: HashMap::new(),
@@ -3488,6 +3674,102 @@ pub unsafe extern "C" fn rocknpu_matmul_q_pair_f32_f32_m1(
     )
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rocknpu_matmul_q_pair_f32_f32_mtile(
+    context: *mut RockNpuContext,
+    first_weights: *const u8,
+    first_bytes: usize,
+    first_kind: u32,
+    first_n: usize,
+    second_weights: *const u8,
+    second_bytes: usize,
+    second_kind: u32,
+    second_n: usize,
+    activations_mk_f32: *const f32,
+    first_output_mn_f32: *mut f32,
+    second_output_mn_f32: *mut f32,
+    m: usize,
+    k: usize,
+) -> i32 {
+    if context.is_null()
+        || first_weights.is_null()
+        || second_weights.is_null()
+        || activations_mk_f32.is_null()
+        || first_output_mn_f32.is_null()
+        || second_output_mn_f32.is_null()
+        || m == 0
+        || k == 0
+        || first_n == 0
+        || second_n == 0
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let first_kind = match first_kind {
+        4 => DecodeWeightKind::Q4K,
+        6 => DecodeWeightKind::Q6K,
+        _ => return STATUS_INVALID_ARGUMENT,
+    };
+    let second_kind = match second_kind {
+        4 => DecodeWeightKind::Q4K,
+        6 => DecodeWeightKind::Q6K,
+        _ => return STATUS_INVALID_ARGUMENT,
+    };
+    let Some(a_len) = m.checked_mul(k) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let Some(first_out_len) = m.checked_mul(first_n) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let Some(second_out_len) = m.checked_mul(second_n) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let (first, second, activations, first_output, second_output, context) = unsafe {
+        (
+            slice::from_raw_parts(first_weights, first_bytes),
+            slice::from_raw_parts(second_weights, second_bytes),
+            slice::from_raw_parts(activations_mk_f32, a_len),
+            slice::from_raw_parts_mut(first_output_mn_f32, first_out_len),
+            slice::from_raw_parts_mut(second_output_mn_f32, second_out_len),
+            &mut *context,
+        )
+    };
+    let key = DecodePairKey {
+        first: DecodeWeightKey {
+            address: first.as_ptr() as usize,
+            bytes: first.len(),
+            k,
+            n: first_n,
+            kind: first_kind,
+        },
+        second: DecodeWeightKey {
+            address: second.as_ptr() as usize,
+            bytes: second.len(),
+            k,
+            n: second_n,
+            kind: second_kind,
+        },
+    };
+    execute_cached_w8a8_mtile_pair_pool(
+        context,
+        key,
+        m,
+        activations,
+        first_output,
+        second_output,
+        || {
+            let first_prepared = match first_kind {
+                DecodeWeightKind::Q4K => prepare_q4_k_w8a8(first, k, first_n)?,
+                DecodeWeightKind::Q6K => prepare_q6_k_w8a8(first, k, first_n)?,
+            };
+            let second_prepared = match second_kind {
+                DecodeWeightKind::Q4K => prepare_q4_k_w8a8(second, k, second_n)?,
+                DecodeWeightKind::Q6K => prepare_q6_k_w8a8(second, k, second_n)?,
+            };
+            Some((first_prepared, second_prepared))
+        },
+    )
+}
+
 /// Execute three M=1 quantized projections that share one activation by
 /// concatenating their W8 rows along N and issuing one prepared NPU matmul.
 /// Kinds are 4 for Q4_K and 6 for Q6_K. Outputs preserve the same per-row
@@ -3707,7 +3989,7 @@ pub unsafe extern "C" fn rocknpu_matmul_q4_k_f32_f32(
         });
     }
 
-    if matches!(m, 32 | 48 | 64 | 128)
+    if matches!(m, 4 | 8 | 12 | 16 | 32 | 48 | 64 | 128)
         && k == 5632
         && n == 2048
         && env_enabled("ROCKNPU_NATIVE_MTILE")
@@ -3734,7 +4016,7 @@ pub unsafe extern "C" fn rocknpu_matmul_q4_k_f32_f32(
         );
     }
 
-    if matches!(m, 32 | 48 | 64 | 128)
+    if matches!(m, 4 | 8 | 12 | 32 | 48 | 64 | 128)
         && env_enabled("ROCKNPU_NATIVE_MTILE")
         && env_enabled("ROCKNPU_MTILE_PERSIST")
         && k <= 4096
@@ -3935,7 +4217,7 @@ pub unsafe extern "C" fn rocknpu_matmul_q6_k_f32_f32(
         });
     }
 
-    if matches!(m, 32 | 48 | 64 | 128)
+    if matches!(m, 4 | 8 | 12 | 16 | 32 | 48 | 64 | 128)
         && k == 5632
         && n == 2048
         && env_enabled("ROCKNPU_NATIVE_MTILE")
@@ -3962,7 +4244,7 @@ pub unsafe extern "C" fn rocknpu_matmul_q6_k_f32_f32(
         );
     }
 
-    if matches!(m, 32 | 48 | 64 | 128)
+    if matches!(m, 4 | 8 | 12 | 32 | 48 | 64 | 128)
         && env_enabled("ROCKNPU_NATIVE_MTILE")
         && env_enabled("ROCKNPU_MTILE_PERSIST")
         && k <= 4096

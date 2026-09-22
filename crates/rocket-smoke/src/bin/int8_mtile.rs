@@ -15,8 +15,8 @@ fn read_i32(bytes: &[u8], index: usize) -> i32 {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let m = args.next().map_or(Ok(16usize), |s| s.parse::<usize>())?;
-    if !matches!(m, 16 | 32 | 48 | 64 | 128) || args.next().is_some() {
-        return Err("usage: int8_mtile [16|32|48|64|128]".into());
+    if !matches!(m, 4 | 8 | 12 | 16 | 32 | 48 | 64 | 128) || args.next().is_some() {
+        return Err("usage: int8_mtile [4|8|12|16|32|48|64|128]".into());
     }
 
     let device = RocketDevice::open()?;
