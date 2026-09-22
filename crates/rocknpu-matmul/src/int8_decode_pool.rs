@@ -557,7 +557,20 @@ impl Int8DecodePool {
         workers: usize,
         split: Int8DecodeSplit,
     ) -> Result<Int8DecodePoolPreparedWeights, Int8DecodePoolError> {
-        self.prepare_weights_with_split_mode(weights, k, n, workers, split, false)
+        self.prepare_weights_with_split_mode(weights, k, n, workers, split, false, true)
+    }
+
+    /// Prepare resident weights for the threaded M-tile executor even when
+    /// M=1 direct submission is enabled on this pool.
+    pub fn prepare_weights_mtile_with_split(
+        &mut self,
+        weights: Arc<[i8]>,
+        k: usize,
+        n: usize,
+        workers: usize,
+        split: Int8DecodeSplit,
+    ) -> Result<Int8DecodePoolPreparedWeights, Int8DecodePoolError> {
+        self.prepare_weights_with_split_mode(weights, k, n, workers, split, false, false)
     }
 
     pub fn prepare_weights_m1_with_split(
@@ -568,7 +581,7 @@ impl Int8DecodePool {
         workers: usize,
         split: Int8DecodeSplit,
     ) -> Result<Int8DecodePoolPreparedWeights, Int8DecodePoolError> {
-        self.prepare_weights_with_split_mode(weights, k, n, workers, split, true)
+        self.prepare_weights_with_split_mode(weights, k, n, workers, split, true, true)
     }
 
     fn prepare_weights_with_split_mode(
@@ -579,6 +592,7 @@ impl Int8DecodePool {
         workers: usize,
         split: Int8DecodeSplit,
         m1_fullk: bool,
+        allow_direct: bool,
     ) -> Result<Int8DecodePoolPreparedWeights, Int8DecodePoolError> {
         if weights.len() != n.saturating_mul(k) {
             return Err(Int8DecodePoolError::InvalidInput(
@@ -588,7 +602,7 @@ impl Int8DecodePool {
         self.validate_requested_workers(workers)?;
         let slices = worker_slices(k, n, workers, split)?;
 
-        if let Some(direct_workers) = self.direct_workers.as_ref() {
+        if let Some(direct_workers) = self.direct_workers.as_ref().filter(|_| allow_direct) {
             let start = Instant::now();
             let mut direct_prepared = Vec::with_capacity(slices.len());
             let mut stats = Int8DecodePoolPreparedStats {

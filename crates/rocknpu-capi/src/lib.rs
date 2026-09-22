@@ -1678,7 +1678,7 @@ where
             }
             weight_prepare_ns = started.elapsed().as_nanos();
             let started = Instant::now();
-            let prepared = match decode_pool.prepare_weights_with_split(
+            let prepared = match decode_pool.prepare_weights_mtile_with_split(
                 Arc::<[i8]>::from(weights_i8),
                 key.k,
                 key.n,
@@ -1836,7 +1836,7 @@ where
             }
             weight_prepare_ns = started.elapsed().as_nanos();
             let started = Instant::now();
-            let first = match decode_pool.prepare_weights_with_split(
+            let first = match decode_pool.prepare_weights_mtile_with_split(
                 Arc::<[i8]>::from(first_weights),
                 k,
                 n,
@@ -1846,7 +1846,7 @@ where
                 Ok(prepared) => prepared,
                 Err(_) => return STATUS_EXECUTION_ERROR,
             };
-            let second = match decode_pool.prepare_weights_with_split(
+            let second = match decode_pool.prepare_weights_mtile_with_split(
                 Arc::<[i8]>::from(second_weights),
                 k,
                 n,
@@ -2174,11 +2174,12 @@ where
                 let Some(group_weights) = weights_i8.get(start..end) else {
                     return STATUS_INVALID_ARGUMENT;
                 };
-                let group_prepared = match decode_pool.prepare_weights(
+                let group_prepared = match decode_pool.prepare_weights_mtile_with_split(
                     Arc::<[i8]>::from(group_weights),
                     group_size,
                     key.n,
                     3,
+                    Int8DecodeSplit::N,
                 ) {
                     Ok(prepared) => prepared,
                     Err(_) => return STATUS_EXECUTION_ERROR,
@@ -3127,7 +3128,7 @@ where
         } else {
             Int8DecodeSplit::N
         };
-        let prepared = match context.decode_pool.prepare_weights_with_split(
+        let prepared = match context.decode_pool.prepare_weights_mtile_with_split(
             Arc::<[i8]>::from(weights_i8),
             key.k,
             key.n,
