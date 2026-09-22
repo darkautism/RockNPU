@@ -2,7 +2,7 @@
 
 Open-source Rust userspace runtime/compiler/backend for Rockchip RK3588 NPUs.
 
-RockNPU fills the userspace gap between standard model/framework frontends and the RK3588 NPU. It owns graph lowering, tensor layouts, quantization, resident weights, register-command generation, userspace scheduling, and framework integration.
+RockNPU fills the userspace gap between standard model/framework frontends and the RK3588 NPU. It owns graph lowering, tensor layouts, quantization, resident weights, register-command generation, userspace scheduling, and framework integration. For llama.cpp-family frontends, the distributable RockNPU backend is a single `libggml-rocknpu.so`; the Rust runtime bridge is linked into that plugin.
 
 ## Quick start
 
@@ -11,7 +11,7 @@ RockNPU fills the userspace gap between standard model/framework frontends and t
 ```sh
 git clone --depth 1 -b b10969 https://github.com/ggml-org/llama.cpp.git llama.cpp
 cmake -S llama.cpp -B llama.cpp/build -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_NATIVE=ON -DLLAMA_CURL=OFF && cmake --build llama.cpp/build --target llama-cli -j
-cmake -S adapters/ggml-rocknpu -B target/ggml-rocknpu -DCMAKE_BUILD_TYPE=Release -DGGML_SOURCE_DIR="$PWD/llama.cpp/ggml" -DGGML_CPU_LIBRARY="$PWD/llama.cpp/build/bin/libggml-cpu.so" && cmake --build target/ggml-rocknpu -j
+cmake -S adapters/ggml-rocknpu -B target/ggml-rocknpu -DCMAKE_BUILD_TYPE=Release -DGGML_SOURCE_DIR="$PWD/llama.cpp/ggml" && cmake --build target/ggml-rocknpu -j
 export GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so"
 ./llama.cpp/build/bin/llama-cli --list-devices && ./llama.cpp/build/bin/llama-cli -dev ROCKNPU0 -m /path/to/model.gguf
 ```

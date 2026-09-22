@@ -965,14 +965,22 @@ ggml_backend_t rocknpu_device_init(ggml_backend_dev_t dev, const char *) {
     auto * context = new rocknpu_backend_context {};
     context->runtime = runtime;
     if (rocknpu_env_enabled("ROCKNPU_RUNTIME_M16_ROUTER")) {
-        context->cpu_fallback = ggml_backend_cpu_init();
+        context->cpu_fallback = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (context->cpu_fallback != nullptr) {
             int threads = 4;
             if (const char * value = std::getenv("ROCKNPU_CPU_FALLBACK_THREADS")) {
                 const int parsed = std::atoi(value);
                 if (parsed > 0) threads = parsed;
             }
-            ggml_backend_cpu_set_n_threads(context->cpu_fallback, threads);
+            ggml_backend_dev_t cpu_dev = ggml_backend_get_device(context->cpu_fallback);
+            ggml_backend_reg_t cpu_reg = cpu_dev != nullptr ? ggml_backend_dev_backend_reg(cpu_dev) : nullptr;
+            if (cpu_reg != nullptr) {
+                auto set_n_threads = reinterpret_cast<ggml_backend_set_n_threads_t>(
+                    ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_set_n_threads"));
+                if (set_n_threads != nullptr) {
+                    set_n_threads(context->cpu_fallback, threads);
+                }
+            }
         }
     }
     return new ggml_backend {
@@ -984,7 +992,8 @@ ggml_backend_t rocknpu_device_init(ggml_backend_dev_t dev, const char *) {
 }
 
 ggml_backend_buffer_type_t rocknpu_device_buffer_type(ggml_backend_dev_t) {
-    return ggml_backend_cpu_buffer_type();
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    return cpu_dev != nullptr ? ggml_backend_dev_buffer_type(cpu_dev) : nullptr;
 }
 
 bool rocknpu_device_supports_op(ggml_backend_dev_t, const ggml_tensor * op) {
