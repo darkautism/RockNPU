@@ -78,3 +78,33 @@ The frontend objective is successful:
 - trace evidence confirms real QKV, attention-output, gate/up, and FFN-down NPU dispatch.
 
 The performance objective is not yet met: at the packaged stock NPU frequency, ordinary decode remains far behind the native ARM CPU.
+
+## Independent recheck
+
+A second pass after rebuilding `libggml-rocknpu.so` from current main and installing the official Ollama 0.34.2 ARM64 package reproduced the frontend behavior.
+
+### llama.cpp
+
+Same GGUF, 32 generated tokens, two repetitions, four A76 threads:
+
+| Path | Throughput |
+| --- | ---: |
+| CPU | **32.6552 tok/s** |
+| RockNPU | **6.9854 tok/s** |
+
+The NPU path is about **21.4%** of CPU throughput in this stock-frequency run.
+
+### Ollama
+
+The same local GGUF was imported into Ollama as `rocknpu-tinyllama`. Each side was warmed once, then measured twice with 32 generated tokens.
+
+| Path | Run 1 | Run 2 | Two-run center |
+| --- | ---: | ---: | ---: |
+| CPU | 36.5985 tok/s | 36.7369 tok/s | **36.6677 tok/s** |
+| RockNPU | 6.8630 tok/s | 6.9581 tok/s | **6.9106 tok/s** |
+
+The NPU center is about **18.8%** of CPU throughput.
+
+The NPU Ollama server log again showed real RockNPU dispatch for Q/V/K triples, attention-output projections, gate/up pairs, and FFN-down projections.
+
+A separate minimal-install smoke removed the W8 sidecar/direct-submit environment and set only the RockNPU GGML backend path plus `LLAMA_ARG_DEVICE=ROCKNPU0`. Ollama still completed four generated tokens (`Paris.\nWhat`) and the trace still showed real RockNPU QKV/FFN dispatch. This validates the short README quick-start path independently of the tuned benchmark configuration.

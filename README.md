@@ -32,6 +32,8 @@ ollama run tinyllama:1.1b-chat-v1-q4_K_M
 
 Current Ollama 0.34.x pins llama.cpp `b10969` (commit `391fac16460f15233a7740550d858ac96df3419d`), the same llama.cpp revision used by the validated RockNPU GGML backend. No Ollama source patch is required. `LLAMA_ARG_DEVICE=ROCKNPU0` is the standard llama.cpp device selector inherited by Ollama's runner. The optional W8 sidecar described later improves repeat startup/decode preparation but is not part of the basic install. Real llama.cpp/Ollama CPU-vs-NPU checks are recorded in [the frontend benchmark](docs/benchmarks/2026-09-22/frontend-cpu-npu.md).
 
+> RK3588 storage note: the current Ollama ARM64 bundle itself is about 2 GB before models. On boards whose root filesystem is eMMC/SD, keep the Ollama runtime and `OLLAMA_MODELS` on NVMe/SSD.
+
 > You may also like oRKLLM/ork-driver, an important open reverse-engineering reference for RK35xx regcmd, quantized matmul, decode layouts, and multi-core execution.
 
 ## Project scope
