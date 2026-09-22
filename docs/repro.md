@@ -99,8 +99,7 @@ Build the RockNPU backend:
     cmake -S "$ROCKNPU_DIR/adapters/ggml-rocknpu" \
       -B "$ROCKNPU_DIR/target/ggml-rocknpu" \
       -DCMAKE_BUILD_TYPE=Release \
-      -DGGML_SOURCE_DIR="$LLAMA_CPP_DIR/ggml" \
-      -DGGML_CPU_LIBRARY="$LLAMA_CPP_DIR/build-rocknpu/bin/libggml-cpu.so"
+      -DGGML_SOURCE_DIR="$LLAMA_CPP_DIR/ggml"
     cmake --build "$ROCKNPU_DIR/target/ggml-rocknpu" -j
 
 Load it:

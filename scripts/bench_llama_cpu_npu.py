@@ -101,7 +101,6 @@ def main():
             "model": model_hash,
             "bench": sha256(args.bench),
             "plugin": sha256(args.plugin),
-            "capi": sha256(args.plugin.parent / "librocknpu_capi.so"),
             "cpu_backend": sha256(args.bench.parent / "libggml-cpu.so"),
         },
         "cpu_native": native,
