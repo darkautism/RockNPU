@@ -76,6 +76,8 @@ The combined paths preserve the existing per-output W8 scaling semantics. Histor
 
 Do not reimplement these as superficial grouping: they already execute as larger combined matmuls.
 
+For M16 Q/O projections, the validated 2-way K grouping (`2048 -> 2x1024`) is now the product default. `ROCKNPU_MTILE_QO_GROUP=0` or `off` remains an explicit diagnostic opt-out. On o8, a fresh fair-hot Ollama c16 check measured 79.30 and 79.65 aggregate tok/s with the default grouping versus a 34.94 tok/s CPU c16 reference. This reproduces the earlier cross-board grouped-M16 result and closes the gap between the promoted research route and the default product route.
+
 ### FP16 fused residual
 
 The prepacked FP16 executor can fuse residual addition into the validated NPU elementwise accumulation path.
@@ -115,6 +117,10 @@ Architecture-specific host preparation improvements that reduce real userspace p
 ## Validated negative results
 
 Do not rerun these without a materially new mechanism.
+
+### Small-M Q/V/K concat
+
+A native M4/M8/M12/M16 Q/V/K concat prototype combined `N=2048+256+256` into one N=2560 M-tile. The primitive was exact and substantially faster than three independent projections: about 1.75x at M4, 1.72x at M8, 1.79x at M12, and 1.65x at M16. However a fair hot whole-model `.so` A/B on Ollama showed no useful improvement: current-main c8 was 76.31 tok/s and the candidate was 76.13 tok/s; c16 likewise did not improve. The prototype was discarded. Do not revive this merely from the attractive primitive result; a future attempt must remove a different whole-model bottleneck.
 
 ### Plain FP16 M=1
 
