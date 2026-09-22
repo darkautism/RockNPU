@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import subprocess
 import time
 
@@ -122,6 +123,7 @@ def main():
         env = base_env.copy()
         if kind == "npu":
             env["GGML_BACKEND_PATH"] = str(args.plugin)
+            env["ROCKNPU_DISPATCH_SUMMARY"] = "1"
             if args.npu_decode == "on":
                 env.update(
                     ROCKNPU_W8_SIDECAR_DIR=str(args.sidecar),
@@ -174,6 +176,18 @@ def main():
             raise RuntimeError("CPU result is contaminated by an accelerator backend")
         if kind == "npu" and ("ROCKNPU" not in row["backends"] or row["devices"] != "ROCKNPU0"):
             raise RuntimeError("NPU backend did not load")
+
+        if kind == "npu":
+            summaries = re.findall(
+                r"ROCKNPU GGML TRACE summary q4_K_mul_mat=(\d+) q6_K_mul_mat=(\d+) f16_mul_mat=(\d+)",
+                prefix.with_suffix(".stderr").read_text(errors="replace"),
+            )
+            dispatches = sum(sum(map(int, counts)) for counts in summaries)
+            record["npu_mul_mat_dispatches"] = dispatches
+            prefix.with_suffix(".meta.json").write_text(json.dumps(record, indent=2) + "\n")
+            expects_npu_work = args.npu_decode == "on" or args.mode != "decode"
+            if expects_npu_work and dispatches == 0:
+                raise RuntimeError(f"NPU backend loaded but executed no matmuls; see {prefix}.stderr")
 
         expected_prompt = 0 if args.mode == "decode" else args.prompt
         expected_tokens = 0 if args.mode == "prefill" else args.tokens

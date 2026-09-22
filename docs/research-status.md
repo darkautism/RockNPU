@@ -211,6 +211,14 @@ Conclusion: same-input projection grouping is already near its structural limit,
 
 The opt-in `ROCKNPU_M1_PROFILE=1` diagnostic records hot-cache M=1 costs by shape without changing routing.
 
+### Native CPU repack and genuine NPU dispatch — 2026-09-23
+
+The `GGML_NATIVE=ON, GGML_CPU_REPACK=ON` llama.cpp build can load `ROCKNPU0` yet execute zero RockNPU matmuls. Its weights use the `CPU_REPACK` buffer type, which does not have the original GGUF layout and is correctly rejected by RockNPU's host-buffer check. Reported NPU throughput from that configuration is CPU work and must not be treated as acceleration.
+
+A separate `GGML_NATIVE=ON, GGML_CPU_REPACK=OFF` build of llama.cpp `391fac1` permits genuine dispatch without changing frontend source. On o8g with the same TinyLlama GGUF, four A76 threads, and the matching W8 sidecar, 32-token warm decode A-B-B-A measured CPU 32.920/32.494 tok/s and NPU 7.307/7.297 tok/s. Each NPU run recorded 10,010 quantized matmul dispatches, including benchmark warmup. RockNPU was about 22.3% of CPU throughput by mean timed latency. This confirms that ordinary M=1 decode still needs a major userspace dataflow or execution improvement.
+
+`scripts/bench_llama_cpu_npu.py` now requests a teardown-only dispatch summary and rejects a nominal NPU run when zero matmuls actually reach RockNPU. The probe intentionally excludes per-op trace logging from the timed path.
+
 ## Current hypotheses
 
 ### H1 — quality-equivalent userspace FFN dataflow

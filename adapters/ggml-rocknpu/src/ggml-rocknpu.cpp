@@ -425,7 +425,7 @@ const char * rocknpu_backend_name(ggml_backend_t) {
 
 void rocknpu_backend_free(ggml_backend_t backend) {
     auto * context = static_cast<rocknpu_backend_context *>(backend->context);
-    if (rocknpu_trace_enabled()) {
+    if (rocknpu_trace_enabled() || rocknpu_env_enabled("ROCKNPU_DISPATCH_SUMMARY")) {
         std::fprintf(stderr,
             "ROCKNPU GGML TRACE summary q4_K_mul_mat=%zu q6_K_mul_mat=%zu f16_mul_mat=%zu w4a4_m1_mul_mat=%zu w8a8_m1_mul_mat=%zu native_w8_calls=%zu vk_pair_calls=%zu ffn_pair_calls=%zu qkv_triple_calls=%zu qkv_stash_hits=%zu\n",
             context->q4_k_mul_mat_calls,
