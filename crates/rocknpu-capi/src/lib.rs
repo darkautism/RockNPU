@@ -3458,13 +3458,13 @@ pub unsafe extern "C" fn rocknpu_matmul_w8a8_swiglu_down_f32(
     let status = unsafe {
         rocknpu_matmul_w8a8_pair_f32_f32_m1(
             context,
-            gate_weights,
-            gate_scales,
+            gate_weights.as_ptr(),
+            gate_scales.as_ptr(),
             ffn_n,
-            up_weights,
-            up_scales,
+            up_weights.as_ptr(),
+            up_scales.as_ptr(),
             ffn_n,
-            activation,
+            activation.as_ptr(),
             gate.as_mut_ptr(),
             up.as_mut_ptr(),
             projection_k,
@@ -3482,10 +3482,10 @@ pub unsafe extern "C" fn rocknpu_matmul_w8a8_swiglu_down_f32(
     unsafe {
         rocknpu_matmul_w8a8_f32_f32_m1(
             context,
-            down_weights,
-            down_scales,
-            gate.as_slice(),
-            output,
+            down_weights.as_ptr(),
+            down_scales.as_ptr(),
+            gate.as_ptr(),
+            output.as_mut_ptr(),
             ffn_n,
             output_n,
         )
