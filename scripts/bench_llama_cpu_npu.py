@@ -240,18 +240,29 @@ def main():
         (args.output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
         print(f"DONE {index} {kind}: {row['avg_ts']:.6f} +/- {row['stddev_ts']:.6f} tok/s", flush=True)
 
-    means = {
-        kind: sum(r["result"]["avg_ns"] for r in results if r["kind"] == kind)
-        / sum(r["kind"] == kind for r in results)
-        for kind in ("cpu", "npu")
+    means = {}
+    for kind in ("cpu", "npu"):
+        rows = [r["result"] for r in results if r["kind"] == kind]
+        means[kind] = {
+            "mean_time_ns": sum(r["avg_ns"] for r in rows) / len(rows),
+            "mean_tok_s": sum(r["avg_ts"] for r in rows) / len(rows),
+        }
+    summary = {
+        "mean_time_ns": {k: v["mean_time_ns"] for k, v in means.items()},
+        "mean_tok_s": {k: v["mean_tok_s"] for k, v in means.items()},
+        "speedup_from_mean_time": means["cpu"]["mean_time_ns"] / means["npu"]["mean_time_ns"],
+        "speedup_from_mean_tok_s": means["cpu"]["mean_tok_s"] / means["npu"]["mean_tok_s"],
     }
-    summary = {"mean_ns": means, "speedup_from_mean_time": means["cpu"] / means["npu"]}
     summary["block_speedups"] = []
     for offset in range(0, len(results), 4):
         block = results[offset:offset + 4]
-        cpu_ns = sum(r["result"]["avg_ns"] for r in block if r["kind"] == "cpu")
-        npu_ns = sum(r["result"]["avg_ns"] for r in block if r["kind"] == "npu")
-        summary["block_speedups"].append(cpu_ns / npu_ns)
+        cpu_rows = [r["result"] for r in block if r["kind"] == "cpu"]
+        npu_rows = [r["result"] for r in block if r["kind"] == "npu"]
+        cpu_ns = sum(r["avg_ns"] for r in cpu_rows) / len(cpu_rows)
+        npu_ns = sum(r["avg_ns"] for r in npu_rows) / len(npu_rows)
+        cpu_ts = sum(r["avg_ts"] for r in cpu_rows) / len(cpu_rows)
+        npu_ts = sum(r["avg_ts"] for r in npu_rows) / len(npu_rows)
+        summary["block_speedups"].append({"time": cpu_ns / npu_ns, "tok_s": cpu_ts / npu_ts})
 
     (args.output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary), flush=True)
