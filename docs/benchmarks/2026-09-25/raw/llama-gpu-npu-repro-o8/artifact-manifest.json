@@ -1,0 +1,157 @@
+{
+  "board": "o8",
+  "files": {
+    "01-gpu.meta.json": {
+      "bytes": 7456,
+      "sha256": "9e9a415bcff2281980772367ab9ef23ba02141fc52820a2b1032a2d45c73d9d9"
+    },
+    "01-gpu.stderr": {
+      "bytes": 395,
+      "sha256": "bdb6546f5246c541ef093617d7358141f0a905d46a66bb7611a57e92b00d23b2"
+    },
+    "01-gpu.stdout": {
+      "bytes": 1203,
+      "sha256": "99f80abedbe71ed12f10efb3e35af348df967e3ab9b05c095402220739c905e0"
+    },
+    "02-npu.meta.json": {
+      "bytes": 7817,
+      "sha256": "7415e243074538b7a279011482add4accd384bcb9348795a7e0f70b84255f6cd"
+    },
+    "02-npu.stderr": {
+      "bytes": 1294,
+      "sha256": "67b595cac48f7cf0fc6ee5a65dd9e1ebde396e113b9ffe2a795ee17e8d6e5068"
+    },
+    "02-npu.stdout": {
+      "bytes": 1228,
+      "sha256": "6c5bbd36d6fabf099c575d45f6ec59e523803a6f682aea020cc06bd1c53785d6"
+    },
+    "03-npu.meta.json": {
+      "bytes": 7817,
+      "sha256": "8015633b19938ab3c9809d752682046c1c2b13e54f4a6a7b5c6076a01a91ff18"
+    },
+    "03-npu.stderr": {
+      "bytes": 1293,
+      "sha256": "33d765e50ea68791a53225747e4ec4398184e971dfb2a4bd9c7874015ca6f188"
+    },
+    "03-npu.stdout": {
+      "bytes": 1228,
+      "sha256": "adcf6a01e7beb206eb68d850c7cd6822e0be29d48c9b7df4eb8d0ca0bb4a0d04"
+    },
+    "04-gpu.meta.json": {
+      "bytes": 7454,
+      "sha256": "b73ae0c6173a15571cd6f4349aef89f70e4241edc9d24d6d1dfc34a1737177b7"
+    },
+    "04-gpu.stderr": {
+      "bytes": 395,
+      "sha256": "bdb6546f5246c541ef093617d7358141f0a905d46a66bb7611a57e92b00d23b2"
+    },
+    "04-gpu.stdout": {
+      "bytes": 1203,
+      "sha256": "2ebea02a245e01551c375f88e433e576eab4c7f21bc3a96923856c1f4a16b5c9"
+    },
+    "05-gpu.meta.json": {
+      "bytes": 7455,
+      "sha256": "708af946f22bc5b03d697ea8e5104f28e3185cac0402dadfa8fdf12f23963a05"
+    },
+    "05-gpu.stderr": {
+      "bytes": 395,
+      "sha256": "bdb6546f5246c541ef093617d7358141f0a905d46a66bb7611a57e92b00d23b2"
+    },
+    "05-gpu.stdout": {
+      "bytes": 1203,
+      "sha256": "2e21ffc66e48501c3b9a0dff7d5bc14880d90943980f00dd224b6eb0bc2d9daf"
+    },
+    "06-npu.meta.json": {
+      "bytes": 7818,
+      "sha256": "104dd5ce9671a4b0a70598e8114577826213a3fb19807bd9294bdfaf150d3085"
+    },
+    "06-npu.stderr": {
+      "bytes": 1291,
+      "sha256": "47e66a26516d278741c215fcb6e327197ed496d5d84e24b4ca1b1bd204f69aac"
+    },
+    "06-npu.stdout": {
+      "bytes": 1228,
+      "sha256": "adc34f156aae122baecf56495b240ec96ac69fe9144febbcab4eb89960a850f3"
+    },
+    "07-npu.meta.json": {
+      "bytes": 7818,
+      "sha256": "6a14679a4a81801ff7613783a6122a9c0782a2a59841793ad267853ae8f602ab"
+    },
+    "07-npu.stderr": {
+      "bytes": 1295,
+      "sha256": "5520191121029e8ecfc328b6e301fd26322fdf7d6e7cec5bc69ac24c771a3d9f"
+    },
+    "07-npu.stdout": {
+      "bytes": 1228,
+      "sha256": "544003308e11240e8515aa505ef85d5914ccdca068d55fec81e9f6b3adfa48f6"
+    },
+    "08-gpu.meta.json": {
+      "bytes": 7454,
+      "sha256": "ca94697c2e6733af1c242ba40f11bffe4e1bba5dce384e5e8af958c43e76d498"
+    },
+    "08-gpu.stderr": {
+      "bytes": 395,
+      "sha256": "bdb6546f5246c541ef093617d7358141f0a905d46a66bb7611a57e92b00d23b2"
+    },
+    "08-gpu.stdout": {
+      "bytes": 1203,
+      "sha256": "8f0b269b7c371531236b3ec14a53dc7c877931e5fc4d4a5e0b0b5620edbdb122"
+    },
+    "09-gpu.meta.json": {
+      "bytes": 7453,
+      "sha256": "2be51597b71e4c3425ed58b98d1bde6831beeac857e3393c10b02f56c88cb83c"
+    },
+    "09-gpu.stderr": {
+      "bytes": 395,
+      "sha256": "bdb6546f5246c541ef093617d7358141f0a905d46a66bb7611a57e92b00d23b2"
+    },
+    "09-gpu.stdout": {
+      "bytes": 1203,
+      "sha256": "3b8d651347172236619aa3deaaffe86eab8305e5e46a4761ca9230fcba7c60b9"
+    },
+    "10-npu.meta.json": {
+      "bytes": 7818,
+      "sha256": "22a6f072593b8134e0a39508afb709ccf3005d6014bf78655920e3327a3bd905"
+    },
+    "10-npu.stderr": {
+      "bytes": 1294,
+      "sha256": "4a931f8a7f259cbffac6c21de9637bb2aea0e1e1a7bb3ccb7729f6718f360ff0"
+    },
+    "10-npu.stdout": {
+      "bytes": 1228,
+      "sha256": "cb060017583060cda6b0d437632083acb49bf70fb945393a9354ff67b8ee9685"
+    },
+    "11-npu.meta.json": {
+      "bytes": 7820,
+      "sha256": "4dafa950f48d50256b405913473e45084ef7ce754f7bac4b570a1682ac655621"
+    },
+    "11-npu.stderr": {
+      "bytes": 1295,
+      "sha256": "49d151befe74b07a2fc02c052112a5462f739a1d6eb4c98819717ae7412763ab"
+    },
+    "11-npu.stdout": {
+      "bytes": 1228,
+      "sha256": "b14ffab6be9020d93766fbf9bbd0e4c7354964599105ce7c4a7495e640ac5e14"
+    },
+    "12-gpu.meta.json": {
+      "bytes": 7456,
+      "sha256": "3cd16eaffd2a2f51cd3c4f8c593c74e277d9592a4db20036dc320acf7d19d93f"
+    },
+    "12-gpu.stderr": {
+      "bytes": 395,
+      "sha256": "bdb6546f5246c541ef093617d7358141f0a905d46a66bb7611a57e92b00d23b2"
+    },
+    "12-gpu.stdout": {
+      "bytes": 1202,
+      "sha256": "0f5d3b32592bea351146ce35305120af8c18666e26b382c88b4f14be92924b0a"
+    },
+    "run-manifest.json": {
+      "bytes": 104432,
+      "sha256": "f51b448b90f609973b3e7202e3532a465481c4e07f2d2bbf1f44d6998d304373"
+    },
+    "summary.json": {
+      "bytes": 263,
+      "sha256": "9c06939e9d7759cb8af5b314f3fc0f44219a9286d435277d7a4965ca5056e405"
+    }
+  }
+}

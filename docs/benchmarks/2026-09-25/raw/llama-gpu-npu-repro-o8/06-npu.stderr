@@ -1,0 +1,9 @@
+ggml_vulkan: Found 1 Vulkan devices:
+ggml_vulkan: 0 = Mali-G610 MC4 (panvk) | uma: 1 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 16 | shared memory: 32768 | int dot: 0 | matrix cores: none
+load_backend: loaded Vulkan backend from /build/llama.cpp-reference/build-vulkan-gpu/bin/libggml-vulkan.so
+load_backend: loaded CPU backend from /build/llama.cpp-reference/build-vulkan-gpu/bin/libggml-cpu.so
+load_backend: loaded ROCKNPU backend from /build/rocknpu/target/ggml-rocknpu-700/libggml-rocknpu.so
+ROCKNPU GGML TRACE summary q4_K_mul_mat=4422 q6_K_mul_mat=660 f16_mul_mat=0 w4a4_m1_mul_mat=0 w8a8_m1_mul_mat=5082 native_w8_calls=5082 vk_pair_calls=44 ffn_pair_calls=726 qkv_triple_calls=682 qkv_stash_hits=682
+ROCKNPU GGML TRACE decode_cache hits=2816 misses=132 entries=88 resident_mb=924.00 hit_ms=1914.78 hit_avg_ms=0.680 miss_ms=2130.01 miss_avg_ms=16.136 tuned_shapes=5 worker_calls=[0,0,2948] ksplit_calls=0
+ROCKNPU GGML TRACE summary q4_K_mul_mat=0 q6_K_mul_mat=0 f16_mul_mat=0 w4a4_m1_mul_mat=0 w8a8_m1_mul_mat=0 native_w8_calls=0 vk_pair_calls=0 ffn_pair_calls=0 qkv_triple_calls=0 qkv_stash_hits=0
+ROCKNPU GGML TRACE decode_cache hits=0 misses=0 entries=0 resident_mb=0.00 hit_ms=0.00 hit_avg_ms=0.000 miss_ms=0.00 miss_avg_ms=0.000 tuned_shapes=0 worker_calls=[0,0,0] ksplit_calls=0
