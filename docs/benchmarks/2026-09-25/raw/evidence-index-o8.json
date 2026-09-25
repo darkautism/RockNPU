@@ -5741,10 +5741,6 @@
       "bytes": 1200,
       "sha256": "9dd3863035c95667ff9da7ed8951df40d613d7b2f49db645065f68754ae2a9ac"
     },
-    "evidence-index-o8.json": {
-      "bytes": 423704,
-      "sha256": "582abbf824c90e2ab34270bcd361b9d6d6a2d0cb0c9aefebf0d6c655464d57c1"
-    },
     "llama-cpu-npu-o16-metadata.json": {
       "bytes": 2124,
       "sha256": "ac8847ad162c6353df7a962665c79c83f1cca16954e0193d88883137a67551ad"
@@ -7647,5 +7643,5 @@
     }
   },
   "schema": "rocknpu-frontend-evidence-v2",
-  "source_commit_at_index": "b0dd6978f072c1c6648bba1d81ac2294fc89d510"
+  "source_commit_at_index": "603048de0699d66cee9bc29df259224fba2075ca"
 }
