@@ -48,6 +48,8 @@ def main():
         "ollama_formal": root / f"ollama-formal-repro-{board}",
         "ollama_trace": root / f"ollama-trace-repro-{board}",
         "llama_profile": root / f"llama-profile-repro-{board}",
+        "candidate_matrix": root / f"candidate-matrix-{board}",
+        "ollama_concurrency": root / f"ollama-concurrency-{board}",
     }
     for name, path in dirs.items():
         if not path.is_dir():
@@ -61,6 +63,8 @@ def main():
     ollama_trace = read_json(dirs["ollama_trace"] / "result.json")
     profile = read_json(dirs["llama_profile"] / "summary.json")
     profile_records = profile_lines(dirs["llama_profile"] / "02-npu.stderr")
+    candidates = read_json(dirs["candidate_matrix"] / "candidate-matrix.json")
+    concurrency = read_json(dirs["ollama_concurrency"] / "run-manifest.json")
     all_snapshots = []
     for p in formal_metas:
         m = read_json(p)
@@ -131,6 +135,14 @@ def main():
             "records": profile_records,
             "frequency_gate": read_json(dirs["llama_profile"] / "metadata.json").get("frequency_gate"),
         },
+        "candidate_matrix": {
+            "directory": str(dirs["candidate_matrix"].relative_to(root)),
+            "matrix": candidates,
+        },
+        "ollama_concurrency": {
+            "directory": str(dirs["ollama_concurrency"].relative_to(root)),
+            "runs": concurrency.get("runs", []),
+        },
         "raw_files": files,
     }
     if "700000000" not in index["llama_cpp"]["formal_ab"]["observed_npu_frequency_values"]:
@@ -139,6 +151,10 @@ def main():
         raise SystemExit("instrumented Ollama evidence has no native W8 dispatch")
     if not index["profile"]["records"]:
         raise SystemExit("profile evidence has no M1 records")
+    if len(index["candidate_matrix"]["matrix"].get("rows", [])) < 8:
+        raise SystemExit("candidate matrix is incomplete")
+    if {x.get("concurrency") for x in index["ollama_concurrency"]["runs"]} != {8, 16}:
+        raise SystemExit("concurrency evidence lacks c8/c16")
     args.output.write_text(json.dumps(index, indent=2, sort_keys=True) + "\n")
     print(json.dumps({"board": board, "files": len(files), "output": str(args.output)}, indent=2))
 
