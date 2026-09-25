@@ -5613,10 +5613,6 @@
     }
   },
   "raw_files": {
-    "artifact-manifest-o16.json": {
-      "bytes": 4028,
-      "sha256": "82f6b0024408055b282753f6c053b167307a0c498c95088cdbe234d9d071ccc1"
-    },
     "artifact-manifest-o8.json": {
       "bytes": 3992,
       "sha256": "ff6ebf98492e7033cd7baf760d10e4a3264e419bf261cb039679063ce81f6410"
@@ -5740,114 +5736,6 @@
     "candidate-matrix-o8/scheduler-ffn-only.stdout": {
       "bytes": 1200,
       "sha256": "9dd3863035c95667ff9da7ed8951df40d613d7b2f49db645065f68754ae2a9ac"
-    },
-    "llama-cpu-npu-o16-metadata.json": {
-      "bytes": 2124,
-      "sha256": "ac8847ad162c6353df7a962665c79c83f1cca16954e0193d88883137a67551ad"
-    },
-    "llama-cpu-npu-o16-results.json": {
-      "bytes": 15601,
-      "sha256": "a7d9b99959376818ec21d1dc89c56d6b08bda89f385b2ef00e82944e56d12593"
-    },
-    "llama-cpu-npu-o16-summary.json": {
-      "bytes": 219,
-      "sha256": "3f622ff2f2c211b2de6aaa92c95a52d632c4e5ef2b1a8a1596628d2e49e906e2"
-    },
-    "llama-cpu-npu-o16/01-cpu.stderr": {
-      "bytes": 114,
-      "sha256": "7a95f5f29f110f7e5fe455bf428a571e527e4b708f154281c356a5c98da1bf40"
-    },
-    "llama-cpu-npu-o16/01-cpu.stdout": {
-      "bytes": 1139,
-      "sha256": "e731b4df0cc17dad66aab941e17b5f6a340f0f301f37c7c82b74f46699681ab9"
-    },
-    "llama-cpu-npu-o16/02-npu.stderr": {
-      "bytes": 1012,
-      "sha256": "fd987661a377419a1ae212c8a353be6bf681a1c13d56f4e707ff4cc88be1cd08"
-    },
-    "llama-cpu-npu-o16/02-npu.stdout": {
-      "bytes": 1166,
-      "sha256": "8048fb4e97cfc33b58a141350856a3ba3e28868a92ca5d2da91dab39eeafbc53"
-    },
-    "llama-cpu-npu-o16/03-npu.stderr": {
-      "bytes": 1011,
-      "sha256": "02fe1f9794ef8a2a28fc44fdb610760cf7d985f75728073359db8467b69f8291"
-    },
-    "llama-cpu-npu-o16/03-npu.stdout": {
-      "bytes": 1166,
-      "sha256": "556fa80818c24ea05cb18c1e55595f47cf4a3860506e6d4c4fd2f5ca979a8a7e"
-    },
-    "llama-cpu-npu-o16/04-cpu.stderr": {
-      "bytes": 114,
-      "sha256": "7a95f5f29f110f7e5fe455bf428a571e527e4b708f154281c356a5c98da1bf40"
-    },
-    "llama-cpu-npu-o16/04-cpu.stdout": {
-      "bytes": 1140,
-      "sha256": "fc8aa576ed0277c0458ed8949d7fdbbc092a5f98831474b7800025a42e621791"
-    },
-    "llama-cpu-npu-o16/05-cpu.stderr": {
-      "bytes": 114,
-      "sha256": "7a95f5f29f110f7e5fe455bf428a571e527e4b708f154281c356a5c98da1bf40"
-    },
-    "llama-cpu-npu-o16/05-cpu.stdout": {
-      "bytes": 1140,
-      "sha256": "c735c94d96697678b73f5ef9257f2efe219520c971e54efbf1aa8834467040fa"
-    },
-    "llama-cpu-npu-o16/06-npu.stderr": {
-      "bytes": 1011,
-      "sha256": "d90f323fe7dde16ba77dd47a827cc0416412b382ae65177e21d6e5d6e3ccb69d"
-    },
-    "llama-cpu-npu-o16/06-npu.stdout": {
-      "bytes": 1166,
-      "sha256": "2f1e798d9759b5a2ea30a96b29ea84824effa3c810d02da698bcdd37e6a63684"
-    },
-    "llama-cpu-npu-o16/07-npu.stderr": {
-      "bytes": 1013,
-      "sha256": "ea7d65e5030b1d4ce260e73fce2b3ab82de65bde94b534a1a60bc8de343c0811"
-    },
-    "llama-cpu-npu-o16/07-npu.stdout": {
-      "bytes": 1166,
-      "sha256": "cbccca7a08f3e6220b904447d6d95c5daf4fdd5b907d22015d4a2b19f5ca4df5"
-    },
-    "llama-cpu-npu-o16/08-cpu.stderr": {
-      "bytes": 114,
-      "sha256": "7a95f5f29f110f7e5fe455bf428a571e527e4b708f154281c356a5c98da1bf40"
-    },
-    "llama-cpu-npu-o16/08-cpu.stdout": {
-      "bytes": 1140,
-      "sha256": "cc0866dd147bc0c16b518ccba230c217f1d5255f580f4de98cd0398b1d06cb7d"
-    },
-    "llama-cpu-npu-o16/09-cpu.stderr": {
-      "bytes": 114,
-      "sha256": "7a95f5f29f110f7e5fe455bf428a571e527e4b708f154281c356a5c98da1bf40"
-    },
-    "llama-cpu-npu-o16/09-cpu.stdout": {
-      "bytes": 1140,
-      "sha256": "c47d9d0171b23fa4921fba8c9431e0e41a813e3fb8d622168bc2ef5d5a90403d"
-    },
-    "llama-cpu-npu-o16/10-npu.stderr": {
-      "bytes": 1011,
-      "sha256": "23b52ef10ecc4982aa2cb99e1c8887807afe8f156d87284470434f4bc549ea9c"
-    },
-    "llama-cpu-npu-o16/10-npu.stdout": {
-      "bytes": 1166,
-      "sha256": "d14a6b12c30eb1e7a311ddd3fbef356452f3efc3408051b8185cd980b5534ca7"
-    },
-    "llama-cpu-npu-o16/11-npu.stderr": {
-      "bytes": 1011,
-      "sha256": "16cbfd2fa4eba62ed9cccb00abc33ee98651a80b458289da27b652e20e99b605"
-    },
-    "llama-cpu-npu-o16/11-npu.stdout": {
-      "bytes": 1166,
-      "sha256": "2d605797c9793d245245922983a78a357c41a8dd8a02265e79593b48bfb94b85"
-    },
-    "llama-cpu-npu-o16/12-cpu.stderr": {
-      "bytes": 114,
-      "sha256": "7a95f5f29f110f7e5fe455bf428a571e527e4b708f154281c356a5c98da1bf40"
-    },
-    "llama-cpu-npu-o16/12-cpu.stdout": {
-      "bytes": 1140,
-      "sha256": "ed14207da14037a852e0657675e1bb6d53c78112baf3d2c1ea4670f46d60a736"
     },
     "llama-cpu-npu-o8-metadata.json": {
       "bytes": 2166,
@@ -6933,10 +6821,6 @@
       "bytes": 251909,
       "sha256": "2a76ffe37d5019da01256f327b2133408279858e69f301dc5f92cb6f2ca4f4a8"
     },
-    "ollama-cpu-npu-o16.json": {
-      "bytes": 7422,
-      "sha256": "ce3b60664118bc6bd84ed5725ecd0fdf94326377796d0f1e60ff58943b62dab9"
-    },
     "ollama-cpu-npu-o8.json": {
       "bytes": 7425,
       "sha256": "4fd9015332c0581bf3917af5b094d9cab446a38ac3488bab36e9753d5b83a10a"
@@ -7261,21 +7145,9 @@
       "bytes": 477,
       "sha256": "3946c85fb49d661d4fce235030cd65e7a3f034125daf4160d33ab30f65d2f801"
     },
-    "ollama-native-trace-evidence-o16.json": {
-      "bytes": 737,
-      "sha256": "318197bc2202f672007024ab45ce66391c96d29940a78a7b31fef4b7062be3a4"
-    },
     "ollama-native-trace-evidence-o8.json": {
       "bytes": 736,
       "sha256": "4a593e871a41a529620ef1480b2c45eca6a27634451c41c9d74ed91b2632be63"
-    },
-    "ollama-native-trace-o16.json": {
-      "bytes": 664,
-      "sha256": "a03adc5c9ac81c6debeb92b110963b26129f231665c3111938a4852739522b64"
-    },
-    "ollama-native-trace-o16.log": {
-      "bytes": 110172,
-      "sha256": "95292b0ae103b6eba2b09be1a8ce8846af3dd986f2d59b629a97800e91ca9ac1"
     },
     "ollama-native-trace-o8.json": {
       "bytes": 664,
@@ -7285,17 +7157,9 @@
       "bytes": 110157,
       "sha256": "7e40266e22fa1290332aa90e40ef79250b79eb7b83bb6db50496aa9cfb1cf367"
     },
-    "ollama-npu-o16.log": {
-      "bytes": 30780,
-      "sha256": "b07259747a53e71cc051b4d110f593d71d548e63b99048a799627ba6d911cc26"
-    },
     "ollama-npu-o8.log": {
       "bytes": 31182,
       "sha256": "7c8f72848ef3ebd66d4722d7c16d40dc69943567582f2857278ec11588c6c290"
-    },
-    "ollama-prefill-cpu-decode-o16.json": {
-      "bytes": 1599,
-      "sha256": "638e6b7d96ff7357c89ca6a5b9909a8ec4577afb0969c7929d8abb9f9cf6053d"
     },
     "ollama-prefill-cpu-decode-o8.json": {
       "bytes": 1596,
@@ -7625,14 +7489,6 @@
       "bytes": 477,
       "sha256": "7bfeba4f6a911e3c29c52c50798b98d74bbaefff732a15f5264eaf4789ef126c"
     },
-    "profile-o16.json": {
-      "bytes": 1163,
-      "sha256": "80e9a895f5509bb0af4f832ecdadce2e52a4a84c7168422361d32c09f097baf3"
-    },
-    "profile-o16.log": {
-      "bytes": 2194,
-      "sha256": "259bf668f8cb3c253dad1a0479726f6f8ddae2b7e232d5c667278445338948ea"
-    },
     "profile-o8.json": {
       "bytes": 1200,
       "sha256": "7a907061427a903d377bf20ada98b36b996ffa91519a447b08e4c42afcf331ec"
@@ -7643,5 +7499,5 @@
     }
   },
   "schema": "rocknpu-frontend-evidence-v2",
-  "source_commit_at_index": "603048de0699d66cee9bc29df259224fba2075ca"
+  "source_commit_at_index": "1f856d733026ad5a01ef64c3bd405821817a2244"
 }
