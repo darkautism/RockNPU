@@ -62,3 +62,5 @@ The committed raw artifacts now include:
 - `raw/ollama-prefill-cpu-decode-o8.json` and `raw/ollama-prefill-cpu-decode-o16.json`: explicitly labelled NPU-prefill/CPU-decode fallback route; it is not a decode promotion.
 
 The Ollama full-decode quality gate is **failed**: NPU continuation is not identical to the CPU reference (`Yes, the French capital is home to` vs `Yes, the French capital has a rich`). The NPU-decode path is therefore not promoted. The raw evidence is retained rather than rewritten as a pass.
+
+Raw llama.cpp structured artifacts and Ollama service logs are versioned under `docs/benchmarks/2026-09-25/raw/` (`llama-cpu-npu-*-summary/results/metadata.json`, `ollama-npu-*.log`).
