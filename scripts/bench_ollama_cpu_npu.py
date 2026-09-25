@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shlex
 import subprocess
 import sys
@@ -239,9 +240,15 @@ def main():
     hashes = {"ollama": sha256(args.ollama), "plugin": sha256(args.plugin),
               "model": sha256(args.model_blob)}
     version_result = subprocess.run([str(args.ollama), "--version"], capture_output=True, text=True)
-    version = (version_result.stdout + version_result.stderr).strip()
+    version_output = (version_result.stdout + version_result.stderr).strip()
+    server_version = re.search(r"ollama version is ([^\s]+)", version_output)
+    client_version = re.search(r"client version is ([^\s]+)", version_output)
     manifest = {
-        "board": args.board, "argv": sys.argv, "binary_version": version, "instrumentation": {"per_op_trace": args.trace},
+        "board": args.board, "argv": sys.argv,
+        "binary_version": {"server_reported": server_version.group(1) if server_version else None,
+                           "client_reported": client_version.group(1) if client_version else None,
+                           "version_command_output": version_output},
+        "instrumentation": {"per_op_trace": args.trace},
         "executable_command": [str(args.ollama), "serve"],
         "workload": payload, "blocks": args.blocks, "warmups": args.warmups,
         "ports": {"npu": args.npu_port, "cpu": args.cpu_port, "oracle": args.oracle_port},
