@@ -50,6 +50,7 @@ def main():
         "llama_profile": root / f"llama-profile-repro-{board}",
         "candidate_matrix": root / f"candidate-matrix-{board}",
         "ollama_concurrency": root / f"ollama-concurrency-{board}",
+        "ollama_runtime": root / f"ollama-runtime-provenance-{board}.json",
     }
     for name, path in dirs.items():
         if not path.is_dir():
@@ -65,6 +66,7 @@ def main():
     profile_records = profile_lines(dirs["llama_profile"] / "02-npu.stderr")
     candidates = read_json(dirs["candidate_matrix"] / "candidate-matrix.json")
     concurrency = read_json(dirs["ollama_concurrency"] / "run-manifest.json")
+    runtime = read_json(dirs["ollama_runtime"]) if dirs["ollama_runtime"].exists() else None
     all_snapshots = []
     for p in formal_metas:
         m = read_json(p)
@@ -114,6 +116,7 @@ def main():
             },
         },
         "ollama": {
+            "runtime_provenance": runtime,
             "fair_performance_ab": {
                 "directory": str(dirs["ollama_formal"].relative_to(root)),
                 "result": "result.json",
