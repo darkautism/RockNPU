@@ -1,0 +1,26 @@
+{
+  "mean_time_ns": {
+    "cpu": 927278427.8333334,
+    "npu": 1906638027.8333333
+  },
+  "mean_tok_s": {
+    "cpu": 34.51006433333333,
+    "npu": 16.78407483333333
+  },
+  "npu_over_cpu_latency_ratio": 2.056165624696305,
+  "npu_over_cpu_tok_s": 0.4863530438893318,
+  "block_speedups": [
+    {
+      "npu_over_cpu_latency_ratio": 2.0787810867136383,
+      "npu_over_cpu_tok_s": 0.48105025771493587
+    },
+    {
+      "npu_over_cpu_latency_ratio": 2.045146547274027,
+      "npu_over_cpu_tok_s": 0.4889640760577792
+    },
+    {
+      "npu_over_cpu_latency_ratio": 2.044690544702931,
+      "npu_over_cpu_tok_s": 0.4890733685761854
+    }
+  ]
+}
