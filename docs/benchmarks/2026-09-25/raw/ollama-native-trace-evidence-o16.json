@@ -1,0 +1,21 @@
+{
+  "board": "o16",
+  "route": "stock Ollama native RockNPU trace probe",
+  "model_sha256": "5c66751b61537f9e55177b1b67e06af88e0e2df88f86de4909f5bf87fb1ae583",
+  "plugin_sha256": "00f32e4ebe6d93d158cc32aa68cd5e31445b3c85e76b39116be634394f561669",
+  "request": {
+    "prompt": "Paris",
+    "temperature": 0,
+    "num_predict": 8,
+    "num_ctx": 2048,
+    "num_thread": 4
+  },
+  "trace_lines": 934,
+  "w8a8_m1_lines": 355,
+  "host_buffer_lines": 4,
+  "trace_log_sha256": "95292b0ae103b6eba2b09be1a8ce8846af3dd986f2d59b629a97800e91ca9ac1",
+  "response_json_sha256": "a03adc5c9ac81c6debeb92b110963b26129f231665c3111938a4852739522b64",
+  "response": "Yes, the French capital has a rich",
+  "eval_count": 8,
+  "eval_duration_ns": 2422195000
+}
