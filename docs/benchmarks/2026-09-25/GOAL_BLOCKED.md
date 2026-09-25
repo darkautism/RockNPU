@@ -29,3 +29,14 @@ Raw evidence is retained in `raw/ollama-gpu-npu-repro-o16-v2/`,
 
 Unblock only when a stock Ollama GPU service can complete the same hot A/B
 without CPU fallback or Vulkan OOM, with response quality and raw evidence.
+
+## Final source-level audit
+
+Ollama v0.34.4 source confirms `OLLAMA_LLM_LIBRARY` selects a named
+variant directory, while integrated GPUs require `OLLAMA_IGPU_ENABLE=1`.
+A temporary `vulkan` variant symlink and `OLLAMA_LLM_LIBRARY=vulkan` made
+Ollama report `library=Vulkan`, `name=Vulkan0`, `type=iGPU`, and load the
+model on Vulkan, but its runner still returned HTTP 500 with
+`ErrorOutOfDeviceMemory`. Replacing only the runner with the same-commit
+native llama-server did not change the result. The installed runtime was
+restored after the probes.
