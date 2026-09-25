@@ -23,7 +23,7 @@ def check(s,node,expected):
     for f in ('cur_freq','target_freq'):
         if s.get(f'/sys/class/devfreq/{node}/{f}')!=str(expected):raise RuntimeError(f'{node}/{f} not {expected}')
 
-def start(name,server,model,port,device,plugin,sidecar,out,trace=False):
+def start(name,server,model,port,device,plugin,sidecar,out,trace=False,gpu_backend=None):
     e=os.environ.copy()
     for k in list(e):
         if k.startswith('ROCKNPU_') or k in ('GGML_BACKEND_PATH','GGML_SCHED_DEBUG'):e.pop(k,None)
@@ -32,6 +32,8 @@ def start(name,server,model,port,device,plugin,sidecar,out,trace=False):
     if device=='ROCKNPU0':
         e.update({'GGML_BACKEND_PATH':str(plugin),'ROCKNPU_W8_SIDECAR_DIR':str(sidecar),'ROCKNPU_W8_DIRECT_SUBMIT':'1','ROCKNPU_EXPERIMENT_DIRECT_SCRATCH':'1','ROCKNPU_PREFILL_CACHE':'1','ROCKNPU_DECODE':'1','ROCKNPU_DISPATCH_SUMMARY':'1'})
         if trace:e['ROCKNPU_GGML_TRACE']='1'
+    elif device=='Vulkan0' and gpu_backend:
+        e['GGML_BACKEND_PATH']=str(gpu_backend)
     out=Path(out);out.mkdir(parents=True,exist_ok=True);o=(out/'stdout.log').open('wb');er=(out/'stderr.log').open('wb');p=subprocess.Popen(cmd,env=e,stdout=o,stderr=er,start_new_session=True);o.close();er.close()
     return {'name':name,'pid':p.pid,'process':p,'command':cmd,'env':{k:v for k,v in sorted(e.items()) if k.startswith('ROCKNPU_') or k in ('GGML_BACKEND_PATH','LD_LIBRARY_PATH')},'stdout':str(out/'stdout.log'),'stderr':str(out/'stderr.log')}
 
@@ -64,11 +66,11 @@ def request(port,payload,stem):
     write(stem.with_suffix('.record.json'),rec);return rec
 
 def main():
-    ap=argparse.ArgumentParser();ap.add_argument('--server',type=Path,required=True);ap.add_argument('--model',type=Path,required=True);ap.add_argument('--plugin',type=Path,required=True);ap.add_argument('--sidecar',type=Path,required=True);ap.add_argument('--output',type=Path,required=True);ap.add_argument('--board',required=True);ap.add_argument('--gpu-port',type=int,default=11540);ap.add_argument('--npu-port',type=int,default=11541);ap.add_argument('--oracle-port',type=int,default=11542);ap.add_argument('--blocks',type=int,default=3);ap.add_argument('--tokens',type=int,default=8);a=ap.parse_args()
-    for n in ('server','model','plugin','sidecar'):setattr(a,n,getattr(a,n).resolve(strict=True))
+    ap=argparse.ArgumentParser();ap.add_argument('--server',type=Path,required=True);ap.add_argument('--model',type=Path,required=True);ap.add_argument('--plugin',type=Path,required=True);ap.add_argument('--gpu-backend',type=Path,required=True);ap.add_argument('--sidecar',type=Path,required=True);ap.add_argument('--output',type=Path,required=True);ap.add_argument('--board',required=True);ap.add_argument('--gpu-port',type=int,default=11540);ap.add_argument('--npu-port',type=int,default=11541);ap.add_argument('--oracle-port',type=int,default=11542);ap.add_argument('--blocks',type=int,default=3);ap.add_argument('--tokens',type=int,default=8);a=ap.parse_args()
+    for n in ('server','model','plugin','gpu_backend','sidecar'):setattr(a,n,getattr(a,n).resolve(strict=True))
     a.output.mkdir(parents=True,exist_ok=False);initial=snap();check(initial,'fdab0000.npu',700000000);check(initial,'fb000000.gpu',1000000000);payload={'prompt':'Paris','n_predict':a.tokens,'temperature':0,'top_k':1,'seed':1234,'stream':False,'cache_prompt':False};services=[]
     try:
-        gpu=start('gpu',a.server,a.model,a.gpu_port,'Vulkan0',a.plugin,a.sidecar,a.output/'gpu-server');services.append(gpu);npu=start('npu',a.server,a.model,a.npu_port,'ROCKNPU0',a.plugin,a.sidecar,a.output/'npu-server',True);services.append(npu);oracle=start('oracle',a.server,a.model,a.oracle_port,'none',a.plugin,a.sidecar,a.output/'oracle-server');services.append(oracle)
+        gpu=start('gpu',a.server,a.model,a.gpu_port,'Vulkan0',a.plugin,a.sidecar,a.output/'gpu-server',False,a.gpu_backend);services.append(gpu);npu=start('npu',a.server,a.model,a.npu_port,'ROCKNPU0',a.plugin,a.sidecar,a.output/'npu-server',True);services.append(npu);oracle=start('oracle',a.server,a.model,a.oracle_port,'none',a.plugin,a.sidecar,a.output/'oracle-server');services.append(oracle)
         for x in (gpu,npu,oracle):wait({'gpu':a.gpu_port,'npu':a.npu_port,'oracle':a.oracle_port}[x['name']],x['process'])
         for name,port in (('gpu',a.gpu_port),('npu',a.npu_port),('oracle',a.oracle_port)):request(port,payload,a.output/'warmup'/name)
         oracle_rec=request(a.oracle_port,payload,a.output/'oracle'/'request');blocks=[]
