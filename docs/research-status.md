@@ -312,3 +312,11 @@ Only a cold-start project. It is not a steady-state decode priority. Any format 
 - Failed experiment: record result, revert/delete.
 - Successful experiment: review, merge, delete the research branch/worktree.
 - Do not use branches as research memory.
+
+## 2026-09-25 700 MHz NPU/CPU whole-model gate
+
+- Both boards ran the native no-repack llama.cpp build with CPU policies 0/4/6 in performance mode and the README-pinned external Rocket DVFS module at 700 MHz.
+- The RockNPU adapter now exposes an independent `ROCKNPU_HOST` host buffer identity. Ollama no longer silently reports a zero-dispatch `CPU_REPACK` path; with the documented prefill-cache route, Ollama logs per-op `path=w8a8_m1` and matches the CPU deterministic 8-token response.
+- Three-block 32-token llama.cpp A/B: o8 NPU/CPU approximately 0.50x; o16 approximately 0.49x. The 8-request M8 diagnostic was approximately 1.003x, below the 5% promotion threshold; the 16-request NPU diagnostic timed out and is not valid evidence.
+- Direct-submit, scratch, scheduler-routing, K-split, M8 and concurrency variants did not produce a stable 5% whole-model NPU win. The observed blocker is NPU execute/wait latency, not host quantization or missing frontend routing.
+- Full raw values and commands are in `docs/benchmarks/2026-09-25/benchmark-summary.md`.

@@ -339,7 +339,7 @@ void rocknpu_device_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props
     props->device_id = nullptr;
     props->caps = {
         /* .async                = */ false,
-        /* .host_buffer          = */ false,
+        /* .host_buffer          = */ true,
         /* .buffer_from_host_ptr = */ false,
         /* .events               = */ false,
         /* .mmap_support         = */ false,
@@ -1118,9 +1118,56 @@ ggml_backend_t rocknpu_device_init(ggml_backend_dev_t dev, const char *) {
     };
 }
 
-ggml_backend_buffer_type_t rocknpu_device_buffer_type(ggml_backend_dev_t) {
-    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    return cpu_dev != nullptr ? ggml_backend_dev_buffer_type(cpu_dev) : nullptr;
+static const char * rocknpu_host_buffer_type_get_name(ggml_backend_buffer_type_t) {
+    return "ROCKNPU_HOST";
+}
+
+static ggml_backend_buffer_t rocknpu_host_buffer_type_alloc_buffer(
+        ggml_backend_buffer_type_t buft, size_t size) {
+    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+    if (buffer != nullptr) {
+        buffer->buft = buft;
+    }
+    return buffer;
+}
+
+static size_t rocknpu_host_buffer_type_get_alignment(ggml_backend_buffer_type_t) {
+    return ggml_backend_cpu_buffer_type()->iface.get_alignment(ggml_backend_cpu_buffer_type());
+}
+
+static size_t rocknpu_host_buffer_type_get_alloc_size(
+        ggml_backend_buffer_type_t, const ggml_tensor * tensor) {
+    auto cpu = ggml_backend_cpu_buffer_type();
+    return cpu->iface.get_alloc_size != nullptr
+        ? cpu->iface.get_alloc_size(cpu, tensor)
+        : ggml_nbytes(tensor);
+}
+
+static bool rocknpu_host_buffer_type_is_host(ggml_backend_buffer_type_t) {
+    return true;
+}
+
+static const ggml_backend_buffer_type_i rocknpu_host_buffer_type_iface = {
+    /* .get_name         = */ rocknpu_host_buffer_type_get_name,
+    /* .alloc_buffer     = */ rocknpu_host_buffer_type_alloc_buffer,
+    /* .get_alignment    = */ rocknpu_host_buffer_type_get_alignment,
+    /* .get_max_size     = */ nullptr,
+    /* .get_alloc_size   = */ rocknpu_host_buffer_type_get_alloc_size,
+    /* .is_host          = */ rocknpu_host_buffer_type_is_host,
+};
+
+ggml_backend_buffer_type_t rocknpu_device_buffer_type(ggml_backend_dev_t dev) {
+    static ggml_backend_buffer_type host_type = {
+        /* .iface    = */ rocknpu_host_buffer_type_iface,
+        /* .device   = */ nullptr,
+        /* .context  = */ nullptr,
+    };
+    host_type.device = dev;
+    return &host_type;
+}
+
+ggml_backend_buffer_type_t rocknpu_device_host_buffer_type(ggml_backend_dev_t dev) {
+    return rocknpu_device_buffer_type(dev);
 }
 
 bool rocknpu_device_supports_op(ggml_backend_dev_t, const ggml_tensor * op) {
@@ -1164,7 +1211,7 @@ const ggml_backend_device_i rocknpu_device_iface = {
     /* .get_props            = */ rocknpu_device_props,
     /* .init_backend         = */ rocknpu_device_init,
     /* .get_buffer_type      = */ rocknpu_device_buffer_type,
-    /* .get_host_buffer_type = */ nullptr,
+    /* .get_host_buffer_type = */ rocknpu_device_host_buffer_type,
     /* .buffer_from_host_ptr = */ nullptr,
     /* .supports_op          = */ rocknpu_device_supports_op,
     /* .supports_buft        = */ rocknpu_device_supports_buft,

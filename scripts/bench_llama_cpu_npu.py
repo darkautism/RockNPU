@@ -20,17 +20,19 @@ def sha256(path):
 
 
 def snapshot():
-    paths = [
-        *Path("/sys/devices/system/cpu/cpufreq").glob("policy*/scaling_governor"),
-        *Path("/sys/devices/system/cpu/cpufreq").glob("policy*/scaling_cur_freq"),
-        *Path("/sys/class/thermal").glob("thermal_zone*/temp"),
-    ]
+    patterns = (
+        "sys/devices/system/cpu/cpufreq/policy*/scaling_governor",
+        "sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq",
+        "sys/class/devfreq/*/{cur_freq,target_freq,min_freq,max_freq,governor}",
+        "sys/class/thermal/thermal_zone*/temp",
+    )
     result = {"machine": platform.machine()}
-    for path in paths:
-        try:
-            result[str(path)] = path.read_text().strip()
-        except OSError as error:
-            result[str(path)] = str(error)
+    for pattern in patterns:
+        for path in Path("/").glob(pattern):
+            try:
+                result[str(path)] = path.read_text().strip()
+            except OSError as error:
+                result[str(path)] = str(error)
     return result
 
 
