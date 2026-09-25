@@ -83,6 +83,20 @@ int rocknpu_matmul_w8a8_f32_f32_m1_nsplit(
     size_t n,
     size_t chunk_n);
 
+int rocknpu_matmul_w8a8_swiglu_down_f32(
+    rocknpu_context * context,
+    const int8_t * gate_weights_nk_i8,
+    const float * gate_scales_n_f32,
+    const int8_t * up_weights_nk_i8,
+    const float * up_scales_n_f32,
+    const int8_t * down_weights_nk_i8,
+    const float * down_scales_n_f32,
+    const float * activations_k_f32,
+    float * output_n_f32,
+    size_t projection_k,
+    size_t ffn_n,
+    size_t output_n);
+
 int rocknpu_matmul_w8a8_pair_f32_f32_m1(
     rocknpu_context * context,
     const int8_t * first_weights_nk_i8,

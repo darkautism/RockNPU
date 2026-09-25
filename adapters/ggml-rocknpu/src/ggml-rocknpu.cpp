@@ -76,6 +76,12 @@ struct rocknpu_backend_context {
     std::unordered_map<std::string, rocknpu_shape_profile> shape_profile;
     std::unordered_map<std::string, rocknpu_w8_tensor> w8_sidecar;
     rocknpu_qkv_layer_state qkv[ROCKNPU_QKV_MAX_LAYERS] = {};
+    bool ffn_composite_pending = false;
+    std::vector<float> ffn_composite_activation;
+    const rocknpu_w8_tensor * ffn_composite_gate = nullptr;
+    const rocknpu_w8_tensor * ffn_composite_up = nullptr;
+    size_t ffn_composite_k = 0;
+    size_t ffn_composite_n = 0;
 };
 
 bool rocknpu_trace_enabled();
@@ -702,6 +708,47 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                         break;
                     }
                 }
+                if (rocknpu_env_enabled("ROCKNPU_FFN_COMPOSITE") && context->ffn_composite_pending) {
+                    const ggml_tensor * down_weights = node->src[0];
+                    const ggml_tensor * down_activations = node->src[1];
+                    const size_t down_m = static_cast<size_t>(down_activations->ne[1]);
+                    const size_t down_k = static_cast<size_t>(down_weights->ne[0]);
+                    const size_t down_n = static_cast<size_t>(down_weights->ne[1]);
+                    if (down_m == 1 && down_k == context->ffn_composite_n &&
+                        down_n == 2048 && rocknpu_weight_name_contains(down_weights, ".ffn_down.weight") &&
+                        (down_weights->type == GGML_TYPE_Q4_K || down_weights->type == GGML_TYPE_Q6_K) &&
+                        context->ffn_composite_gate != nullptr && context->ffn_composite_up != nullptr) {
+                        rocknpu_w8_tensor * down_w8 = rocknpu_w8_sidecar_get(
+                            context, down_weights->name, down_k, down_n,
+                            static_cast<const uint8_t *>(down_weights->data), ggml_nbytes(down_weights));
+                        if (down_w8 != nullptr) {
+                            const rocknpu_w8_tensor * gate_w8 = context->ffn_composite_gate;
+                            const rocknpu_w8_tensor * up_w8 = context->ffn_composite_up;
+                            const int status = rocknpu_matmul_w8a8_swiglu_down_f32(
+                                context->runtime,
+                                gate_w8->weights.data(), gate_w8->scales.data(),
+                                up_w8->weights.data(), up_w8->scales.data(),
+                                down_w8->weights.data(), down_w8->scales.data(),
+                                context->ffn_composite_activation.data(), static_cast<float *>(node->data),
+                                context->ffn_composite_k, context->ffn_composite_n, down_n);
+                            if (status != ROCKNPU_STATUS_OK) {
+                                return GGML_STATUS_FAILED;
+                            }
+                            context->ffn_composite_pending = false;
+                            context->ffn_pair_calls++;
+                            context->w8a8_m1_mul_mat_calls += 3;
+                            context->native_w8_calls += 3;
+                            context->q4_k_mul_mat_calls += 2;
+                            context->q6_k_mul_mat_calls += 1;
+                            if (rocknpu_trace_enabled()) {
+                                std::fprintf(stderr,
+                                    "ROCKNPU GGML TRACE ffn_composite K=%zu N=%zu down_N=%zu path=w8a8_swiglu_down\n",
+                                    context->ffn_composite_k, context->ffn_composite_n, down_n);
+                            }
+                            break;
+                        }
+                    }
+                }
                 if (rocknpu_qkv_triple_enabled()) {
                     const ggml_tensor * q_weights = node->src[0];
                     const ggml_tensor * q_activations = node->src[1];
@@ -803,6 +850,23 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                                     context, second_weights->name, k_pair, 5632,
                                     static_cast<const uint8_t *>(second_weights->data), ggml_nbytes(second_weights));
                                 native_w8 = first_w8 != nullptr && second_w8 != nullptr;
+                                if (pair_m == 1 && native_w8 &&
+                                    rocknpu_env_enabled("ROCKNPU_FFN_COMPOSITE")) {
+                                    context->ffn_composite_pending = true;
+                                    context->ffn_composite_activation.assign(
+                                        static_cast<const float *>(first_activations->data),
+                                        static_cast<const float *>(first_activations->data) + k_pair);
+                                    context->ffn_composite_gate = first_w8;
+                                    context->ffn_composite_up = second_w8;
+                                    context->ffn_composite_k = k_pair;
+                                    context->ffn_composite_n = 5632;
+                                    if (rocknpu_trace_enabled()) {
+                                        std::fprintf(stderr,
+                                            "ROCKNPU GGML TRACE ffn_composite_defer K=%zu N=5632\n", k_pair);
+                                    }
+                                    i += 1;
+                                    break;
+                                }
                                 status = native_w8 ? rocknpu_matmul_w8a8_pair_f32_f32_m1(
                                     context->runtime,
                                     first_w8->weights.data(), first_w8->scales.data(), 5632,

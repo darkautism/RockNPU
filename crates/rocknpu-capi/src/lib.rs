@@ -3403,6 +3403,95 @@ pub unsafe extern "C" fn rocknpu_matmul_w8a8_f32_f32_m1_nsplit(
     STATUS_OK
 }
 
+/// Execute a quality-equivalent M=1 W8A8 FFN sequence through one adapter
+/// boundary: gate/up projections, F32 SwiGLU, and the down projection.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rocknpu_matmul_w8a8_swiglu_down_f32(
+    context: *mut RockNpuContext,
+    gate_weights_nk_i8: *const i8,
+    gate_scales_n_f32: *const f32,
+    up_weights_nk_i8: *const i8,
+    up_scales_n_f32: *const f32,
+    down_weights_nk_i8: *const i8,
+    down_scales_n_f32: *const f32,
+    activations_k_f32: *const f32,
+    output_n_f32: *mut f32,
+    projection_k: usize,
+    ffn_n: usize,
+    output_n: usize,
+) -> i32 {
+    if context.is_null()
+        || gate_weights_nk_i8.is_null()
+        || gate_scales_n_f32.is_null()
+        || up_weights_nk_i8.is_null()
+        || up_scales_n_f32.is_null()
+        || down_weights_nk_i8.is_null()
+        || down_scales_n_f32.is_null()
+        || activations_k_f32.is_null()
+        || output_n_f32.is_null()
+        || projection_k == 0
+        || ffn_n == 0
+        || output_n == 0
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let Some(gate_len) = projection_k.checked_mul(ffn_n) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let Some(down_len) = ffn_n.checked_mul(output_n) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let (gate_weights, gate_scales, up_weights, up_scales, down_weights, down_scales, activation, output) = unsafe {
+        (
+            slice::from_raw_parts(gate_weights_nk_i8, gate_len),
+            slice::from_raw_parts(gate_scales_n_f32, ffn_n),
+            slice::from_raw_parts(up_weights_nk_i8, gate_len),
+            slice::from_raw_parts(up_scales_n_f32, ffn_n),
+            slice::from_raw_parts(down_weights_nk_i8, down_len),
+            slice::from_raw_parts(down_scales_n_f32, output_n),
+            slice::from_raw_parts(activations_k_f32, projection_k),
+            slice::from_raw_parts_mut(output_n_f32, output_n),
+        )
+    };
+    let mut gate = vec![0.0f32; ffn_n];
+    let mut up = vec![0.0f32; ffn_n];
+    let status = unsafe {
+        rocknpu_matmul_w8a8_pair_f32_f32_m1(
+            context,
+            gate_weights,
+            gate_scales,
+            ffn_n,
+            up_weights,
+            up_scales,
+            ffn_n,
+            activation,
+            gate.as_mut_ptr(),
+            up.as_mut_ptr(),
+            projection_k,
+        )
+    };
+    if status != STATUS_OK {
+        return status;
+    }
+    for index in 0..ffn_n {
+        let gate_value = gate[index];
+        let up_value = up[index];
+        let sigmoid = 1.0 / (1.0 + (-gate_value).exp());
+        gate[index] = gate_value * sigmoid * up_value;
+    }
+    unsafe {
+        rocknpu_matmul_w8a8_f32_f32_m1(
+            context,
+            down_weights,
+            down_scales,
+            gate.as_slice(),
+            output,
+            ffn_n,
+            output_n,
+        )
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rocknpu_matmul_w8a8_f32_f32_m16(
     context: *mut RockNpuContext,
