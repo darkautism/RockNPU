@@ -666,7 +666,7 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                         }
                         const int status = rocknpu_matmul_w8a8_f32_f32_m1_nsplit(
                             context->runtime,
-                            output_w8->weights.data(), output_w8->scales.data(), output_k,
+                            output_w8->weights.data(), output_w8->scales.data(),
                             static_cast<const float *>(output_activations->data),
                             static_cast<float *>(node->data), output_k, output_n, 8192);
                         if (status != ROCKNPU_STATUS_OK) {
