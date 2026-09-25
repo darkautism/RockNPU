@@ -26,8 +26,8 @@ repository gains a complete request-level benchmark for them.
   modified by this project.
 - CPU: policies 0/4/6 set to `performance`; four Cortex-A76 workers; policy 0
   at 1.8 GHz and policies 4/6 at 2.4 GHz when available.
-- Prompt: `Paris` repeated 16 times.
-- Decode: 32 generated tokens, temperature 0, fixed context and model hash.
+- llama.cpp prompt: `Paris` repeated 16 times; Ollama API prompt: `Paris`.
+- Decode: 32 generated tokens for llama.cpp and 8 generated tokens for the fixed Ollama quality/A-B diagnostic, temperature 0, fixed context and model hash.
 - Initial concurrency: one request per frontend. Additional concurrency points
   use the same fixed workload at each tested value.
 - Timing: resident caches warm; model loading and first preparation are
@@ -65,7 +65,7 @@ Each result directory contains:
 1. exact commands, versions, binary/plugin/model hashes and source commit;
 2. NPU/CPU/GPU frequency, governor, temperature and memory snapshots;
 3. warmup policy and hot measurement window;
-4. raw CPU/NPU stdout, stderr and structured JSON;
+4. raw CPU/NPU stdout, stderr and structured JSON (llama.cpp per-run files are under `raw/llama-cpu-npu-o8/` and `raw/llama-cpu-npu-o16/`);
 5. NPU dispatch summary and backend/device row;
 6. deterministic response/continuation and independent quality result;
 7. every raw A/B block and computed aggregate.

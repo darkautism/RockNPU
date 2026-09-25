@@ -11,8 +11,8 @@
 ## Correctness and integration
 
 - llama.cpp no-repack NPU smoke on both boards: backend/device `ROCKNPU0`, native W8 dispatch 1386 per smoke, model hash and sidecar v2 hash matched.
-- Ollama 0.34.4 isolated stock runtime on both boards: `ROCKNPU0` discovered, `ROCKNPU_HOST` used for KV/compute and, with the documented prefill-cache route, 549.40 MiB of model weights. Per-op trace showed `path=w8a8_m1` (66 o8 operations and 179 o16 operations in the recorded short request).
-- Ollama CPU and NPU deterministic 8-token responses were identical: `Yes, the French capital has a rich`.
+- Ollama 0.34.4 isolated stock runtime on both boards: `ROCKNPU0` discovered, `ROCKNPU_HOST` used for KV/compute and, with the documented prefill-cache route, 549.40 MiB of model weights. The independent native-trace probe recorded 934 trace lines and 355 `path=w8a8_m1` dispatches on each board. The formal A/B service intentionally did not enable per-op tracing; its raw JSON points to the separate native-trace evidence.
+- The independent Ollama native-trace probe matched the CPU reference (`Yes, the French capital has a rich`). In the formal three-block A/B, however, NPU produced `Yes, the French capital is home to` while CPU produced `Yes, the French capital has a rich`; the formal quality gate is failed.
 - The host-buffer adapter change is a correctness/routing fix: it gives RockNPU an independent host buffer identity and prevents the frontend from silently using `CPU_REPACK` as a false NPU path.
 
 ## Three-block hot A/B
@@ -23,13 +23,13 @@
 | llama.cpp o16, 32 tokens | 33.96 | 16.59 | 0.49x | FAIL |
 | llama.cpp c8 diagnostic, 8 requests | 32.32 | 32.46 | 1.003x | FAIL (<5%) |
 | Ollama c1 hot diagnostic, 8 tokens | 40.1 | 19.1 | 0.48x | FAIL |
-| Ollama c16 diagnostic | not completed | not completed | — | INVALID/timeout |
+| Ollama c16 diagnostic (not a required gate point) | not admitted | not admitted | — | INVALID/timeout; not used for completion |
 
 Raw A/B files:
 
 - `artifacts/bench-700-cpu-npu-final-o8/`
 - `artifacts/bench-700-cpu-npu-final-o16/`
-- `/tmp/c8-*` and `/tmp/c16-*` diagnostic logs (not promoted).
+- The c8/c16 diagnostics were exploratory; c16 timed out and neither result is used as a completion result or promotion candidate.
 
 ## Profiling conclusion
 
@@ -48,9 +48,7 @@ edited.
 
 ## Status
 
-Correctness and integration gates pass. The required NPU-over-CPU performance
-objective is not met on either board; this document records the blocker rather
-than claiming completion.
+Integration and dispatch evidence is complete. The formal Ollama A/B quality gate and all required NPU-over-CPU performance gates failed; no promotion is claimed. This document records the blocker rather than claiming completion.
 
 
 ## Auditor evidence addendum
@@ -63,7 +61,7 @@ The committed raw artifacts now include:
 
 The Ollama full-decode quality gate is **failed**: NPU continuation is not identical to the CPU reference (`Yes, the French capital is home to` vs `Yes, the French capital has a rich`). The NPU-decode path is therefore not promoted. The raw evidence is retained rather than rewritten as a pass.
 
-Raw llama.cpp structured artifacts and Ollama service logs are versioned under `docs/benchmarks/2026-09-25/raw/` (`llama-cpu-npu-*-summary/results/metadata.json`, `ollama-npu-*.log`).
+Raw llama.cpp structured artifacts, per-run stdout/stderr, Ollama service logs, and native trace logs are versioned under `docs/benchmarks/2026-09-25/raw/` (`llama-cpu-npu-*-summary/results/metadata.json`, `llama-cpu-npu-o8/`, `llama-cpu-npu-o16/`, `ollama-npu-*.log`, `ollama-native-trace-*.log`).
 
 ## Native dispatch trace evidence
 
