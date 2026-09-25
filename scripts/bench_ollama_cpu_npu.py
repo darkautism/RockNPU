@@ -222,6 +222,7 @@ def main():
     ap.add_argument("--num-thread", type=int, default=4)
     ap.add_argument("--blocks", type=int, default=3)
     ap.add_argument("--warmups", type=int, default=1)
+    ap.add_argument("--trace", action="store_true", help="enable per-op trace in the NPU service; use for instrumented verification, not fair timing")
     ap.add_argument("--npu-port", type=int, default=11440)
     ap.add_argument("--cpu-port", type=int, default=11441)
     ap.add_argument("--oracle-port", type=int, default=11442)
@@ -237,8 +238,9 @@ def main():
                            "num_ctx": args.num_ctx, "num_thread": args.num_thread}}
     hashes = {"ollama": sha256(args.ollama), "plugin": sha256(args.plugin),
               "model": sha256(args.model_blob)}
+    version = subprocess.run([str(args.ollama), "--version"], capture_output=True, text=True).stdout.strip()
     manifest = {
-        "board": args.board, "argv": sys.argv,
+        "board": args.board, "argv": sys.argv, "binary_version": version, "instrumentation": {"per_op_trace": args.trace},
         "executable_command": [str(args.ollama), "serve"],
         "workload": payload, "blocks": args.blocks, "warmups": args.warmups,
         "ports": {"npu": args.npu_port, "cpu": args.cpu_port, "oracle": args.oracle_port},
@@ -247,6 +249,8 @@ def main():
     }
     write_json(args.output / "run-manifest.json", manifest)
     npu_env = service_env(args, args.npu_port, "npu")
+    if args.trace:
+        npu_env["ROCKNPU_GGML_TRACE"] = "1"
     cpu_env = service_env(args, args.cpu_port, "cpu")
     oracle_env = service_env(args, args.oracle_port, "cpu")
     manifest["service_environments"] = {"npu": safe_env(npu_env), "cpu": safe_env(cpu_env), "oracle": safe_env(oracle_env)}
@@ -260,7 +264,7 @@ def main():
         exports = " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(env.items()) if k in {
             "OLLAMA_HOST", "OLLAMA_MODELS", "OLLAMA_NUM_GPU", "OLLAMA_KEEP_ALIVE", "LLAMA_ARG_DEVICE",
             "GGML_BACKEND_PATH", "LD_LIBRARY_PATH", "ROCKNPU_W8_SIDECAR_DIR", "ROCKNPU_W8_DIRECT_SUBMIT",
-            "ROCKNPU_EXPERIMENT_DIRECT_SCRATCH", "ROCKNPU_DECODE", "ROCKNPU_PREFILL_CACHE", "ROCKNPU_DISPATCH_SUMMARY",
+            "ROCKNPU_EXPERIMENT_DIRECT_SCRATCH", "ROCKNPU_DECODE", "ROCKNPU_PREFILL_CACHE", "ROCKNPU_DISPATCH_SUMMARY", "ROCKNPU_GGML_TRACE",
         })
         command_lines += [f"# {name} service", f"env {exports} {shlex.quote(str(args.ollama))} serve >{args.output.name}-{name}.stdout.log 2>{args.output.name}-{name}.stderr.log &", f"{name}_pid=$!"]
     command_lines += ["# Run requests using the Python harness; this file records the exact service launch commands.", "wait"]
@@ -312,7 +316,7 @@ def main():
         result = {
             "board": args.board, "manifest": manifest, "blocks": blocks,
             "quality_gate": quality,
-            "npu_log": {"stderr": npu["stderr"], "sha256": hashlib.sha256(npu_log.encode()).hexdigest(),
+            "npu_log": {"trace_enabled": args.trace, "stderr": npu["stderr"], "sha256": hashlib.sha256(npu_log.encode()).hexdigest(),
                         "w8a8_m1_lines": npu_log.count("path=w8a8_m1"),
                         "host_lines": npu_log.count("ROCKNPU_HOST"),
                         "dispatch_summary_lines": npu_log.count("ROCKNPU GGML TRACE summary")},
