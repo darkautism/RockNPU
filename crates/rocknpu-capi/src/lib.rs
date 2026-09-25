@@ -956,7 +956,7 @@ fn decode_worker_candidates(
             last_effective_n = effective;
         }
     }
-    if k > 4096 {
+    if k > 4096 && !env_enabled("ROCKNPU_M1_FORCE_N_SPLIT") {
         let mut last_effective_k = 1usize;
         for requested in 2..=pool.workers() {
             let effective = pool.effective_workers_for_k(k, requested).map_err(|_| ())?;
