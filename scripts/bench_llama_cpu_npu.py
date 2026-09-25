@@ -8,6 +8,7 @@ from pathlib import Path
 import platform
 import re
 import subprocess
+import sys
 import time
 
 
@@ -55,6 +56,8 @@ def main():
     parser.add_argument("--allow-generic-cpu", action="store_true")
     parser.add_argument("--no-warmup", action="store_true",
                         help="disable llama-bench warmup so first-use resident-cache setup is timed")
+    parser.add_argument("--expected-npu-freq", type=int, default=None,
+                        help="require both NPU cur_freq and target_freq to equal this value")
     args = parser.parse_args()
 
     if platform.machine() not in ("aarch64", "arm64"):
@@ -80,6 +83,17 @@ def main():
         if initial.get(f"/sys/devices/system/cpu/cpufreq/policy{policy}/scaling_governor") != "performance":
             parser.error("set CPU policies 0/4/6 to performance before timing")
 
+    def check_npu_frequency(label, snap):
+        if args.expected_npu_freq is None:
+            return
+        node = "fdab0000.npu"
+        cur = snap.get(f"/sys/class/devfreq/{node}/cur_freq")
+        target = snap.get(f"/sys/class/devfreq/{node}/target_freq")
+        if cur != str(args.expected_npu_freq) or target != str(args.expected_npu_freq):
+            parser.error(f"{label} NPU frequency is not pinned to {args.expected_npu_freq}: cur={cur}, target={target}")
+
+    check_npu_frequency("initial", initial)
+
     model_hash = sha256(args.model)
     if args.sidecar is not None:
         manifest = json.loads((args.sidecar / "manifest.json").read_text())
@@ -98,8 +112,20 @@ def main():
         workload = ["-p", str(args.prompt), "-n", "0"]
 
     results = []
+    def safe_env(environ):
+        redacted = {}
+        for key, value in sorted(environ.items()):
+            upper = key.upper()
+            redacted[key] = "<redacted>" if any(word in upper for word in ("TOKEN", "PASSWORD", "SECRET", "API_KEY")) else value
+        return redacted
+
+    recorded_env = safe_env(os.environ)
+    (args.output / "environment.json").write_text(json.dumps(recorded_env, indent=2) + "\n")
     metadata = {
+        "argv": sys.argv,
+        "command": [str(args.bench)] + sys.argv[1:],
         "settings": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+        "environment": recorded_env,
         "source_hashes": {
             "model": model_hash,
             "bench": sha256(args.bench),
@@ -108,6 +134,11 @@ def main():
         },
         "cpu_native": native,
         "initial_environment": initial,
+        "frequency_gate": {
+            "expected_npu_freq": args.expected_npu_freq,
+            "initial_cur_freq": initial.get("/sys/class/devfreq/fdab0000.npu/cur_freq"),
+            "initial_target_freq": initial.get("/sys/class/devfreq/fdab0000.npu/target_freq"),
+        },
         "warmup_policy": (
             "disabled; first timed repetition includes first-use backend/cache setup"
             if args.no_warmup else
@@ -120,6 +151,7 @@ def main():
         ),
     }
     (args.output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    (args.output / "run-manifest.json").write_text(json.dumps({"argv": sys.argv, "command": [str(args.bench)] + sys.argv[1:], "environment": recorded_env, "initial_environment": initial, "frequency_gate": metadata["frequency_gate"]}, indent=2) + "\n")
 
     for index, kind in enumerate(["cpu", "npu", "npu", "cpu"] * args.blocks, 1):
         env = base_env.copy()
@@ -158,14 +190,17 @@ def main():
         with prefix.with_suffix(".stdout").open("wb") as out, prefix.with_suffix(".stderr").open("wb") as err:
             process = subprocess.run(command, env=env, stdout=out, stderr=err, timeout=1800)
 
+        check_npu_frequency(f"before run {index} {kind}", before)
         record = {
             "kind": kind,
             "command": command,
+            "environment": {k: v for k, v in sorted(env.items()) if k.startswith("ROCKNPU_") or k in ("GGML_BACKEND_PATH", "LD_LIBRARY_PATH", "GGML_SCHED_DEBUG")},
             "exit_code": process.returncode,
             "process_wall_seconds": time.monotonic() - start,
             "before": before,
             "after": snapshot(),
         }
+        check_npu_frequency(f"after run {index} {kind}", record["after"])
         prefix.with_suffix(".meta.json").write_text(json.dumps(record, indent=2) + "\n")
         if process.returncode:
             raise RuntimeError(f"{kind} exited {process.returncode}; see {prefix}.stderr")
