@@ -33,7 +33,7 @@ not considered integrated merely because `ROCKNPU0` appears in a log.
   `vk::CommandBuffer::end: ErrorOutOfDeviceMemory` under both Flash Attention
   settings and with `OLLAMA_KV_CACHE_TYPE=q8_0`. Raw diagnostics are in
   `raw/ollama-gpu-npu-repro-o16-v2/` and
-  `raw/ollama-gpu-q8-probe-o16.log`.
+  `raw/ollama-gpu-q8-probe-o16.log`, `raw/ollama-gpu-wrapper3-o16.log`, and `raw/llama-direct-vulkan-stable-o16.log`.
 - Consequence: Ollama has a real discoverable GPU backend but no valid hot
   GPU generation denominator in this environment. CPU results are not a
   substitute; the Ollama GPU/NPU A/B remains blocked until the Vulkan/PanVK
