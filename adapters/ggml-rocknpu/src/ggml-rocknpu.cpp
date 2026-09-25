@@ -417,6 +417,9 @@ bool rocknpu_mul_mat_supported(const ggml_tensor * op) {
         if (rocknpu_env_enabled("ROCKNPU_SCHED_CPU_KV") && k == 2048 && n == 256) {
             return false;
         }
+        if (rocknpu_env_enabled("ROCKNPU_SCHED_CPU_GATEUP") && k == 2048 && n == 5632) {
+            return false;
+        }
         if (rocknpu_env_enabled("ROCKNPU_SCHED_CPU_FFN") &&
             ((k == 2048 && n == 5632) || (k == 5632 && n == 2048))) {
             return false;
