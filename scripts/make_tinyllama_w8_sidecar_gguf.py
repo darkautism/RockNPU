@@ -98,8 +98,6 @@ def main() -> None:
         "ffn_up.weight",
         "ffn_down.weight",
     ]
-    if args.include_output_head:
-        suffixes.append("output.weight")
     manifest = {
         "format": "rocknpu-w8-sidecar-v2",
         "source": str(args.gguf),
@@ -134,6 +132,29 @@ def main() -> None:
                 "source_sample_fnv1a64": source_fingerprint,
             }
             print(f"{name} K={k} N={n} type={int(tensor.tensor_type)}", flush=True)
+    if args.include_output_head:
+        name = "output.weight"
+        tensor = by_name.get(name)
+        if tensor is None:
+            raise KeyError(name)
+        source_fingerprint = source_sample_fnv1a64(tensor.data)
+        values = dequantize(tensor.data, tensor.tensor_type)
+        out_base = args.output_dir / name
+        n, k = quantize_rows(values, out_base, args.chunk_rows)
+        Path(str(out_base) + ".source.fnv1a64").write_text(source_fingerprint + "\n")
+        expected_k, expected_n = map(int, tensor.shape)
+        if (k, n) != (expected_k, expected_n):
+            raise ValueError(
+                f"{name}: dequant orientation mismatch: got K={k} N={n}, expected K={expected_k} N={expected_n}"
+            )
+        manifest["tensors"][name] = {
+            "k": k,
+            "n": n,
+            "scheme": "symmetric-per-output-channel-int8",
+            "ggml_type": int(tensor.tensor_type),
+            "source_sample_fnv1a64": source_fingerprint,
+        }
+        print(f"{name} K={k} N={n} type={int(tensor.tensor_type)}", flush=True)
     (args.output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"wrote {len(manifest['tensors'])} tensors to {args.output_dir}")
 
