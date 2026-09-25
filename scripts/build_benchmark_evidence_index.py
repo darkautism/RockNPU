@@ -53,6 +53,8 @@ def main():
         "ollama_runtime": root / f"ollama-runtime-provenance-{board}.json",
     }
     for name, path in dirs.items():
+        if name == "ollama_runtime":
+            continue
         if not path.is_dir():
             raise SystemExit(f"missing evidence directory: {name}: {path}")
     formal = read_json(dirs["llama_formal"] / "summary.json")
