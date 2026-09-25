@@ -1,0 +1,63 @@
+{
+  "board": "o16",
+  "route": "NPU prefill + CPU decode (not a decode promotion)",
+  "blocks": [
+    {
+      "npu": {
+        "wall_s": 0.25274705300398637,
+        "tok_s": 38.75330614143019,
+        "response": "Yes, the French capital is home to",
+        "tokens": 8
+      },
+      "cpu": {
+        "wall_s": 0.2475353069967241,
+        "tok_s": 40.88808929958703,
+        "response": "Yes, the French capital has a rich",
+        "tokens": 8
+      }
+    },
+    {
+      "npu": {
+        "wall_s": 0.2563587280019419,
+        "tok_s": 38.648463240480396,
+        "response": "Yes, the French capital is home to",
+        "tokens": 8
+      },
+      "cpu": {
+        "wall_s": 0.23854330299946014,
+        "tok_s": 40.8463360836533,
+        "response": "Yes, the French capital has a rich",
+        "tokens": 8
+      }
+    },
+    {
+      "npu": {
+        "wall_s": 0.25763563299551606,
+        "tok_s": 38.673498984820654,
+        "response": "Yes, the French capital is home to",
+        "tokens": 8
+      },
+      "cpu": {
+        "wall_s": 0.2413272350022453,
+        "tok_s": 40.67831083314265,
+        "response": "Yes, the French capital has a rich",
+        "tokens": 8
+      }
+    }
+  ],
+  "quality_exact": false,
+  "trace": {
+    "fp16_bridge": 0,
+    "w8a8": 0,
+    "host": 4,
+    "log_sha256": "51737449eca02954840206ee092a8247aa94a26a6eab386f58697472f5bbb2f5"
+  },
+  "frequency": {
+    "npu": "700000000",
+    "gpu": "1000000000"
+  },
+  "commands": {
+    "npu": "stock Ollama 0.34.4, ROCKNPU_PREFILL_CACHE=1, ROCKNPU_DECODE=0",
+    "cpu": "stock Ollama 0.34.4, OLLAMA_NUM_GPU=0"
+  }
+}
