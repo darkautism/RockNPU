@@ -250,8 +250,8 @@ def main():
     summary = {
         "mean_time_ns": {k: v["mean_time_ns"] for k, v in means.items()},
         "mean_tok_s": {k: v["mean_tok_s"] for k, v in means.items()},
-        "speedup_from_mean_time": means["cpu"]["mean_time_ns"] / means["npu"]["mean_time_ns"],
-        "speedup_from_mean_tok_s": means["cpu"]["mean_tok_s"] / means["npu"]["mean_tok_s"],
+        "npu_over_cpu_latency_ratio": means["npu"]["mean_time_ns"] / means["cpu"]["mean_time_ns"],
+        "npu_over_cpu_tok_s": means["npu"]["mean_tok_s"] / means["cpu"]["mean_tok_s"],
     }
     summary["block_speedups"] = []
     for offset in range(0, len(results), 4):
@@ -262,7 +262,7 @@ def main():
         npu_ns = sum(r["avg_ns"] for r in npu_rows) / len(npu_rows)
         cpu_ts = sum(r["avg_ts"] for r in cpu_rows) / len(cpu_rows)
         npu_ts = sum(r["avg_ts"] for r in npu_rows) / len(npu_rows)
-        summary["block_speedups"].append({"time": cpu_ns / npu_ns, "tok_s": cpu_ts / npu_ts})
+        summary["block_speedups"].append({"npu_over_cpu_latency_ratio": npu_ns / cpu_ns, "npu_over_cpu_tok_s": npu_ts / cpu_ts})
 
     (args.output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary), flush=True)
