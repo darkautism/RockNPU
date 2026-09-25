@@ -1,0 +1,22 @@
+{
+  "directory": "docs/benchmarks/2026-09-25/raw/llama-profile-repro-o16",
+  "files": {
+    "01-cpu.meta.json": "37abfa90ee119c8bae608bbaf2842786227401a4a5e4597ae087b52c1c9c95eb",
+    "01-cpu.stderr": "7a95f5f29f110f7e5fe455bf428a571e527e4b708f154281c356a5c98da1bf40",
+    "01-cpu.stdout": "567903e9396e5306f8dae34358ab7d342529d2b9c1abad3c4383b4ac744509cc",
+    "02-npu.meta.json": "dd8460c5433f087e3b4632fddf6b04279a8e4a78ee1eeb503cca932487cc5c6a",
+    "02-npu.stderr": "679d6f89a506181f641b5fe281b805aecdf222fe757aeb64d820db705bc8b3ea",
+    "02-npu.stdout": "e6a6a2fa7d336240cdce83dc48c4984b683c4201aa90329922694af57fd75736",
+    "03-npu.meta.json": "a8f1d4d6d920fbe89551816bd11592459476fbab7af3a4c96ee7c8de196dc0a7",
+    "03-npu.stderr": "6e4044dae082d71f362c9c7a6a04072fe0d5bf3fdf32359b312cd33abea15134",
+    "03-npu.stdout": "7c79cc263a06e6a5ac7fec44b52c2baebda6e59e062a68501bc4b05592ecb6df",
+    "04-cpu.meta.json": "3d4410062d0ac52415452193b9342b6e7e910a815471b03ca02aabcac19811e8",
+    "04-cpu.stderr": "7a95f5f29f110f7e5fe455bf428a571e527e4b708f154281c356a5c98da1bf40",
+    "04-cpu.stdout": "61a914e6679e8287138ec45f8962e8ebeb68948a452c11c6a341f65f14de0e7a",
+    "environment.json": "a81f84f7fc848680f03b74fc72e563d14d000a78e4323c912c788e299bd36dd9",
+    "metadata.json": "fc0a7761ddc7d8b7a63b5b0eb821362d91097cf4a29924de4365a12481533bbb",
+    "results.json": "c4895c905164af6b6a279899a0a9f2c1f0f4d208565994f24c21c2dd07c6c800",
+    "run-manifest.json": "f6d516fa763967ee52d2046d9f2ded036ebe5582559d53d590215b6ea081cc4b",
+    "summary.json": "252d44df0db5b8e8ff3ccf51dc9af124f17e1395f03c791f627e648d7bbe9f68"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "mean_time_ns": {
+    "cpu": 229107546.0,
+    "npu": 601380157.0
+  },
+  "mean_tok_s": {
+    "cpu": 34.918482499999996,
+    "npu": 13.302873
+  },
+  "npu_over_cpu_latency_ratio": 2.624881491245164,
+  "npu_over_cpu_tok_s": 0.38096939063717905,
+  "block_speedups": [
+    {
+      "npu_over_cpu_latency_ratio": 2.624881491245164,
+      "npu_over_cpu_tok_s": 0.38096939063717905
+    }
+  ]
+}

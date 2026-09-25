@@ -1,0 +1,121 @@
+{
+  "board": "o16",
+  "files": {
+    "baseline.record.json": {
+      "bytes": 6701,
+      "sha256": "daca7ece2ad0199c1dbb35f9291636432d1e611f5891d8aeec817a20efff0018"
+    },
+    "baseline.stderr": {
+      "bytes": 1011,
+      "sha256": "18e8935a1acbbeef8a0abea1a1bf063f325d31fef5cfa77fe7dbb9bb9a6d6f82"
+    },
+    "baseline.stdout": {
+      "bytes": 1163,
+      "sha256": "3715a03a964848a46207f761a9f7e9a7f8a457ffb1a7a1e058a14a6017e8d4d0"
+    },
+    "candidate-matrix.json": {
+      "bytes": 70031,
+      "sha256": "7bdbb2b05c23c829fcf897056552408c9f474b7c605b8cd4fa16e878f7e37a76"
+    },
+    "commands.sh": {
+      "bytes": 1992,
+      "sha256": "3be848d5bbcc0ac676ae1960f465808acc7c1cc6bee81a3d8e577e021307b026"
+    },
+    "cpu-reference.record.json": {
+      "bytes": 6015,
+      "sha256": "e5a78fb51c93c0eaf18677bcc1bd7d8111b3a2b8865b813b9df8b9798d9d04b4"
+    },
+    "cpu-reference.stderr": {
+      "bytes": 114,
+      "sha256": "7a95f5f29f110f7e5fe455bf428a571e527e4b708f154281c356a5c98da1bf40"
+    },
+    "cpu-reference.stdout": {
+      "bytes": 1139,
+      "sha256": "cb77075b43a527c0292dbac39e0aa32b488383b6d6a1492173c102748ec27150"
+    },
+    "direct-scratch.record.json": {
+      "bytes": 6886,
+      "sha256": "b4e9bb33c0832dba3cc4a20be6f2a3e728a990501116d710bd44720701b74f7c"
+    },
+    "direct-scratch.stderr": {
+      "bytes": 1007,
+      "sha256": "9d4fd6a57b0a0173038387a2397a7c36b1950fbfd8a5ca74808663e916adcbfe"
+    },
+    "direct-scratch.stdout": {
+      "bytes": 1163,
+      "sha256": "1e733f20fa3b104129a3dc64d22b970b9d7d88123ff3cd5703190aeda7fc1522"
+    },
+    "direct-submit.record.json": {
+      "bytes": 6793,
+      "sha256": "8a4d06cc53989b33de5b85382150341085adb605105fa43666a67c8af36a4ffa"
+    },
+    "direct-submit.stderr": {
+      "bytes": 1009,
+      "sha256": "61b26bc2d7a846b352dfa62436552baaa5ec97fe70ade9062ce138c49d60923a"
+    },
+    "direct-submit.stdout": {
+      "bytes": 1163,
+      "sha256": "10f407a4e46c6e7d26c502105863bab46ca4ebb79b84f3ec9cf1abc718c0b126"
+    },
+    "k64-candidate.record.json": {
+      "bytes": 6955,
+      "sha256": "af35cb21128e9b5ecd190e0f36b062374b3b8125b43ca40eacf3843551ca3d2e"
+    },
+    "k64-candidate.stderr": {
+      "bytes": 1008,
+      "sha256": "5addf0e7f529f9f99dea0b22dab51307d562d32889d1899e25d55d0bcb00642d"
+    },
+    "k64-candidate.stdout": {
+      "bytes": 1163,
+      "sha256": "85125dba0e49f626eec6b9a42686bef803660073a1897c035abda25fd114e973"
+    },
+    "m16-qo-group.record.json": {
+      "bytes": 6958,
+      "sha256": "4e0e9f88bcca28cf48e5c2c588fa29ecda39fd1c6bf095fffc9f0155b30c0d5f"
+    },
+    "m16-qo-group.stderr": {
+      "bytes": 1010,
+      "sha256": "7a8eb892036de5150fe8c3d48981133044184ae23cecf2ebd3e5c24e64fc128a"
+    },
+    "m16-qo-group.stdout": {
+      "bytes": 1163,
+      "sha256": "eabff64ff4d2eedcfd9e079872c95d0949aefdae0b3008dc93554766b335d1c6"
+    },
+    "m8-mtile.record.json": {
+      "bytes": 7068,
+      "sha256": "60de5d28e2de94659b718267c19e2330b127c999d478bc8f3bdde90c912b5ef6"
+    },
+    "m8-mtile.stderr": {
+      "bytes": 1008,
+      "sha256": "914ace735c6b6d578eec48fa1fa0c135d47b7a9df3d73919d1d0a4a7d965b91e"
+    },
+    "m8-mtile.stdout": {
+      "bytes": 1163,
+      "sha256": "073d489f68ccdb24f94ef1a45f5d4fd59d8e94f97cc87e2ec1fcdd55a2acdf0c"
+    },
+    "scheduler-cpu-qo.record.json": {
+      "bytes": 6959,
+      "sha256": "af7c7b7b84162c0afb6d1095732eed952a4dbd5b68c1261341ec739efae24c5f"
+    },
+    "scheduler-cpu-qo.stderr": {
+      "bytes": 1008,
+      "sha256": "62af3e767276de81912bc9beb8114dc5df16080579ee5473e2ce8af3148716e4"
+    },
+    "scheduler-cpu-qo.stdout": {
+      "bytes": 1163,
+      "sha256": "44985a3203cc6c12aab4b1da0047bc67db8d242f06584e289794524a0ede099b"
+    },
+    "scheduler-ffn-only.record.json": {
+      "bytes": 6970,
+      "sha256": "e5b622868a7a62d81b4a0bff3682d78226c0ed7357328d8201c581d4b8f58ac3"
+    },
+    "scheduler-ffn-only.stderr": {
+      "bytes": 1008,
+      "sha256": "b279c4556d69c4ce9cc6e286be2aee3a29548cc64645cf0ffa05b84460f42e4f"
+    },
+    "scheduler-ffn-only.stdout": {
+      "bytes": 1163,
+      "sha256": "42dad8bd069e0f07a8c66b1a56a955082f13252b718cf1c63baedfa2a06245f6"
+    }
+  }
+}
