@@ -198,13 +198,20 @@
   },
   "quality_gate": {
     "cpu_npu_exact_match": false,
-    "reference": "stock isolated Ollama CPU response"
+    "reference": "stock isolated Ollama CPU response",
+    "status": "failed",
+    "cpu_reference_response": "Yes, the French capital has a rich",
+    "npu_response": "Yes, the French capital is home to"
   },
   "npu_trace": {
     "w8a8_m1_ops": 0,
     "rocknpu_host_lines": 4,
     "cpu_repack_lines": 2,
-    "log_sha256": "fca0f5ac6de0394cb42b0037ac96029084866273cc720926fbfe5692db1e3c4e"
+    "log_sha256": "fca0f5ac6de0394cb42b0037ac96029084866273cc720926fbfe5692db1e3c4e",
+    "trace_enabled_during_ab": false,
+    "native_trace_evidence": "raw/ollama-native-trace-evidence-o16.json",
+    "native_trace_lines": 934,
+    "native_w8a8_m1_lines": 355
   },
   "frequency_after": {
     "/sys/class/devfreq/fdab0000.npu/cur_freq": "700000000",
