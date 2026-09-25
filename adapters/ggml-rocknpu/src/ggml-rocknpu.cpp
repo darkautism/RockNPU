@@ -411,6 +411,19 @@ bool rocknpu_mul_mat_supported(const ggml_tensor * op) {
             return rocknpu_env_enabled("ROCKNPU_NPU_OUTPUT_HEAD") &&
                 k > 0 && k % 512 == 0 && n % 32 == 0 && n <= 32768;
         }
+        if (rocknpu_env_enabled("ROCKNPU_SCHED_CPU_QO") && k == 2048 && n == 2048) {
+            return false;
+        }
+        if (rocknpu_env_enabled("ROCKNPU_SCHED_CPU_KV") && k == 2048 && n == 256) {
+            return false;
+        }
+        if (rocknpu_env_enabled("ROCKNPU_SCHED_CPU_FFN") &&
+            ((k == 2048 && n == 5632) || (k == 5632 && n == 2048))) {
+            return false;
+        }
+        if (rocknpu_env_enabled("ROCKNPU_SCHED_CPU_DOWN") && k == 5632 && n == 2048) {
+            return false;
+        }
         return quantized && k > 0 && n > 0 && k % 512 == 0 && n % 32 == 0 && n <= 8192;
     }
     if (quantized && (m == 4 || m == 8 || m == 12)) {
