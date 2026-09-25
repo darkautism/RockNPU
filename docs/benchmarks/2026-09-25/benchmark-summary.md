@@ -64,3 +64,7 @@ The committed raw artifacts now include:
 The Ollama full-decode quality gate is **failed**: NPU continuation is not identical to the CPU reference (`Yes, the French capital is home to` vs `Yes, the French capital has a rich`). The NPU-decode path is therefore not promoted. The raw evidence is retained rather than rewritten as a pass.
 
 Raw llama.cpp structured artifacts and Ollama service logs are versioned under `docs/benchmarks/2026-09-25/raw/` (`llama-cpu-npu-*-summary/results/metadata.json`, `ollama-npu-*.log`).
+
+## Native dispatch trace evidence
+
+The independent Ollama native-trace probes are versioned as `raw/ollama-native-trace-o8.log` / `raw/ollama-native-trace-evidence-o8.json` and the corresponding o16 files. Each probe records 934 `ROCKNPU GGML TRACE` lines, 355 non-zero `path=w8a8_m1` dispatches, and 4 `ROCKNPU_HOST` markers. The probe is an integration/dispatch check only; the A/B throughput and full-generation quality gates remain separate and failed.
