@@ -1,0 +1,19 @@
+{
+  "HOME": "/home/kautism",
+  "INVOCATION_ID": "b595e85131df4012a290bbc78392c07a",
+  "JOURNAL_STREAM": "9:92859",
+  "LANG": "en_US.UTF-8",
+  "LANGUAGE": "en_US.UTF-8",
+  "LC_MESSAGES": "en_US.UTF-8",
+  "LOGNAME": "kautism",
+  "MEMORY_PRESSURE_WATCH": "/sys/fs/cgroup/system.slice/pc.service/memory.pressure",
+  "MEMORY_PRESSURE_WRITE": "c29tZSAyMDAwMDAgMjAwMDAwMAA=",
+  "OLDPWD": "/build",
+  "PATH": "/home/kautism/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games",
+  "PWD": "/build/rocknpu",
+  "SHELL": "/usr/bin/bash",
+  "SHLVL": "0",
+  "SYSTEMD_EXEC_PID": "58788",
+  "USER": "kautism",
+  "_": "/usr/bin/python3"
+}
