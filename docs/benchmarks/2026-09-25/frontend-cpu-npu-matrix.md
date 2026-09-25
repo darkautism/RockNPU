@@ -39,8 +39,8 @@ repository gains a complete request-level benchmark for them.
 
 | Frontend | Request path | CPU baseline | RockNPU path | Required quality evidence | Status |
 |---|---|---|---|---|---|
-| stock llama.cpp | `llama-bench`, `llama-server`, `llama-cli` | `-dev none`, no RockNPU plugin | `-dev ROCKNPU0`, W8 sidecar, resident decode | deterministic continuation plus int32/model oracle | formal three-block A/B in progress |
-| stock Ollama | `/api/generate` | stock runner, CPU-only, no RockNPU plugin | stock runner + `GGML_BACKEND_PATH` RockNPU plugin and `-dev ROCKNPU0` equivalence | deterministic response compared with CPU response and model oracle | stock 0.34.4 isolated install in progress on both boards |
+| stock llama.cpp | `llama-bench`, `llama-server`, `llama-cli` | `-dev none`, no RockNPU plugin | `-dev ROCKNPU0`, W8 sidecar, resident decode | deterministic continuation plus int32/model oracle | three-block A/B completed; throughput gate failed |
+| stock Ollama | `/api/generate` | stock runner, CPU-only, no RockNPU plugin | stock runner + `GGML_BACKEND_PATH` RockNPU plugin and `-dev ROCKNPU0` equivalence | deterministic response compared with CPU response and model oracle | stock 0.34.4 isolated install and three-block evidence completed; quality/throughput gates failed |
 
 ## Backend gates
 
@@ -73,7 +73,11 @@ Each result directory contains:
 Canonical llama.cpp evidence directories:
 
 - `artifacts/bench-700-cpu-npu-formal-o8/`
+- `docs/benchmarks/2026-09-25/raw/ollama-cpu-npu-o8.json`
+- `docs/benchmarks/2026-09-25/raw/profile-o8.log`
 - `artifacts/bench-700-cpu-npu-formal-o16/`
+- `docs/benchmarks/2026-09-25/raw/ollama-cpu-npu-o16.json`
+- `docs/benchmarks/2026-09-25/raw/profile-o16.log`
 
 ## Boundary
 

@@ -1,0 +1,224 @@
+{
+  "board": "o8",
+  "workload": {
+    "prompt": "Paris",
+    "temperature": 0,
+    "num_predict": 8,
+    "num_ctx": 2048,
+    "num_thread": 4
+  },
+  "model_sha256": "5c66751b61537f9e55177b1b67e06af88e0e2df88f86de4909f5bf87fb1ae583",
+  "ollama_sha256": "7dd29a8dce3a8371f53429ee9abcdc66033a861ff0b8a8f5c09fbac68e4d431e",
+  "plugin_sha256": "00f32e4ebe6d93d158cc32aa68cd5e31445b3c85e76b39116be634394f561669",
+  "commands": {
+    "npu": "PORT=11440 isolated stock Ollama 0.34.4 + ROC KNPU prefill-cache route",
+    "cpu": "PORT=11441 isolated stock Ollama 0.34.4, OLLAMA_NUM_GPU=0, device none"
+  },
+  "frequency_before": {
+    "/sys/class/devfreq/fdab0000.npu/cur_freq": "700000000",
+    "/sys/class/devfreq/fdab0000.npu/target_freq": "700000000",
+    "/sys/class/devfreq/fb000000.gpu/cur_freq": "1000000000",
+    "/sys/devices/system/cpu/cpufreq/policy6/scaling_governor": "performance",
+    "/sys/devices/system/cpu/cpufreq/policy4/scaling_governor": "performance",
+    "/sys/devices/system/cpu/cpufreq/policy0/scaling_governor": "performance",
+    "/sys/class/thermal/thermal_zone2/temp": "46230",
+    "/sys/class/thermal/thermal_zone0/temp": "46230",
+    "/sys/class/thermal/thermal_zone5/temp": "45307",
+    "/sys/class/thermal/thermal_zone3/temp": "47153",
+    "/sys/class/thermal/thermal_zone1/temp": "47153",
+    "/sys/class/thermal/thermal_zone6/temp": "46230",
+    "/sys/class/thermal/thermal_zone4/temp": "46230"
+  },
+  "blocks": [
+    {
+      "block": 1,
+      "npu": [
+        {
+          "wall_s": 0.6149449060030747,
+          "load_s": 0.030346852,
+          "eval_s": 0.503862,
+          "tokens": 8,
+          "tok_s": 15.877363246285688,
+          "response": "Yes, the French capital is home to"
+        },
+        {
+          "wall_s": 0.5743630510041839,
+          "load_s": 0.029019206,
+          "eval_s": 0.469518,
+          "tokens": 8,
+          "tok_s": 17.038750378047276,
+          "response": "Yes, the French capital is home to"
+        }
+      ],
+      "cpu": [
+        {
+          "wall_s": 0.26583536399994045,
+          "load_s": 0.029352284,
+          "eval_s": 0.201768,
+          "tokens": 8,
+          "tok_s": 39.64949843384481,
+          "response": "Yes, the French capital has a rich"
+        },
+        {
+          "wall_s": 0.2673972139964462,
+          "load_s": 0.030742054,
+          "eval_s": 0.201402,
+          "tokens": 8,
+          "tok_s": 39.72155192103356,
+          "response": "Yes, the French capital has a rich"
+        }
+      ]
+    },
+    {
+      "block": 2,
+      "npu": [
+        {
+          "wall_s": 0.462959527001658,
+          "load_s": 0.028076263,
+          "eval_s": 0.377018,
+          "tokens": 8,
+          "tok_s": 21.2191460354678,
+          "response": "Yes, the French capital is home to"
+        },
+        {
+          "wall_s": 0.5663968849985395,
+          "load_s": 0.030118772,
+          "eval_s": 0.480289,
+          "tokens": 8,
+          "tok_s": 16.656637982548006,
+          "response": "Yes, the French capital is home to"
+        }
+      ],
+      "cpu": [
+        {
+          "wall_s": 0.26604536100057885,
+          "load_s": 0.02921287,
+          "eval_s": 0.201445,
+          "tokens": 8,
+          "tok_s": 39.713073047233735,
+          "response": "Yes, the French capital has a rich"
+        },
+        {
+          "wall_s": 0.2685504460023367,
+          "load_s": 0.027724519,
+          "eval_s": 0.206061,
+          "tokens": 8,
+          "tok_s": 38.823455190453316,
+          "response": "Yes, the French capital has a rich"
+        }
+      ]
+    },
+    {
+      "block": 3,
+      "npu": [
+        {
+          "wall_s": 0.6033732149953721,
+          "load_s": 0.028980415,
+          "eval_s": 0.498073,
+          "tokens": 8,
+          "tok_s": 16.06190257251447,
+          "response": "Yes, the French capital is home to"
+        },
+        {
+          "wall_s": 0.5994217780025792,
+          "load_s": 0.028414007,
+          "eval_s": 0.496259,
+          "tokens": 8,
+          "tok_s": 16.120614437219274,
+          "response": "Yes, the French capital is home to"
+        }
+      ],
+      "cpu": [
+        {
+          "wall_s": 0.24805127100262325,
+          "load_s": 0.011085782,
+          "eval_s": 0.201547,
+          "tokens": 8,
+          "tok_s": 39.69297483961557,
+          "response": "Yes, the French capital has a rich"
+        },
+        {
+          "wall_s": 0.26495308699668385,
+          "load_s": 0.028424799,
+          "eval_s": 0.20137,
+          "tokens": 8,
+          "tok_s": 39.727864130704674,
+          "response": "Yes, the French capital has a rich"
+        }
+      ]
+    }
+  ],
+  "ps": {
+    "npu": {
+      "models": [
+        {
+          "name": "rocknpu-tinyllama:latest",
+          "model": "rocknpu-tinyllama:latest",
+          "size": 873788864,
+          "digest": "0f36dceea0f4e2e6dcae4e9b2891887af5da7740f00840907b596f3dd6666640",
+          "details": {
+            "parent_model": "",
+            "format": "gguf",
+            "family": "llama",
+            "families": [
+              "llama"
+            ],
+            "parameter_size": "1.1B",
+            "quantization_level": "Q4_K_M"
+          },
+          "expires_at": "2026-09-25T16:42:51.968540477+08:00",
+          "size_vram": 782793440,
+          "context_length": 2048
+        }
+      ]
+    },
+    "cpu": {
+      "models": [
+        {
+          "name": "rocknpu-tinyllama:latest",
+          "model": "rocknpu-tinyllama:latest",
+          "size": 766834112,
+          "digest": "0f36dceea0f4e2e6dcae4e9b2891887af5da7740f00840907b596f3dd6666640",
+          "details": {
+            "parent_model": "",
+            "format": "gguf",
+            "family": "llama",
+            "families": [
+              "llama"
+            ],
+            "parameter_size": "1.1B",
+            "quantization_level": "Q4_K_M"
+          },
+          "expires_at": "2026-09-25T16:42:51.36896091+08:00",
+          "size_vram": 0,
+          "context_length": 2048
+        }
+      ]
+    }
+  },
+  "quality_gate": {
+    "cpu_npu_exact_match": false,
+    "reference": "stock isolated Ollama CPU response"
+  },
+  "npu_trace": {
+    "w8a8_m1_ops": 0,
+    "rocknpu_host_lines": 4,
+    "cpu_repack_lines": 2,
+    "log_sha256": "53532ec9f5e771cd92f90ff23494933c076c13339c82a96cb720917105780e2b"
+  },
+  "frequency_after": {
+    "/sys/class/devfreq/fdab0000.npu/cur_freq": "700000000",
+    "/sys/class/devfreq/fdab0000.npu/target_freq": "700000000",
+    "/sys/class/devfreq/fb000000.gpu/cur_freq": "1000000000",
+    "/sys/devices/system/cpu/cpufreq/policy6/scaling_governor": "performance",
+    "/sys/devices/system/cpu/cpufreq/policy4/scaling_governor": "performance",
+    "/sys/devices/system/cpu/cpufreq/policy0/scaling_governor": "performance",
+    "/sys/class/thermal/thermal_zone2/temp": "46230",
+    "/sys/class/thermal/thermal_zone0/temp": "46230",
+    "/sys/class/thermal/thermal_zone5/temp": "45307",
+    "/sys/class/thermal/thermal_zone3/temp": "47153",
+    "/sys/class/thermal/thermal_zone1/temp": "47153",
+    "/sys/class/thermal/thermal_zone6/temp": "46230",
+    "/sys/class/thermal/thermal_zone4/temp": "46230"
+  }
+}

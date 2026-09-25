@@ -51,3 +51,14 @@ edited.
 Correctness and integration gates pass. The required NPU-over-CPU performance
 objective is not met on either board; this document records the blocker rather
 than claiming completion.
+
+
+## Auditor evidence addendum
+
+The committed raw artifacts now include:
+
+- `raw/ollama-cpu-npu-o8.json` and `raw/ollama-cpu-npu-o16.json`: three interleaved Ollama CPU/NPU blocks, model/plugin hashes, frequency and thermal snapshots, `/api/ps`, responses, timings, and trace-log hashes.
+- `raw/profile-o8.log` and `raw/profile-o16.log`: original `ROCKNPU M1 PROFILE` output.
+- `raw/ollama-prefill-cpu-decode-o8.json` and `raw/ollama-prefill-cpu-decode-o16.json`: explicitly labelled NPU-prefill/CPU-decode fallback route; it is not a decode promotion.
+
+The Ollama full-decode quality gate is **failed**: NPU continuation is not identical to the CPU reference (`Yes, the French capital is home to` vs `Yes, the French capital has a rich`). The NPU-decode path is therefore not promoted. The raw evidence is retained rather than rewritten as a pass.
