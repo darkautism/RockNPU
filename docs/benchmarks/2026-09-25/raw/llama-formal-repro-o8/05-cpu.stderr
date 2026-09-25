@@ -1,0 +1,1 @@
+load_backend: loaded CPU backend from /build/llama.cpp-reference/build-native-norepack-rocknpu/bin/libggml-cpu.so

@@ -1,0 +1,12 @@
+{
+  "keep_alive": "30m",
+  "model": "rocknpu-tinyllama",
+  "options": {
+    "num_ctx": 2048,
+    "num_predict": 8,
+    "num_thread": 4,
+    "temperature": 0
+  },
+  "prompt": "Paris",
+  "stream": false
+}

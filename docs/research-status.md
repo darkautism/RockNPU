@@ -313,10 +313,11 @@ Only a cold-start project. It is not a steady-state decode priority. Any format 
 - Successful experiment: review, merge, delete the research branch/worktree.
 - Do not use branches as research memory.
 
-## 2026-09-25 700 MHz NPU/CPU whole-model gate
+## 2026-09-25 700 MHz NPU/CPU whole-model gate — reproducible evidence refresh
 
-- Both boards ran the native no-repack llama.cpp build with CPU policies 0/4/6 in performance mode and the README-pinned external Rocket DVFS module at 700 MHz.
-- The RockNPU adapter now exposes an independent `ROCKNPU_HOST` host buffer identity. Ollama no longer silently reports a zero-dispatch `CPU_REPACK` path; with the documented prefill-cache route, Ollama logs per-op `path=w8a8_m1`; the independent trace probe matches the CPU deterministic 8-token response, while the formal three-block A/B quality gate is recorded as failed (`home to` vs `has a rich`).
-- Three-block 32-token llama.cpp A/B: o8 NPU/CPU approximately 0.50x; o16 approximately 0.49x. The 8-request M8 diagnostic was approximately 1.003x, below the 5% promotion threshold; the 16-request NPU diagnostic timed out and is not valid evidence.
-- Direct-submit, scratch, scheduler-routing, K-split, M8 and concurrency variants did not produce a stable 5% whole-model NPU win. The observed blocker is NPU execute/wait latency, not host quantization or missing frontend routing.
-- Full raw values and commands are in `docs/benchmarks/2026-09-25/benchmark-summary.md`.
+- The formal llama.cpp A/B was rerun with a hard 700 MHz NPU frequency gate. Both boards record `cur_freq=target_freq=700000000` before and after every process, with complete commands, environments, stdout/stderr and 30,492 native W8 dispatches per board.
+- Formal NPU/CPU centers are 16.426/32.863 tok/s on o8 and 16.713/34.603 tok/s on o16 (NPU/CPU 0.4998 and 0.4830). The independent llama-server quality oracle passes on both boards, but the throughput gate fails.
+- The fair Ollama A/B was rerun with three interleaved blocks, warmups, fresh CPU oracle, exact service environments, raw HTTP bodies, logs, `/api/ps`, and 700 MHz snapshots. NPU continuation differs from the CPU oracle (`home to` vs `has a rich`), so the Ollama quality gate fails. A same-configuration per-op trace run records 2,467 `path=w8a8_m1` lines per board and is retained as dispatch evidence, not as the fair timing result.
+- Candidate and concurrency raw artifacts are versioned for both boards. Direct/scratch/scheduler/K64/M-tile/grouped-QO candidates and c8/c16 diagnostics do not produce a joint quality-plus-5%-throughput promotion candidate.
+- M1 profiles at 700 MHz attribute the dominant cost to execute/wait (o8 K2048 execute 57.397 ms, K5632 93.903 ms; o16 53.950/89.702 ms). The blocker is recorded as NPU execute/wall latency, not missing frontend routing.
+- Full raw evidence and hashes are indexed by `docs/benchmarks/2026-09-25/raw/evidence-index-o8.json` and `evidence-index-o16.json`. No promotion is claimed.

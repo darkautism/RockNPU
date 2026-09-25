@@ -79,9 +79,10 @@ def main():
             for req in block.get("requests", []):
                 r = req.get("record", {})
                 all_snapshots += [r.get("before", {}), r.get("after", {})]
+    output = args.output.resolve()
     files = {}
     for path in sorted(root.rglob("*")):
-        if path.is_file() and path != args.output:
+        if path.is_file() and path.resolve() != output:
             files[str(path.relative_to(root))] = {"sha256": digest(path), "bytes": path.stat().st_size}
     try:
         source_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()

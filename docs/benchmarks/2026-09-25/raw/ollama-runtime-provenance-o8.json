@@ -1,0 +1,9 @@
+{
+  "board": "o8",
+  "binary_path": "/opt/ollama-0.34.4/bin/ollama",
+  "binary_sha256": "7dd29a8dce3a8371f53429ee9abcdc66033a861ff0b8a8f5c09fbac68e4d431e",
+  "server_reported_version": "0.34.4",
+  "server_log": "docs/benchmarks/2026-09-25/raw/ollama-formal-repro-o8/npu-server.stderr.log",
+  "server_log_sha256": "0db451e80cb21c5d880585ce4128f329cb6fcdd003838c999c358936f075be8c",
+  "client_version_source": "server log Listening line; isolated binary hash above"
+}

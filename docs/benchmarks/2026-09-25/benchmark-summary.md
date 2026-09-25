@@ -1,68 +1,143 @@
 # 2026-09-25 NPU/CPU benchmark summary
 
-## Environment
+## Authoritative evidence
+
+The version-controlled evidence package is under `docs/benchmarks/2026-09-25/raw/`.
+The machine-readable entry points are `raw/evidence-index-o8.json` and
+`raw/evidence-index-o16.json`. They contain the complete file/hash manifest,
+fixed conditions, quality-oracle results, dispatch checks, profile records,
+candidate matrix, and concurrency diagnostics. Older `ollama-cpu-npu-o*.json`
+files are retained as historical evidence and are not the authoritative
+reproducibility package.
+
+## Fixed conditions
 
 - Boards: o8 and o16, RK3588.
-- CPU: native A76 build, policies 0/4/6 `performance`, four A76 workers.
-- NPU: README-pinned external DVFS module commit `ed52a89afa8e68fedf636c8e891bd8fc47e82d26`, verified at 700 MHz.
-- Model: TinyLlama-1.1B-Chat-v1.0-Q4_K_M, SHA-256 `5c66751b61537f9e55177b1b67e06af88e0e2df88f86de4909f5bf87fb1ae583`.
-- Workload: fixed `Paris` prompt, temperature 0, 8 or 32 generated tokens, warm resident state, same native no-repack llama binary.
+- Model: TinyLlama-1.1B-Chat-v1.0-Q4_K_M.
+- Model SHA-256: `5c66751b61537f9e55177b1b67e06af88e0e2df88f86de4909f5bf87fb1ae583`.
+- Sidecar: `native-w8-gguf/manifest.json`, source hash matches the model.
+- NPU: README-pinned Rocket DVFS module commit
+  `ed52a89afa8e68fedf636c8e891bd8fc47e82d26`; every formal run requires and
+  records `fdab0000.npu/cur_freq=700000000` and `target_freq=700000000`.
+- CPU: policies 0/4/6 in `performance`, with recorded current frequencies
+  1.8/2.4/2.4 GHz; four A76 workers; both CPU and NPU runs use the same
+  llama.cpp binary and model.
+- Ollama: isolated binary `/opt/ollama-0.34.4/bin/ollama`, SHA-256
+  `7dd29a8dce3a8371f53429ee9abcdc66033a861ff0b8a8f5c09fbac68e4d431e`; server logs
+  report `Listening ... version 0.34.4`. The complete server environment,
+  command, model/plugin hashes, and log hashes are in each run manifest.
 
-## Correctness and integration
+## Reproduction entry points
 
-- llama.cpp no-repack NPU smoke on both boards: backend/device `ROCKNPU0`, native W8 dispatch 1386 per smoke, model hash and sidecar v2 hash matched.
-- Ollama 0.34.4 isolated stock runtime on both boards: `ROCKNPU0` discovered, `ROCKNPU_HOST` used for KV/compute and, with the documented prefill-cache route, 549.40 MiB of model weights. The independent native-trace probe recorded 934 trace lines and 355 `path=w8a8_m1` dispatches on each board. The formal A/B service intentionally did not enable per-op tracing; its raw JSON points to the separate native-trace evidence.
-- The independent Ollama native-trace probe matched the CPU reference (`Yes, the French capital has a rich`). In the formal three-block A/B, however, NPU produced `Yes, the French capital is home to` while CPU produced `Yes, the French capital has a rich`; the formal quality gate is failed.
-- The host-buffer adapter change is a correctness/routing fix: it gives RockNPU an independent host buffer identity and prevents the frontend from silently using `CPU_REPACK` as a false NPU path.
+The exact argv, environment, per-process frequency snapshots, stdout/stderr,
+HTTP request/response bodies, `/api/ps`, and artifact manifests are retained
+in the raw directories. The reusable entry points are:
 
-## Three-block hot A/B
+```text
+python3 scripts/bench_llama_cpu_npu.py ... --expected-npu-freq 700000000
+python3 scripts/bench_llama_quality.py ...
+python3 scripts/bench_ollama_cpu_npu.py ... --blocks 3 --warmups 1
+python3 scripts/bench_ollama_cpu_npu.py ... --blocks 3 --warmups 1 --trace
+python3 scripts/bench_candidate_matrix.py ... --expected-npu-freq 700000000
+python3 scripts/bench_ollama_concurrency.py ... --concurrency 8 16
+python3 scripts/build_benchmark_evidence_index.py ...
+```
 
-| Board/path | CPU tok/s center | NPU tok/s center | NPU/CPU | Gate |
-|---|---:|---:|---:|---|
-| llama.cpp o8, 32 tokens | 32.68 | 16.35 | 0.50x | FAIL |
-| llama.cpp o16, 32 tokens | 33.96 | 16.59 | 0.49x | FAIL |
-| llama.cpp c8 diagnostic, 8 requests | 32.32 | 32.46 | 1.003x | FAIL (<5%) |
-| Ollama c1 hot diagnostic, 8 tokens | 40.1 | 19.1 | 0.48x | FAIL |
-| Ollama c16 diagnostic (not a required gate point) | not admitted | not admitted | — | INVALID/timeout; not used for completion |
+The formal llama.cpp A/B is a 32-token, three-block ABBA-style run with four
+processes per block. The Ollama fair-performance A/B is three interleaved
+blocks with two requests per backend, one warmup per backend, and a fresh CPU
+oracle service. The separate `--trace` Ollama run has identical workload and
+configuration with per-op tracing enabled; it verifies genuine native
+dispatch and is not used as the fair timing result.
 
-Raw A/B files:
+## Frontend results
 
-- `docs/benchmarks/2026-09-25/raw/llama-cpu-npu-o8/` and `raw/llama-cpu-npu-o8-{summary,results,metadata}.json`
-- `docs/benchmarks/2026-09-25/raw/llama-cpu-npu-o16/` and `raw/llama-cpu-npu-o16-{summary,results,metadata}.json`
-- The c8/c16 diagnostics were exploratory; c16 timed out and neither result is used as a completion result or promotion candidate.
+| Frontend/board | CPU tok/s | NPU tok/s | NPU/CPU | Quality/oracle | Dispatch/performance gate |
+|---|---:|---:|---:|---|---|
+| llama.cpp o8, 32 tokens | 32.863 | 16.426 | 0.4998 | PASS: 3 blocks × 6 responses match CPU oracle | 30,492 native W8 dispatches; performance FAIL |
+| llama.cpp o16, 32 tokens | 34.603 | 16.713 | 0.4830 | PASS: 3 blocks × 6 responses match CPU oracle | 30,492 native W8 dispatches; performance FAIL |
+| Ollama o8, 8 tokens, fair run | 40.141 | 16.589 | 0.4133 | FAIL: NPU `home to` vs oracle `has a rich` | trace run has 2,467 `path=w8a8_m1` lines; performance FAIL |
+| Ollama o16, 8 tokens, fair run | 40.800 | 15.585 | 0.3820 | FAIL: NPU `home to` vs oracle `has a rich` | trace run has 2,467 `path=w8a8_m1` lines; performance FAIL |
 
-## Profiling conclusion
+The llama.cpp quality artifact is generated by the unmodified
+`llama-server` frontend using the same model, fixed prompt, temperature-zero
+request, and an independent fresh CPU server. The Ollama fair A/B also stores
+an independent fresh CPU service response as its oracle. No quality result is
+being silently upgraded from failed to passed.
 
-At 700 MHz, the M1 profile attributes most time to NPU execute/wait:
-K2048/N2048 about 0.28 ms, K5632/N2048 about 0.53 ms, and the FFN pair
-K2048/N11264 about 0.91 ms. Host quantization/rescale is not the dominant
-cost. Direct-submit, scratch, scheduler-routing, K-split, M8 and concurrency
-variants did not produce a stable 5% whole-model NPU win.
+## Raw artifact map
 
-## Boundary check
+For each board, the authoritative directories are:
 
-Only RockNPU userspace middleware/adapter, benchmark tooling and docs were
-changed. No frontend source and no kernel-driver source were modified. The
-700 MHz module is an external environment dependency and its source was not
-edited.
+- `raw/llama-formal-repro-<board>/`: 12 formal llama.cpp CPU/NPU runs,
+  environment/run manifests, 700 MHz gates, results and summaries.
+- `raw/llama-quality-repro-<board>/`: llama-server CPU/NPU/oracle quality
+  requests, raw responses, complete server logs, and native trace counts.
+- `raw/ollama-formal-repro-<board>/`: fair no-per-op-trace CPU/NPU A/B,
+  warmups, oracle, service logs, frequency snapshots and HTTP raw files.
+- `raw/ollama-trace-repro-<board>/`: same Ollama A/B with per-op trace,
+  proving nonzero native W8 dispatch in every block configuration.
+- `raw/llama-profile-repro-<board>/`: M1 profile with exact command/env and
+  frequency gate.
+- `raw/candidate-matrix-<board>/`: CPU reference and eight adapter candidate
+  variants, including direct, scratch, scheduler, K64, M-tile and grouped-QO
+  flags; every stdout/stderr/JSON/frequency record is retained.
+- `raw/ollama-concurrency-<board>/`: c8 and c16 requests with fresh service,
+  explicit `OLLAMA_NUM_PARALLEL`, queue settings, warmup, raw responses/logs,
+  and frequency snapshots.
+- `raw/ollama-runtime-provenance-<board>.json` and `raw/evidence-index-<board>.json`.
 
-## Status
+## Candidate and concurrency evidence
 
-Integration and dispatch evidence is complete. The formal Ollama A/B quality gate and all required NPU-over-CPU performance gates failed; no promotion is claimed. This document records the blocker rather than claiming completion.
+The fixed-condition candidate matrix completed on both boards. NPU average
+throughput values were:
 
+| Candidate | o8 tok/s | o16 tok/s |
+|---|---:|---:|
+| CPU reference | 33.104 | 35.003 |
+| baseline NPU | 9.022 | 10.902 |
+| direct submit | 11.794 | 12.057 |
+| direct + scratch | 13.222 | 13.369 |
+| scheduler CPU-QO | 12.966 | 13.556 |
+| scheduler FFN-only | 13.111 | 13.281 |
+| K64 candidate | 12.721 | 13.461 |
+| M8/M-tile candidate | 12.953 | 13.207 |
+| M16 grouped-QO candidate | 12.954 | 13.295 |
 
-## Auditor evidence addendum
+All candidate runs retained their raw result and completed without a hidden
+frequency change; none is within 5% of the corresponding CPU reference.
+The Ollama c8/c16 diagnostic completed all 8/8 and 16/16 requests on both
+boards (o8 wall time 4.506 s / 14.492 s; o16 4.348 s / 12.759 s). It is a
+concurrency diagnostic, not a promotion result.
 
-The committed raw artifacts now include:
+## Profile and blocker
 
-- `raw/ollama-cpu-npu-o8.json` and `raw/ollama-cpu-npu-o16.json`: three interleaved Ollama CPU/NPU blocks, model/plugin hashes, frequency and thermal snapshots, `/api/ps`, responses, timings, and trace-log hashes.
-- `raw/profile-o8.log` and `raw/profile-o16.log`: original `ROCKNPU M1 PROFILE` output.
-- `raw/ollama-prefill-cpu-decode-o8.json` and `raw/ollama-prefill-cpu-decode-o16.json`: explicitly labelled NPU-prefill/CPU-decode fallback route; it is not a decode promotion.
+The M1 profile shows the dominant cost remains NPU execute/wait rather than
+host quantization. Representative `ROCKNPU M1 PROFILE` records are:
 
-The Ollama full-decode quality gate is **failed**: NPU continuation is not identical to the CPU reference (`Yes, the French capital is home to` vs `Yes, the French capital has a rich`). The NPU-decode path is therefore not promoted. The raw evidence is retained rather than rewritten as a pass.
+- o8: K2048/N2048 execute wall 57.397 ms, worker wait 48.742 ms;
+  K5632/N2048 execute wall 93.903 ms, worker wait 85.778 ms.
+- o16: K2048/N2048 execute wall 53.950 ms, worker wait 45.645 ms;
+  K5632/N2048 execute wall 89.702 ms, worker wait 81.131 ms.
 
-Raw llama.cpp structured artifacts, per-run stdout/stderr, Ollama service logs, and native trace logs are versioned under `docs/benchmarks/2026-09-25/raw/` (`llama-cpu-npu-*-summary/results/metadata.json`, `llama-cpu-npu-o8/`, `llama-cpu-npu-o16/`, `ollama-npu-*.log`, `ollama-native-trace-*.log`).
+The same 700 MHz profile command, environment, per-run frequency snapshots,
+and raw stderr are in `raw/llama-profile-repro-<board>/`. The evidence supports
+an execute/wall and worker-wait blocker at 700 MHz. It does not support a
+claim that NPU acceleration is promoted.
 
-## Native dispatch trace evidence
+## Promotion decision
 
-The independent Ollama native-trace probes are versioned as `raw/ollama-native-trace-o8.log` / `raw/ollama-native-trace-evidence-o8.json` and the corresponding o16 files. Each probe records 934 `ROCKNPU GGML TRACE` lines, 355 non-zero `path=w8a8_m1` dispatches, and 4 `ROCKNPU_HOST` markers. The probe is an integration/dispatch check only; the A/B throughput and full-generation quality gates remain separate and failed.
+No candidate satisfies the joint gate: dual-board hardware oracle, whole-model
+A/B, non-regressing generation quality, and at least 5% higher NPU throughput.
+The engineering evidence package is complete and reproducible, but the
+performance promotion is **not** achieved. This document intentionally makes
+no claim that NPU is faster than CPU.
+
+## Boundary and regression
+
+Only RockNPU userspace middleware/adapter glue, benchmark scripts, generated
+raw evidence, and documentation were changed. No llama.cpp/Ollama/Candle
+frontend source and no kernel driver or kernel tree was modified. The existing
+regcmd, matmul, C API, adapter build, Python syntax, and `git diff --check`
+regressions were run during the evidence refresh; final tracked-tree checks
+are recorded by the repository state.
