@@ -77,6 +77,11 @@ def main() -> None:
     ap.add_argument("--gguf-py", type=Path, required=True)
     ap.add_argument("--layers", type=int, default=22)
     ap.add_argument("--chunk-rows", type=int, default=64)
+    ap.add_argument(
+        "--include-output-head",
+        action="store_true",
+        help="also prepare the wide output/vocabulary projection for N-split decode",
+    )
     args = ap.parse_args()
 
     sys.path.insert(0, str(args.gguf_py))
@@ -84,7 +89,7 @@ def main() -> None:
 
     reader = GGUFReader(str(args.gguf), "r")
     by_name = {tensor.name: tensor for tensor in reader.tensors}
-    suffixes = (
+    suffixes = [
         "attn_q.weight",
         "attn_k.weight",
         "attn_v.weight",
@@ -92,7 +97,9 @@ def main() -> None:
         "ffn_gate.weight",
         "ffn_up.weight",
         "ffn_down.weight",
-    )
+    ]
+    if args.include_output_head:
+        suffixes.append("output.weight")
     manifest = {
         "format": "rocknpu-w8-sidecar-v2",
         "source": str(args.gguf),

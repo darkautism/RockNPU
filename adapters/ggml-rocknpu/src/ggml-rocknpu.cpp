@@ -407,6 +407,10 @@ bool rocknpu_mul_mat_supported(const ggml_tensor * op) {
         if (!rocknpu_env_enabled_default("ROCKNPU_DECODE", true)) {
             return false;
         }
+        if (quantized && n > 8192) {
+            return rocknpu_env_enabled("ROCKNPU_NPU_OUTPUT_HEAD") &&
+                k > 0 && k % 512 == 0 && n % 32 == 0 && n <= 32768;
+        }
         return quantized && k > 0 && n > 0 && k % 512 == 0 && n % 32 == 0 && n <= 8192;
     }
     if (quantized && (m == 4 || m == 8 || m == 12)) {
@@ -644,6 +648,43 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
             case GGML_OP_MUL_MAT: {
                 if (!rocknpu_mul_mat_supported(node)) {
                     return GGML_STATUS_FAILED;
+                }
+                if (rocknpu_env_enabled("ROCKNPU_NPU_OUTPUT_HEAD")) {
+                    const ggml_tensor * output_weights = node->src[0];
+                    const ggml_tensor * output_activations = node->src[1];
+                    const size_t output_m = static_cast<size_t>(output_activations->ne[1]);
+                    const size_t output_k = static_cast<size_t>(output_weights->ne[0]);
+                    const size_t output_n = static_cast<size_t>(output_weights->ne[1]);
+                    if (output_m == 1 && output_n > 8192 &&
+                        rocknpu_weight_name_contains(output_weights, "output.weight") &&
+                        (output_weights->type == GGML_TYPE_Q4_K || output_weights->type == GGML_TYPE_Q6_K)) {
+                        rocknpu_w8_tensor * output_w8 = rocknpu_w8_sidecar_get(
+                            context, output_weights->name, output_k, output_n,
+                            static_cast<const uint8_t *>(output_weights->data), ggml_nbytes(output_weights));
+                        if (output_w8 == nullptr) {
+                            return GGML_STATUS_FAILED;
+                        }
+                        const int status = rocknpu_matmul_w8a8_f32_f32_m1_nsplit(
+                            context->runtime,
+                            output_w8->weights.data(), output_w8->scales.data(), output_k,
+                            static_cast<const float *>(output_activations->data),
+                            static_cast<float *>(node->data), output_k, output_n, 8192);
+                        if (status != ROCKNPU_STATUS_OK) {
+                            return GGML_STATUS_FAILED;
+                        }
+                        const size_t chunks = (output_n + 8191) / 8192;
+                        context->w8a8_m1_mul_mat_calls++;
+                        context->native_w8_calls += chunks;
+                        if (output_weights->type == GGML_TYPE_Q4_K) context->q4_k_mul_mat_calls++; else context->q6_k_mul_mat_calls++;
+                        if (rocknpu_trace_enabled()) {
+                            std::fprintf(stderr,
+                                "ROCKNPU GGML TRACE output_head_split name=%s type=%s K=%zu N=%zu chunks=%zu path=w8a8_m1_nsplit\n",
+                                output_weights->name,
+                                output_weights->type == GGML_TYPE_Q4_K ? "q4_K" : "q6_K",
+                                output_k, output_n, chunks);
+                        }
+                        break;
+                    }
                 }
                 if (rocknpu_qkv_triple_enabled()) {
                     const ggml_tensor * q_weights = node->src[0];

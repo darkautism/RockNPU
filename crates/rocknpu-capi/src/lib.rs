@@ -3351,6 +3351,58 @@ pub unsafe extern "C" fn rocknpu_matmul_w8a8_f32_f32_m1(
     })
 }
 
+/// Execute a wide M=1 W8A8 projection as bounded N chunks.
+///
+/// The resident cache and Rocket command path remain unchanged for each
+/// chunk; only the adapter-facing entry point is split. This is used for
+/// vocab/output heads whose N exceeds the native M=1 N limit.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rocknpu_matmul_w8a8_f32_f32_m1_nsplit(
+    context: *mut RockNpuContext,
+    weights_nk_i8: *const i8,
+    weight_scales_n_f32: *const f32,
+    activations_k_f32: *const f32,
+    output_n_f32: *mut f32,
+    k: usize,
+    n: usize,
+    chunk_n: usize,
+) -> i32 {
+    if context.is_null()
+        || weights_nk_i8.is_null()
+        || weight_scales_n_f32.is_null()
+        || activations_k_f32.is_null()
+        || output_n_f32.is_null()
+        || k == 0
+        || n == 0
+        || chunk_n == 0
+        || !chunk_n.is_multiple_of(32)
+        || !n.is_multiple_of(32)
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    let mut offset = 0usize;
+    while offset < n {
+        let current = chunk_n.min(n - offset);
+        let status = unsafe {
+            rocknpu_matmul_w8a8_f32_f32_m1(
+                context,
+                weights_nk_i8.add(offset * k),
+                weight_scales_n_f32.add(offset),
+                activations_k_f32,
+                output_n_f32.add(offset),
+                k,
+                current,
+            )
+        };
+        if status != STATUS_OK {
+            return status;
+        }
+        offset += current;
+    }
+    STATUS_OK
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rocknpu_matmul_w8a8_f32_f32_m16(
     context: *mut RockNpuContext,
