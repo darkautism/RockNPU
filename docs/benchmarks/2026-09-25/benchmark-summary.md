@@ -27,8 +27,8 @@
 
 Raw A/B files:
 
-- `artifacts/bench-700-cpu-npu-final-o8/`
-- `artifacts/bench-700-cpu-npu-final-o16/`
+- `docs/benchmarks/2026-09-25/raw/llama-cpu-npu-o8/` and `raw/llama-cpu-npu-o8-{summary,results,metadata}.json`
+- `docs/benchmarks/2026-09-25/raw/llama-cpu-npu-o16/` and `raw/llama-cpu-npu-o16-{summary,results,metadata}.json`
 - The c8/c16 diagnostics were exploratory; c16 timed out and neither result is used as a completion result or promotion candidate.
 
 ## Profiling conclusion

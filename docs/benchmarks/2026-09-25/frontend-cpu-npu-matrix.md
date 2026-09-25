@@ -72,10 +72,12 @@ Each result directory contains:
 
 Canonical llama.cpp evidence directories:
 
-- `artifacts/bench-700-cpu-npu-formal-o8/`
+- `docs/benchmarks/2026-09-25/raw/llama-cpu-npu-o8/`
+- `docs/benchmarks/2026-09-25/raw/llama-cpu-npu-o8-{summary,results,metadata}.json`
 - `docs/benchmarks/2026-09-25/raw/ollama-cpu-npu-o8.json`
 - `docs/benchmarks/2026-09-25/raw/profile-o8.log`
-- `artifacts/bench-700-cpu-npu-formal-o16/`
+- `docs/benchmarks/2026-09-25/raw/llama-cpu-npu-o16/`
+- `docs/benchmarks/2026-09-25/raw/llama-cpu-npu-o16-{summary,results,metadata}.json`
 - `docs/benchmarks/2026-09-25/raw/ollama-cpu-npu-o16.json`
 - `docs/benchmarks/2026-09-25/raw/profile-o16.log`
 
