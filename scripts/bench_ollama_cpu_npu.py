@@ -238,7 +238,8 @@ def main():
                            "num_ctx": args.num_ctx, "num_thread": args.num_thread}}
     hashes = {"ollama": sha256(args.ollama), "plugin": sha256(args.plugin),
               "model": sha256(args.model_blob)}
-    version = subprocess.run([str(args.ollama), "--version"], capture_output=True, text=True).stdout.strip()
+    version_result = subprocess.run([str(args.ollama), "--version"], capture_output=True, text=True)
+    version = (version_result.stdout + version_result.stderr).strip()
     manifest = {
         "board": args.board, "argv": sys.argv, "binary_version": version, "instrumentation": {"per_op_trace": args.trace},
         "executable_command": [str(args.ollama), "serve"],
