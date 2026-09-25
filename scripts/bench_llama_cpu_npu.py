@@ -59,6 +59,8 @@ def main():
                         help="disable llama-bench warmup so first-use resident-cache setup is timed")
     parser.add_argument("--expected-npu-freq", type=int, default=None,
                         help="require both NPU cur_freq and target_freq to equal this value")
+    parser.add_argument("--profile", action="store_true",
+                        help="enable ROCKNPU_M1_PROFILE for the NPU run")
     args = parser.parse_args()
 
     if platform.machine() not in ("aarch64", "arm64"):
@@ -159,6 +161,8 @@ def main():
         if kind == "npu":
             env["GGML_BACKEND_PATH"] = str(args.plugin)
             env["ROCKNPU_DISPATCH_SUMMARY"] = "1"
+            if args.profile:
+                env["ROCKNPU_M1_PROFILE"] = "1"
             if args.npu_decode == "on":
                 env.update(
                     ROCKNPU_W8_SIDECAR_DIR=str(args.sidecar),
