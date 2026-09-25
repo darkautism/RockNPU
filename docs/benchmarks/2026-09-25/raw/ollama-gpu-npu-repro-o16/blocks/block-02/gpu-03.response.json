@@ -1,0 +1,3 @@
+{
+  "error": "an error was encountered while running the model: error: task id = 0, error: decode() failed: vk::CommandBuffer::end: ErrorOutOfDeviceMemory"
+}

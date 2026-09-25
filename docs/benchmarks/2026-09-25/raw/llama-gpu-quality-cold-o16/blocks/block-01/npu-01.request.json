@@ -1,0 +1,9 @@
+{
+  "cache_prompt": false,
+  "n_predict": 8,
+  "prompt": "Paris",
+  "seed": 1234,
+  "stream": false,
+  "temperature": 0,
+  "top_k": 1
+}

@@ -29,8 +29,8 @@ must not be substituted for a missing GPU backend.
 
 | Frontend | GPU backend/device | NPU backend/device | Model/quant | Workload and timing | Dispatch/quality evidence | Status |
 |---|---|---|---|---|---|---|
-| stock llama.cpp | Vulkan / `Vulkan0`, Mali-G610 | `ROCKNPU0` with W8 sidecar | TinyLlama Q4_K_M; exact SHA above | 0 prompt + 32 decode tokens; 3 ABBA blocks; 4 threads; default llama-bench warmup; model load excluded | `raw/llama-gpu-npu-repro-o8/` and `raw/llama-gpu-npu-repro-o16/`; each NPU run has nonzero `w8a8_m1` dispatch; GPU/NPU quality harness is the next gate | Formal performance baseline complete; quality gate pending |
-| stock Ollama | **Unavailable in the isolated stock runtime**: no `libggml-vulkan.so` and no valid Vulkan device row; see `raw/ollama-gpu-discovery-o8.txt` / `...o16.txt` | `ROCKNPU0` route exists, but formal quality comparison is currently failed | TinyLlama Q4_K_M; exact SHA above | 8-token API diagnostic; no valid same-frontend GPU baseline can be run in this environment | NPU device/dispatch evidence exists, but it cannot be compared to a GPU row until a stock Ollama Vulkan backend is supplied | GPU comparison blocked/unsupported; do not count CPU as GPU |
+| stock llama.cpp | Vulkan / `Vulkan0`, Mali-G610 | `ROCKNPU0` with W8 sidecar | TinyLlama Q4_K_M; exact SHA above | 0 prompt + 32 decode tokens; 3 ABBA blocks; 4 threads; default llama-bench warmup; model load excluded | `raw/llama-gpu-npu-repro-o8/` and `raw/llama-gpu-npu-repro-o16/`; quality PASS in `raw/llama-gpu-quality-warm2-o8/` and `...o16/`; NPU has nonzero `w8a8_m1` dispatch | Formal A/B and quality complete; o16 block variance still blocks promotion |
+| stock Ollama | Vulkan backend is discoverable through external `GGML_BACKEND_PATH`; `raw/ollama-gpu-discovery-*.txt` records the route | `ROCKNPU0` route exists; W8 sidecar | TinyLlama Q4_K_M; exact SHA above | 8-token API; 2 warmups + 3 ABBA blocks in `raw/ollama-gpu-npu-repro-o16-v2/` | GPU requests repeatedly fail with `ErrorOutOfDeviceMemory`; NPU raw retained, but no valid GPU denominator | GPU hot A/B blocked by Vulkan/PanVK resource failure; do not count CPU as GPU |
 
 Candle `RockNpuLinear` and the ONNX importer are adapter/operator slices,
 not complete request-level LLM frontends, and are not rows in this matrix.
@@ -61,7 +61,4 @@ backend row, JSON result, and dispatch summary is versioned in the two raw
 
 ## Current conclusion
 
-The llama.cpp NPU path is a plausible GPU-acceleration candidate, but the
-present evidence is a baseline matrix, not a completed promotion. Ollama has
-no valid GPU denominator in the current stock environment, so its GPU/NPU
-promotion status is explicitly blocked rather than inferred from CPU.
+The llama.cpp NPU path clears the mean 1.05x GPU threshold on both boards and passes the two-warmup GPU/NPU/CPU quality gate, but o16 block variance prevents promotion. Ollama can discover Vulkan0, yet repeated GPU generation fails with `ErrorOutOfDeviceMemory`; its GPU/NPU promotion is explicitly blocked by the GPU backend, not inferred from CPU.
