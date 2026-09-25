@@ -1,0 +1,4 @@
+ggml_vulkan: Found 1 Vulkan devices:
+ggml_vulkan: 0 = Mali-G610 MC4 (panvk) | uma: 1 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 16 | shared memory: 32768 | int dot: 0 | matrix cores: none
+load_backend: loaded Vulkan backend from /build/llama.cpp-reference/build-vulkan-gpu/bin/libggml-vulkan.so
+load_backend: loaded CPU backend from /build/llama.cpp-reference/build-vulkan-gpu/bin/libggml-cpu.so

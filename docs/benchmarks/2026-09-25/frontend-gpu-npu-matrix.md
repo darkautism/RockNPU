@@ -29,7 +29,7 @@ must not be substituted for a missing GPU backend.
 
 | Frontend | GPU backend/device | NPU backend/device | Model/quant | Workload and timing | Dispatch/quality evidence | Status |
 |---|---|---|---|---|---|---|
-| stock llama.cpp | Vulkan / `Vulkan0`, Mali-G610 | `ROCKNPU0` with W8 sidecar | TinyLlama Q4_K_M; exact SHA above | 0 prompt + 32 decode tokens; 3 ABBA blocks; 4 threads; default llama-bench warmup; model load excluded | `raw/llama-gpu-npu-repro-o8/` and `raw/llama-gpu-npu-repro-o16/`; quality PASS in `raw/llama-gpu-quality-warm2-o8/` and `...o16/`; NPU has nonzero `w8a8_m1` dispatch | Formal A/B and quality complete; o16 block variance still blocks promotion |
+| stock llama.cpp | Vulkan / `Vulkan0`, Mali-G610 | `ROCKNPU0` with W8 sidecar | TinyLlama Q4_K_M; exact SHA above | 0 prompt + 32 decode tokens; 3 ABBA blocks; 4 threads; default llama-bench warmup; model load excluded | `raw/llama-gpu-npu-repro-o8/` and `raw/llama-gpu-npu-repro-o16/`; quality PASS in `raw/llama-gpu-quality-warm2-o8/` and `...o16/`; NPU has nonzero `w8a8_m1` dispatch | Formal A/B and quality complete; direct+scratch candidate is `1.546x`/`1.735x` NPU/GPU on o8/o16; candidate promotion remains pending cross-frontend completion |
 | stock Ollama | Vulkan backend is discoverable through external `GGML_BACKEND_PATH`; `raw/ollama-gpu-discovery-*.txt` records the route | `ROCKNPU0` route exists; W8 sidecar | TinyLlama Q4_K_M; exact SHA above | 8-token API; 2 warmups + 3 ABBA blocks in `raw/ollama-gpu-npu-repro-o16-v2/` | GPU requests repeatedly fail with `ErrorOutOfDeviceMemory`; NPU raw retained, but no valid GPU denominator | GPU hot A/B blocked by Vulkan/PanVK resource failure; do not count CPU as GPU |
 
 Candle `RockNpuLinear` and the ONNX importer are adapter/operator slices,
@@ -61,4 +61,4 @@ backend row, JSON result, and dispatch summary is versioned in the two raw
 
 ## Current conclusion
 
-The llama.cpp NPU path clears the mean 1.05x GPU threshold on both boards and passes the two-warmup GPU/NPU/CPU quality gate, but o16 block variance prevents promotion. Ollama can discover Vulkan0, yet repeated GPU generation fails with `ErrorOutOfDeviceMemory`; its GPU/NPU promotion is explicitly blocked by the GPU backend, not inferred from CPU.
+The llama.cpp NPU path clears the mean 1.05x GPU threshold on both boards and passes the two-warmup GPU/NPU/CPU quality gate. The repeated direct+scratch candidate is 1.546x (o8) and 1.735x (o16) NPU/GPU; it is the retained llama.cpp candidate, but the overall goal remains incomplete because Ollama GPU generation is blocked. Ollama can discover Vulkan0, yet repeated GPU generation fails with `ErrorOutOfDeviceMemory`; its GPU/NPU promotion is explicitly blocked by the GPU backend, not inferred from CPU.
