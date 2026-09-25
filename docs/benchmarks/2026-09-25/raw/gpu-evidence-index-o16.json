@@ -3,7 +3,8 @@
     "llama-gpu-npu-repro-o16",
     "llama-gpu-quality-warm2-o16",
     "ollama-gpu-npu-repro-o16-v2",
-    "gpu-candidate-ab-o16"
+    "gpu-candidate-ab-o16",
+    "ollama-gpu-q8-probe-o16.log"
   ],
   "board": "o16",
   "candidate_summary": {
@@ -311,7 +312,8 @@
     "ollama-gpu-npu-repro-o16-v2/warmup/oracle-02.record.json": "60c2a82443828b4f409782a64527b8ffa689dc090fd89cee3aea295327f0d823",
     "ollama-gpu-npu-repro-o16-v2/warmup/oracle-02.request.json": "db2a3f05d3d0e322de242ed47c2e8470a6bbe2562e1efdccdb0779745322b910",
     "ollama-gpu-npu-repro-o16-v2/warmup/oracle-02.response.json": "5aa994ef8866a9bdd132833d2960412690480762a735c625331252b98d0175e0",
-    "ollama-gpu-npu-repro-o16-v2/warmup/oracle-02.response.raw": "712a873f5013825f7b89edc2974df33a42758d01c512ad4729c5ff99c9d373fd"
+    "ollama-gpu-npu-repro-o16-v2/warmup/oracle-02.response.raw": "712a873f5013825f7b89edc2974df33a42758d01c512ad4729c5ff99c9d373fd",
+    "ollama-gpu-q8-probe-o16.log": "850952075b57a1f0802d3b0211b71523bbce53c6c48a9ba60ac9da8ba9b3d9da"
   },
   "gpu_frequency": "1000000000",
   "llama_quality": {
