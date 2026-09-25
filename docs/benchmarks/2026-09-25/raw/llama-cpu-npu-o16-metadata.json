@@ -1,0 +1,45 @@
+{
+  "settings": {
+    "bench": "/build/llama.cpp-reference/build-native-norepack-rocknpu/bin/llama-bench",
+    "plugin": "/build/rocknpu/target/ggml-rocknpu-700/libggml-rocknpu.so",
+    "model": "/build/model-cache/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf",
+    "sidecar": "/build/w8a8-models/native-w8-gguf",
+    "output": "/build/rocknpu/artifacts/bench-700-cpu-npu-final-o16",
+    "mode": "decode",
+    "prefill_cache": false,
+    "npu_decode": "on",
+    "prompt": 512,
+    "tokens": 32,
+    "reps": 1,
+    "blocks": 3,
+    "cpu_threads": 4,
+    "npu_threads": 4,
+    "allow_generic_cpu": false,
+    "no_warmup": false
+  },
+  "source_hashes": {
+    "model": "5c66751b61537f9e55177b1b67e06af88e0e2df88f86de4909f5bf87fb1ae583",
+    "bench": "d3158aba424f9dac084a88bba8f332e7c7218171a1a43acea15581cbf0ed9d71",
+    "plugin": "00f32e4ebe6d93d158cc32aa68cd5e31445b3c85e76b39116be634394f561669",
+    "cpu_backend": "36c1c60a597db783713c2e9f111745a74c288d3415e7c6b3aee497e5721d89f9"
+  },
+  "cpu_native": true,
+  "initial_environment": {
+    "machine": "aarch64",
+    "/sys/devices/system/cpu/cpufreq/policy6/scaling_governor": "performance",
+    "/sys/devices/system/cpu/cpufreq/policy4/scaling_governor": "performance",
+    "/sys/devices/system/cpu/cpufreq/policy0/scaling_governor": "performance",
+    "/sys/devices/system/cpu/cpufreq/policy6/scaling_cur_freq": "2400000",
+    "/sys/devices/system/cpu/cpufreq/policy4/scaling_cur_freq": "2400000",
+    "/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq": "1800000",
+    "/sys/class/thermal/thermal_zone2/temp": "52692",
+    "/sys/class/thermal/thermal_zone0/temp": "51769",
+    "/sys/class/thermal/thermal_zone5/temp": "50846",
+    "/sys/class/thermal/thermal_zone3/temp": "52692",
+    "/sys/class/thermal/thermal_zone1/temp": "52692",
+    "/sys/class/thermal/thermal_zone6/temp": "50846",
+    "/sys/class/thermal/thermal_zone4/temp": "51769"
+  },
+  "warmup_policy": "llama-bench default warmup runs before timing; context-owned resident caches are warm",
+  "timing_scope": "llama-bench timed workload; model loading and default warmup excluded; resident caches are warm"
+}
