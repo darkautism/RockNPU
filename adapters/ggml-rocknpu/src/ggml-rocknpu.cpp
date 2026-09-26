@@ -289,6 +289,26 @@ bool rocknpu_small_native_mtile_supported(size_t m, size_t k, size_t n) {
     return k > 0 && k <= 4096 && k % 512 == 0 && n > 0 && n <= 8192 && n % 32 == 0;
 }
 
+// Where single-token (M=1) decode projections run.
+//   cpu    - llama.cpp's own CPU kernels (fastest single-stream generation on
+//            LPDDR4X RK3588 boards: decode is memory-bound and Q4_K moves
+//            fewer bytes than W8).
+//   npu    - resident W8 weights on the NPU (frees the CPU cores).
+//   hybrid - rows split between NPU (W8) and CPU (original GGUF) concurrently.
+// Batched decode and prompt processing (M>1) always use the NPU.
+enum class rocknpu_decode { cpu, npu, hybrid };
+
+rocknpu_decode rocknpu_decode_mode() {
+    static const rocknpu_decode mode = [] {
+        const char * value = std::getenv("ROCKNPU_DECODE");
+        if (value == nullptr || value[0] == '\0') return rocknpu_decode::cpu;
+        if (std::strcmp(value, "npu") == 0 || std::strcmp(value, "1") == 0) return rocknpu_decode::npu;
+        if (std::strcmp(value, "hybrid") == 0) return rocknpu_decode::hybrid;
+        return rocknpu_decode::cpu;
+    }();
+    return mode;
+}
+
 double rocknpu_hybrid_share_env(const char * name, double fallback) {
     const char * value = std::getenv(name);
     if (value == nullptr || value[0] == '\0') return fallback;
@@ -299,7 +319,8 @@ double rocknpu_hybrid_share_env(const char * name, double fallback) {
 // NPU share of the output rows for a concurrent CPU/NPU M=1 projection.
 // 0 disables the hybrid split for that shape.
 double rocknpu_hybrid_npu_share(size_t k, size_t n) {
-    static const double global = rocknpu_hybrid_share_env("ROCKNPU_HYBRID", 0.0);
+    static const double global = rocknpu_hybrid_share_env(
+        "ROCKNPU_HYBRID", rocknpu_decode_mode() == rocknpu_decode::hybrid ? 0.3 : 0.0);
     static const double qkv = rocknpu_hybrid_share_env("ROCKNPU_HYBRID_QKV", global);
     static const double out = rocknpu_hybrid_share_env("ROCKNPU_HYBRID_O", global);
     static const double gate_up = rocknpu_hybrid_share_env("ROCKNPU_HYBRID_GATEUP", global);
@@ -631,7 +652,7 @@ bool rocknpu_mul_mat_supported(const ggml_tensor * op) {
     if (m == 1) {
         // Let optimized CPU kernels handle decode when NPU acceleration is
         // useful only for prompt processing. Decide before graph assignment.
-        if (!rocknpu_env_enabled_default("ROCKNPU_DECODE", true)) {
+        if (rocknpu_decode_mode() == rocknpu_decode::cpu) {
             return false;
         }
         if (quantized && n > 8192) {
@@ -1719,7 +1740,26 @@ int rocknpu_backend_score() {
 
 } // namespace
 
+// Validated execution routes that used to be opt-in research flags. They are
+// set only when the user has not chosen a value, so any of them can still be
+// disabled explicitly with "=0".
+void rocknpu_apply_default_env() {
+    static const char * const defaults[] = {
+        "ROCKNPU_W8_DIRECT_SUBMIT",          // drive all NPU cores from the calling thread
+        "ROCKNPU_EXPERIMENT_DIRECT_SCRATCH", // persistent per-core scratch + cached regcmds
+        "ROCKNPU_PREFILL_CACHE",             // resident prompt-processing weights
+        "ROCKNPU_NATIVE_MTILE",              // native W8A8 M-tile prompt processing
+        "ROCKNPU_W8_MTILE",
+        "ROCKNPU_MTILE_PERSIST",
+        "ROCKNPU_MTILE_MC",                  // multi-core M-tile
+        "ROCKNPU_NATIVE_MTILE_DOWN",         // K-split FFN down projection
+    };
+    for (const char * name : defaults) setenv(name, "1", 0);
+}
+
 ggml_backend_reg_t ggml_backend_rocknpu_reg() {
+    static const bool defaults_applied = (rocknpu_apply_default_env(), true);
+    (void) defaults_applied;
     static ggml_backend_reg reg = {
         /* .api_version = */ GGML_BACKEND_API_VERSION,
         /* .iface       = */ rocknpu_reg_iface,
