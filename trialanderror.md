@@ -70,6 +70,10 @@ Disposition:
 | Two-part activation encoding (`ROCKNPU_PREFILL_HILO`) as default | KLD 4–5× lower but prefill speed halves (`down`: ~2× lower KLD, −23 %). Opt-in only. | C4 | CLOSED as default |
 | LLM.int8()-style fixed outlier channels for W8A8 prefill | Outliers are per-token over tens–hundreds of channels; scale gain only 2–4×. | C4 | CLOSED |
 | Prefill Q+V+K as one concatenated M-tile call (Q node stashes V/K for the later split) | First try kept a third resident W8 copy of Q/K/V (+115 MB TinyLlama); closed. Reopened with `rocknpu_mtile_release` freeing the unused single/pair caches: peak RSS unchanged, KL bit-identical, pp128 TinyLlama 556 → 572, Qwen2.5‑1.5B 324 → 350 (Q/K/V in separate bias splits), pp512 Qwen 294 → 316. First request after load pays the one-time concat build. | C4 | KEEP |
+| Qwen3.5-4B scheduler fallback for wide projections | On o16g Q4_K_M, stock CPU pp128 was 18.09 tok/s while current RockNPU hot runs were ~36.7 tok/s. Forcing `K=9216,N=2560` FFN-down back to CPU collapsed pp128 to 18.39 tok/s; forcing `K=4096,N=2560` back to CPU gave 26.46 ± 5.00. The wide NPU routes are necessary despite their large per-op latency. | C3 | CLOSED |
+| Qwen3.5-4B legacy/non-direct M-tile executor | `ROCKNPU_W8_DIRECT_SUBMIT=0` gave 35.84 ± 2.80 tok/s vs current hot baseline 36.69 ± 2.26; no stable win. | C3 | CLOSED |
+| Qwen3.5-4B QKV/group/dequant flag sweep | Five-run pp128: baseline 36.69 ± 2.26, `ROCKNPU_MTILE_QKV=0` 36.75 ± 0.73, QKV-off plus `ROCKNPU_PREFILL_PARALLEL_DEQUANT=0` 36.41 ± 1.08. Earlier two-run apparent gains were noise. | C3 | CLOSED |
+| Qwen3.5 same-data grouping / >4-way concat | Actual trace already groups every FFN gate+up as 2-way and full-attention QKV as 3-way; no group hits the 4-member cap. `ssm_alpha`/`ssm_beta` do not share the same underlying GGML data buffer, so relaxing tensor identity to exact data-pointer+shape equality found no additional groups. | C3 | CLOSED |
 
 ## Important measurement lessons
 
