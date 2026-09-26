@@ -59,6 +59,18 @@ cd RockNPU
 
 第一次使用若提示沒有 `/dev/accel/accel0` 權限，執行 `sudo usermod -aG render $USER` 後重新登入即可。
 
+### 最佳效能設定
+
+**啟動 llama.cpp 或 Ollama 前，一定先載入安裝腳本產生的環境設定：**
+
+```sh
+. ~/.local/share/rocknpu/rocknpu.env
+```
+
+`install.sh` 已把驗證過的設定寫進這個檔案：RockNPU backend/device、`LLAMA_ARG_REPACK=false`、`GOMP_SPINCOUNT=20000`、4 個 CPU threads，以及 flash attention。已驗證的 NPU 執行路徑也由 backend 自動開啟；**不需要從 benchmark/研究紀錄手動複製一堆實驗用 `ROCKNPU_*` flags。** 如果沒有先載入這個 env 就直接執行 `llama-server`，很容易其實是在測 stock CPU，而不是 RockNPU。
+
+要跑到最高效能，再用 `taskset -c 4-7` 固定在 4 顆 Cortex-A76 大核，模型選支援的 K-quant GGUF，例如 `Q4_K_M`。
+
 （選用，強烈建議）讓 NPU 跑在 700 MHz，並套用系統調校：
 
 ```sh
@@ -73,13 +85,14 @@ sudo ./scripts/rocknpu-tune.sh install   # 開機自動套用；要還原：sudo
 ### llama.cpp（網頁聊天介面 / OpenAI 相容 API）
 
 ```sh
-llama-server -m 你的模型.gguf
+. ~/.local/share/rocknpu/rocknpu.env
+taskset -c 4-7 llama-server -m 你的模型.gguf -t 4
 ```
 
 然後用瀏覽器開啟 `http://開發板IP:8080`。
 確認有用到 NPU：`llama-server --list-devices` 會列出 `ROCKNPU0: RockNPU RK3588`。
 
-小技巧：`taskset -c 4-7 llama-server -m 你的模型.gguf -t 4` 把 llama.cpp 固定在 4 顆大核上，讀提示詞再快約 10%。
+把 llama.cpp 固定在 4 顆大核上，讀提示詞實測還能再快約 10%。env 已要求 4 threads；`taskset` 則避免這些 threads 被排程到 A55 小核。
 載入模型後的**第一個**請求會稍慢（NPU 正在把權重轉成 8-bit，TinyLlama 約 1 秒），之後就是全速。
 
 ### Ollama

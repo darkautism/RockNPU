@@ -58,6 +58,18 @@ cd RockNPU
 
 If `/dev/accel/accel0` exists but is not accessible, run `sudo usermod -aG render $USER` and log in again.
 
+### Best-performance settings
+
+**Always load the generated environment before starting llama.cpp or Ollama:**
+
+```sh
+. ~/.local/share/rocknpu/rocknpu.env
+```
+
+`install.sh` writes the validated settings into this file: the RockNPU backend/device, `LLAMA_ARG_REPACK=false`, `GOMP_SPINCOUNT=20000`, four CPU threads, and flash attention. The validated NPU execution routes are already enabled by the backend itself; **you do not need to copy experimental `ROCKNPU_*` flags from benchmark notes.** If you launch `llama-server` without loading this environment, you can easily end up benchmarking stock CPU instead of RockNPU.
+
+For maximum performance, also pin the process to the four Cortex-A76 cores (`taskset -c 4-7`) and use a supported K-quant GGUF such as `Q4_K_M`.
+
 ### Optional but strongly recommended: run the NPU at 700 MHz
 
 ```sh
@@ -76,7 +88,8 @@ For the RockNPU LLM path, performance is already near saturation around 700 MHz.
 ### llama.cpp / llama-server
 
 ```sh
-llama-server -m your-model.gguf
+. ~/.local/share/rocknpu/rocknpu.env
+taskset -c 4-7 llama-server -m your-model.gguf -t 4
 ```
 
 Open `http://BOARD_IP:8080`.
@@ -93,13 +106,7 @@ Expected output includes:
 ROCKNPU0: RockNPU RK3588
 ```
 
-For best results, pin llama.cpp to the four large cores:
-
-```sh
-taskset -c 4-7 llama-server -m your-model.gguf -t 4
-```
-
-This improves prompt processing by roughly another 10% on the validated systems.
+Pinning llama.cpp to the four large cores improves prompt processing by roughly another 10% on the validated systems. The environment already requests four threads; `taskset` additionally prevents those threads from migrating onto the A55 cores.
 
 The first request after model loading is slower because RockNPU prepares 8-bit NPU weights. For TinyLlama this takes roughly one second; steady-state requests are faster.
 
