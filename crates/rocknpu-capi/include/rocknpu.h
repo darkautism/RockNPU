@@ -52,6 +52,13 @@ int rocknpu_matmul_q_concat_f32_f32_mtile(
     const uint8_t * const * weights, const size_t * bytes, const uint32_t * kinds, const size_t * ns,
     const float * activations_mk_f32, float * const * outputs, size_t m, size_t k);
 
+/* Free the cached prompt-path (M-tile) NPU copies of the given weights:
+ * single-projection entries and every concatenated group that contains one
+ * of them, except the group made of exactly these weights in this order.
+ * Decode (M=1) caches are kept. */
+int rocknpu_mtile_release(
+    rocknpu_context * context, size_t count, const uint8_t * const * weights);
+
 int rocknpu_prewarm_quantized_m16(
     rocknpu_context * context,
     const uint8_t * weights,

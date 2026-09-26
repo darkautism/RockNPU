@@ -13,8 +13,8 @@
 
 | 項目 | 只用 CPU（llama.cpp） | **RockNPU** | 參考：閉源 RKLLM 官方數據* |
 |---|---:|---:|---:|
-| 讀提示詞（prefill，128 tokens） | 73 tok/s | **≈ 555 tok/s** | ≈ 525 tok/s（TTFT 244 ms） |
-| 讀提示詞（prefill，512 tokens） | 69 tok/s | **≈ 415 tok/s** | — |
+| 讀提示詞（prefill，128 tokens） | 73 tok/s | **≈ 570 tok/s** | ≈ 525 tok/s（TTFT 244 ms） |
+| 讀提示詞（prefill，512 tokens） | 69 tok/s | **≈ 420 tok/s** | — |
 | 生成（decode） | 33 tok/s | **≈ 32–33 tok/s** | 24.4 tok/s |
 | 輸出品質 | 基準 | 生成階段與 CPU 完全相同；讀提示詞為 W8A8 | W8A8 |
 
@@ -23,11 +23,11 @@ RockNPU 數字為 NPU 700 MHz、llama-bench、4 個 A76 執行緒。詳細方法
 
 其他模型（讀提示詞 128 tokens，tok/s）：
 
-| 模型（Q4_K_M） | 只用 CPU | **RockNPU** |
-|---|---:|---:|
-| Llama‑3.2‑1B‑Instruct | 42 | **≈ 580** |
-| Qwen2.5‑1.5B‑Instruct | 28 | **≈ 310** |
-| Qwen2.5‑0.5B‑Instruct | 71 | 71（不加速，見常見問題） |
+| 模型（Q4_K_M） | 只用 CPU | **RockNPU** | 參考：RKLLM 官方* |
+|---|---:|---:|---:|
+| Llama‑3.2‑1B‑Instruct | 42 | **≈ 580** | — |
+| Qwen2.5‑1.5B‑Instruct | 28 | **≈ 350** | ≈ 340（TTFT 378 ms） |
+| Qwen2.5‑0.5B‑Instruct | 71 | 71（不加速，見常見問題） | — |
 
 白話：**貼長文件、長對話歷史給模型時，等待回應的時間大約縮短為 1/7**；生成速度維持 CPU 的最佳水準（RK3588 的 LPDDR4X 記憶體頻寬決定了生成速度的上限，CPU 的 4-bit 路徑在這一步已是最快，所以 RockNPU 預設讓 CPU 負責生成、NPU 負責讀提示詞）。
 

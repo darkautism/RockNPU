@@ -69,7 +69,7 @@ Disposition:
 | Wide shapes on the native M-tile path (K-split to 12288, 64-row halves, N chunks, K zero-padding, pool from N ≥ 768) | Llama‑3.2‑1B pp128 260 → 580, Qwen2.5‑1.5B 31 → 311; TinyLlama KL bit-identical. | C4 | KEEP |
 | Two-part activation encoding (`ROCKNPU_PREFILL_HILO`) as default | KLD 4–5× lower but prefill speed halves (`down`: ~2× lower KLD, −23 %). Opt-in only. | C4 | CLOSED as default |
 | LLM.int8()-style fixed outlier channels for W8A8 prefill | Outliers are per-token over tens–hundreds of channels; scale gain only 2–4×. | C4 | CLOSED |
-| Prefill Q+V+K as one concatenated M-tile call (Q node stashes V/K for the later split) | Steady pp128 556 → ~567 (+2 %), but the first measured run drops to 290 (concat weight build) and a third resident W8 copy of Q/K/V is kept (~115 MB TinyLlama, ~440 MB at 3B). Not worth the memory on 8 GB boards. | C4 | CLOSED |
+| Prefill Q+V+K as one concatenated M-tile call (Q node stashes V/K for the later split) | First try kept a third resident W8 copy of Q/K/V (+115 MB TinyLlama); closed. Reopened with `rocknpu_mtile_release` freeing the unused single/pair caches: peak RSS unchanged, KL bit-identical, pp128 TinyLlama 556 → 572, Qwen2.5‑1.5B 324 → 350 (Q/K/V in separate bias splits), pp512 Qwen 294 → 316. First request after load pays the one-time concat build. | C4 | KEEP |
 
 ## Important measurement lessons
 

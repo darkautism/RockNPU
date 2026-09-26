@@ -1663,6 +1663,38 @@ fn execute_cached_w8a8_mtile_pool<F>(
 where
     F: FnOnce() -> Option<(Vec<i8>, Vec<f32>)>,
 {
+    execute_cached_w8a8_mtile_pool_padded(
+        context,
+        key,
+        m,
+        split,
+        key.k,
+        activations_mk_f32,
+        output_mn_f32,
+        prepare,
+    )
+}
+
+/// As `execute_cached_w8a8_mtile_pool`, with activation rows of
+/// `source_k <= key.k` values; the int8 rows are zero-padded to `key.k`
+/// while quantizing (no padded f32 copy).
+#[allow(clippy::too_many_arguments)]
+fn execute_cached_w8a8_mtile_pool_padded<F>(
+    context: &mut RockNpuContext,
+    key: DecodeWeightKey,
+    m: usize,
+    split: Int8DecodeSplit,
+    source_k: usize,
+    activations_mk_f32: &[f32],
+    output_mn_f32: &mut [f32],
+    prepare: F,
+) -> i32
+where
+    F: FnOnce() -> Option<(Vec<i8>, Vec<f32>)>,
+{
+    if source_k == 0 || source_k > key.k || activations_mk_f32.len() != m * source_k {
+        return STATUS_INVALID_ARGUMENT;
+    }
     if !matches!(m, 4 | 8 | 12 | 16 | 32 | 48 | 64 | 128) {
         return STATUS_INVALID_ARGUMENT;
     }
@@ -1679,7 +1711,7 @@ where
         Int8DecodeSplit::N => key.k <= 4096 && key.n >= MIN_POOL_N,
         Int8DecodeSplit::K => key.k > 4096 && key.k <= MAX_POOL_K,
     };
-    if activations_mk_f32.len() != expected_a
+    if activations_mk_f32.len() != m * source_k
         || output_mn_f32.len() != expected_out
         || key.k == 0
         || !key.k.is_multiple_of(512)
@@ -1695,10 +1727,10 @@ where
     let mut activations_i8 = vec![0i8; expected_a];
     let mut activation_scales = vec![0.0f32; m];
     let quantized_ok = activations_mk_f32
-        .par_chunks_exact(key.k)
+        .par_chunks_exact(source_k)
         .zip(activations_i8.par_chunks_exact_mut(key.k))
         .zip(activation_scales.par_iter_mut())
-        .all(|((row, out), scale)| match quantize_symmetric_into(row, out) {
+        .all(|((row, out), scale)| match quantize_symmetric_into(row, &mut out[..source_k]) {
             Some(row_scale) => {
                 *scale = row_scale;
                 true
@@ -2097,10 +2129,6 @@ where
     if activations_mk_f32.len() != m * k {
         return STATUS_INVALID_ARGUMENT;
     }
-    let mut padded = vec![0.0f32; m * kp];
-    for (dst, src) in padded.chunks_exact_mut(kp).zip(activations_mk_f32.chunks_exact(k)) {
-        dst[..k].copy_from_slice(src);
-    }
     let key = DecodeWeightKey { k: kp, ..key };
     let prepare = || {
         let (weights, scales) = prepare()?;
@@ -2110,13 +2138,24 @@ where
         }
         Some((padded_weights, scales))
     };
-    if kp > 4096 {
-        execute_cached_w8a8_mtile_pool(context, key, m, Int8DecodeSplit::K, &padded, output_mn_f32, prepare)
-    } else if key.n >= MTILE_POOL_MIN_N {
-        execute_cached_w8a8_mtile_pool(context, key, m, Int8DecodeSplit::N, &padded, output_mn_f32, prepare)
-    } else {
-        execute_cached_w8a8_mtile(context, key, m, &padded, output_mn_f32, prepare)
+    if kp > 4096 || key.n >= MTILE_POOL_MIN_N {
+        let split = if kp > 4096 { Int8DecodeSplit::K } else { Int8DecodeSplit::N };
+        return execute_cached_w8a8_mtile_pool_padded(
+            context,
+            key,
+            m,
+            split,
+            k,
+            activations_mk_f32,
+            output_mn_f32,
+            prepare,
+        );
     }
+    let mut padded = vec![0.0f32; m * kp];
+    for (dst, src) in padded.chunks_exact_mut(kp).zip(activations_mk_f32.chunks_exact(k)) {
+        dst[..k].copy_from_slice(src);
+    }
+    execute_cached_w8a8_mtile(context, key, m, &padded, output_mn_f32, prepare)
 }
 
 /// Run a row-independent M-row projection as native M-tiles: full 128-row
@@ -2324,6 +2363,35 @@ where
         profile.wait_ns += timings.wait_ns;
         profile.host_accum_ns += timings.consume_ns;
     }
+    STATUS_OK
+}
+
+/// Free the cached prompt-path (M-tile) NPU copies of the given weights:
+/// single-projection entries and every concatenated group containing one of
+/// them, except the group of exactly these weights in this order (the caller
+/// has switched to that group). Decode (M=1) caches are kept.
+///
+/// # Safety
+/// `weights` must hold `count` pointers (only their addresses are used).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rocknpu_mtile_release(
+    context: *mut RockNpuContext,
+    count: usize,
+    weights: *const *const u8,
+) -> i32 {
+    if context.is_null() || weights.is_null() || !(1..=4).contains(&count) {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let (context, weights) = unsafe { (&mut *context, slice::from_raw_parts(weights, count)) };
+    let addresses: Vec<usize> = weights.iter().map(|&w| w as usize).collect();
+    let involved = |key: &DecodeWeightKey| addresses.contains(&key.address);
+    context.decode_mtile_weights.retain(|key, _| !involved(key));
+    context.decode_mtile_pool_weights.retain(|key, _| !involved(key));
+    context.decode_mtile_concat_weights.retain(|keys, _| {
+        let exact = keys.len() == addresses.len()
+            && keys.iter().zip(&addresses).all(|(key, &address)| key.address == address);
+        exact || !keys.iter().any(&involved)
+    });
     STATUS_OK
 }
 

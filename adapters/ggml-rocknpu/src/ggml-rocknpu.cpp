@@ -38,6 +38,18 @@ struct rocknpu_qkv_layer_state {
     bool pending = false;
     float v_output[256] = {};
     float k_output[256] = {};
+    // Prompt batches (M>1): Q, K and V usually sit in different GGML splits
+    // (bias adds, or V/K grouped after Q), so the Q node runs all three as
+    // one M-tile call and stashes K/V for their own nodes.
+    const ggml_tensor * mk_tensor = nullptr;
+    const ggml_tensor * mv_tensor = nullptr;
+    std::vector<float> mk_output;
+    std::vector<float> mv_output;
+    const float * m_activation = nullptr;
+    int64_t m_rows = 0;
+    bool mk_pending = false;
+    bool mv_pending = false;
+    bool m_released = false;
 };
 
 struct rocknpu_w8_tensor {
@@ -840,7 +852,7 @@ int rocknpu_mtile_group(rocknpu_backend_context * context, ggml_cgraph * graph, 
                         std::vector<const ggml_tensor *> & done) {
     ggml_tensor * lead = graph->nodes[first];
     const ggml_tensor * activations = lead->src[1];
-    ggml_tensor * members[4] = { lead };
+    ggml_tensor * members[4] = { lead, nullptr, nullptr, nullptr };
     int count = 1;
     for (int j = first + 1; j < graph->n_nodes && count < 4; ++j) {
         ggml_tensor * candidate = graph->nodes[j];
@@ -851,8 +863,66 @@ int rocknpu_mtile_group(rocknpu_backend_context * context, ggml_cgraph * graph, 
             members[count++] = candidate;
         }
     }
+    static const bool qkv_enabled = rocknpu_env_enabled_default("ROCKNPU_MTILE_QKV", true);
+    const size_t m = static_cast<size_t>(activations->ne[1]);
+    const size_t k = static_cast<size_t>(lead->src[0]->ne[0]);
+    const float * activation_data = static_cast<const float *>(activations->data);
+    size_t layer = 0;
+    if (qkv_enabled) {
+        // Remember each layer's K/V weights and serve K/V from the stash the
+        // Q node left, when every member of this group is stashed.
+        int stashed = 0;
+        for (int g = 0; g < count; ++g) {
+            const ggml_tensor * w = members[g]->src[0];
+            if (rocknpu_attention_layer(w, ".attn_k.weight", &layer)) {
+                auto & state = context->qkv[layer];
+                state.mk_tensor = w;
+                stashed += state.mk_pending && state.m_activation == activation_data &&
+                    state.m_rows == activations->ne[1] &&
+                    state.mk_output.size() == static_cast<size_t>(ggml_nelements(members[g]));
+            } else if (rocknpu_attention_layer(w, ".attn_v.weight", &layer)) {
+                auto & state = context->qkv[layer];
+                state.mv_tensor = w;
+                stashed += state.mv_pending && state.m_activation == activation_data &&
+                    state.m_rows == activations->ne[1] &&
+                    state.mv_output.size() == static_cast<size_t>(ggml_nelements(members[g]));
+            }
+        }
+        if (stashed == count) {
+            for (int g = 0; g < count; ++g) {
+                const ggml_tensor * w = members[g]->src[0];
+                const bool is_k = rocknpu_attention_layer(w, ".attn_k.weight", &layer);
+                if (!is_k) rocknpu_attention_layer(w, ".attn_v.weight", &layer);
+                auto & state = context->qkv[layer];
+                auto & stash = is_k ? state.mk_output : state.mv_output;
+                std::memcpy(members[g]->data, stash.data(), stash.size() * sizeof(float));
+                (is_k ? state.mk_pending : state.mv_pending) = false;
+                if (g > 0) done.push_back(members[g]);
+                context->qkv_stash_hits++;
+            }
+            return count;
+        }
+    }
+    // Q of a layer whose K/V weights are known: run Q, K and V together.
+    const ggml_tensor * member_weights[4] = {};
+    for (int g = 0; g < count; ++g) member_weights[g] = members[g]->src[0];
+    rocknpu_qkv_layer_state * q_state = nullptr;
+    if (qkv_enabled && count == 1 && rocknpu_attention_layer(lead->src[0], ".attn_q.weight", &layer)) {
+        auto & state = context->qkv[layer];
+        state.mk_pending = state.mv_pending = false;
+        const ggml_tensor * wk = state.mk_tensor;
+        const ggml_tensor * wv = state.mv_tensor;
+        if (wk != nullptr && wv != nullptr && wk->ne[0] == lead->src[0]->ne[0] && wv->ne[0] == lead->src[0]->ne[0]) {
+            state.mk_output.resize(m * static_cast<size_t>(wk->ne[1]));
+            state.mv_output.resize(m * static_cast<size_t>(wv->ne[1]));
+            member_weights[1] = wk;
+            member_weights[2] = wv;
+            q_state = &state;
+            count = 3;
+        }
+    }
     int64_t total_n = 0;
-    for (int g = 0; g < count; ++g) total_n += members[g]->src[0]->ne[1];
+    for (int g = 0; g < count; ++g) total_n += member_weights[g]->ne[1];
     // A single wide projection keeps its dedicated (K-split capable) path.
     if (count == 1) return 0;
     if (total_n > 3 * 8192) return 0;
@@ -862,23 +932,34 @@ int rocknpu_mtile_group(rocknpu_backend_context * context, ggml_cgraph * graph, 
     size_t ns[4];
     float * outputs[4];
     for (int g = 0; g < count; ++g) {
-        const ggml_tensor * w = members[g]->src[0];
+        const ggml_tensor * w = member_weights[g];
+        if (w->type != GGML_TYPE_Q4_K && w->type != GGML_TYPE_Q6_K) return 0;
         weights[g] = static_cast<const uint8_t *>(w->data);
         bytes[g] = ggml_nbytes(w);
         kinds[g] = w->type == GGML_TYPE_Q4_K ? 4 : 6;
         ns[g] = static_cast<size_t>(w->ne[1]);
-        outputs[g] = static_cast<float *>(members[g]->data);
+        outputs[g] = q_state == nullptr || g == 0 ? static_cast<float *>(members[g]->data)
+            : g == 1 ? q_state->mk_output.data() : q_state->mv_output.data();
     }
-    const size_t m = static_cast<size_t>(activations->ne[1]);
-    const size_t k = static_cast<size_t>(lead->src[0]->ne[0]);
     const int status = rocknpu_matmul_q_concat_f32_f32_mtile(
         context->runtime, static_cast<size_t>(count), weights, bytes, kinds, ns,
-        static_cast<const float *>(activations->data), outputs, m, k);
+        activation_data, outputs, m, k);
     if (status != ROCKNPU_STATUS_OK) return 0;
+    if (q_state != nullptr) {
+        q_state->m_activation = activation_data;
+        q_state->m_rows = activations->ne[1];
+        q_state->mk_pending = q_state->mv_pending = true;
+        context->qkv_triple_calls++;
+        if (!q_state->m_released) {
+            // The single/pair prompt caches of these weights are now unused.
+            rocknpu_mtile_release(context->runtime, 3, weights);
+            q_state->m_released = true;
+        }
+    }
     for (int g = 0; g < count; ++g) {
-        const ggml_tensor * w = members[g]->src[0];
+        const ggml_tensor * w = member_weights[g];
         if (w->type == GGML_TYPE_Q4_K) context->q4_k_mul_mat_calls++; else context->q6_k_mul_mat_calls++;
-        if (g > 0) done.push_back(members[g]);
+        if (g > 0 && q_state == nullptr) done.push_back(members[g]);
     }
     context->m_other_calls += static_cast<size_t>(count);
     context->mtile_group_calls++;
