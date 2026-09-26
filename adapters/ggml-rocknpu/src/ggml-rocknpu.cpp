@@ -15,6 +15,7 @@
 #include <cstring>
 #include <cmath>
 #include <fstream>
+#include <algorithm>
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -156,35 +157,94 @@ bool rocknpu_read_source_fingerprint(const std::string & path, uint64_t * value)
     return true;
 }
 
+bool rocknpu_env_enabled_default(const char * name, bool default_value);
+
+// Symmetric per-output-channel int8 from the GGUF source rows. Identical
+// semantics to scripts/make_tinyllama_w8_sidecar_gguf.py (dequantize, scale =
+// max|row|/127, round half away from zero), so a sidecar is only a cache.
+bool rocknpu_w8_convert(rocknpu_w8_tensor & tensor, const uint8_t * source, size_t source_bytes,
+                        ggml_type type, size_t k, size_t n) {
+    if (source == nullptr || type >= GGML_TYPE_COUNT) return false;
+    const ggml_type_traits * traits = ggml_get_type_traits(type);
+    if (type != GGML_TYPE_F32 && (traits == nullptr || traits->to_float == nullptr)) return false;
+    const size_t row_bytes = ggml_row_size(type, static_cast<int64_t>(k));
+    if (row_bytes * n != source_bytes) return false;
+    tensor.weights.resize(k * n);
+    tensor.scales.resize(n);
+    const size_t workers = std::max<size_t>(1, std::min<size_t>(4, std::thread::hardware_concurrency()));
+    const auto convert_rows = [&](size_t first, size_t last) {
+        std::vector<float> row(k);
+        for (size_t r = first; r < last; ++r) {
+            const uint8_t * src = source + r * row_bytes;
+            if (type == GGML_TYPE_F32) {
+                std::memcpy(row.data(), src, k * sizeof(float));
+            } else {
+                traits->to_float(src, row.data(), static_cast<int64_t>(k));
+            }
+            float max_abs = 0.0f;
+            for (float v : row) max_abs = std::max(max_abs, std::fabs(v));
+            const float scale = max_abs == 0.0f ? 1.0f : max_abs / 127.0f;
+            int8_t * dst = tensor.weights.data() + r * k;
+            for (size_t i = 0; i < k; ++i) {
+                const float q = std::round(row[i] / scale);
+                dst[i] = static_cast<int8_t>(std::max(-127.0f, std::min(127.0f, q)));
+            }
+            tensor.scales[r] = scale;
+        }
+    };
+    std::vector<std::thread> threads;
+    const size_t per = (n + workers - 1) / workers;
+    for (size_t w = 0; w < workers; ++w) {
+        const size_t first = w * per;
+        const size_t last = std::min(n, first + per);
+        if (first < last) threads.emplace_back(convert_rows, first, last);
+    }
+    for (auto & thread : threads) thread.join();
+    for (float scale : tensor.scales) {
+        if (!std::isfinite(scale) || scale <= 0.0f) return false;
+    }
+    return true;
+}
+
 rocknpu_w8_tensor * rocknpu_w8_sidecar_get(
     rocknpu_backend_context * context, const char * name, size_t k, size_t n,
-    const uint8_t * source_data, size_t source_bytes) {
+    const uint8_t * source_data, size_t source_bytes, ggml_type type = GGML_TYPE_COUNT) {
+    if (name == nullptr || name[0] == '\0') return nullptr;
     const char * dir = std::getenv("ROCKNPU_W8_SIDECAR_DIR");
-    if (dir == nullptr || dir[0] == '\0' || name == nullptr || name[0] == '\0') return nullptr;
+    const bool convert = rocknpu_env_enabled_default("ROCKNPU_W8_CONVERT", true);
+    if ((dir == nullptr || dir[0] == '\0') && !convert) return nullptr;
     auto & tensor = context->w8_sidecar[std::string(name)];
     if (!tensor.attempted) {
         tensor.attempted = true;
         tensor.k = k;
         tensor.n = n;
         const size_t weight_count = k * n;
-        const std::string base = std::string(dir) + "/" + name;
-        uint64_t expected_fingerprint = 0;
-        const bool source_matches = source_data != nullptr && source_bytes != 0 &&
-            rocknpu_read_source_fingerprint(base + ".source.fnv1a64", &expected_fingerprint) &&
-            expected_fingerprint == rocknpu_source_sample_fingerprint(source_data, source_bytes);
-        if (!source_matches) {
-            if (rocknpu_trace_enabled()) {
-                std::fprintf(stderr, "ROCKNPU GGML TRACE native_w8_rejected_source weight=%s\n", name);
+        if (dir != nullptr && dir[0] != '\0') {
+            const std::string base = std::string(dir) + "/" + name;
+            uint64_t expected_fingerprint = 0;
+            const bool source_matches = source_data != nullptr && source_bytes != 0 &&
+                rocknpu_read_source_fingerprint(base + ".source.fnv1a64", &expected_fingerprint) &&
+                expected_fingerprint == rocknpu_source_sample_fingerprint(source_data, source_bytes);
+            if (!source_matches) {
+                if (rocknpu_trace_enabled()) {
+                    std::fprintf(stderr, "ROCKNPU GGML TRACE native_w8_rejected_source weight=%s\n", name);
+                }
+            } else {
+                tensor.weights.resize(weight_count);
+                tensor.scales.resize(n);
+                if (rocknpu_read_exact(base + ".w8", tensor.weights.data(), weight_count) &&
+                    rocknpu_read_exact(base + ".scale.f32", tensor.scales.data(), n * sizeof(float))) {
+                    tensor.valid = true;
+                    for (float scale : tensor.scales) {
+                        if (!std::isfinite(scale) || scale <= 0.0f) { tensor.valid = false; break; }
+                    }
+                }
             }
-            return nullptr;
         }
-        tensor.weights.resize(weight_count);
-        tensor.scales.resize(n);
-        if (rocknpu_read_exact(base + ".w8", tensor.weights.data(), weight_count) &&
-            rocknpu_read_exact(base + ".scale.f32", tensor.scales.data(), n * sizeof(float))) {
-            tensor.valid = true;
-            for (float scale : tensor.scales) {
-                if (!std::isfinite(scale) || scale <= 0.0f) { tensor.valid = false; break; }
+        if (!tensor.valid && convert) {
+            tensor.valid = rocknpu_w8_convert(tensor, source_data, source_bytes, type, k, n);
+            if (tensor.valid && rocknpu_trace_enabled()) {
+                std::fprintf(stderr, "ROCKNPU GGML TRACE native_w8_converted weight=%s K=%zu N=%zu\n", name, k, n);
             }
         }
         if (!tensor.valid) {
@@ -890,7 +950,7 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                         (output_weights->type == GGML_TYPE_Q4_K || output_weights->type == GGML_TYPE_Q6_K)) {
                         rocknpu_w8_tensor * output_w8 = rocknpu_w8_sidecar_get(
                             context, output_weights->name, output_k, output_n,
-                            static_cast<const uint8_t *>(output_weights->data), ggml_nbytes(output_weights));
+                            static_cast<const uint8_t *>(output_weights->data), ggml_nbytes(output_weights), output_weights->type);
                         if (output_w8 == nullptr) {
                             return GGML_STATUS_FAILED;
                         }
@@ -928,7 +988,7 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                         context->ffn_composite_gate != nullptr && context->ffn_composite_up != nullptr) {
                         rocknpu_w8_tensor * down_w8 = rocknpu_w8_sidecar_get(
                             context, down_weights->name, down_k, down_n,
-                            static_cast<const uint8_t *>(down_weights->data), ggml_nbytes(down_weights));
+                            static_cast<const uint8_t *>(down_weights->data), ggml_nbytes(down_weights), down_weights->type);
                         if (down_w8 != nullptr) {
                             const rocknpu_w8_tensor * gate_w8 = context->ffn_composite_gate;
                             const rocknpu_w8_tensor * up_w8 = context->ffn_composite_up;
@@ -982,11 +1042,11 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                             const std::string k_name = "blk." + std::to_string(q_layer) + ".attn_k.weight";
                             rocknpu_w8_tensor * q_w8 = rocknpu_w8_sidecar_get(
                                 context, q_weights->name, 2048, 2048,
-                                static_cast<const uint8_t *>(q_weights->data), ggml_nbytes(q_weights));
+                                static_cast<const uint8_t *>(q_weights->data), ggml_nbytes(q_weights), q_weights->type);
                             rocknpu_w8_tensor * v_w8 = rocknpu_w8_sidecar_get(
-                                context, v_name.c_str(), 2048, 256, state.v.data, state.v.bytes);
+                                context, v_name.c_str(), 2048, 256, state.v.data, state.v.bytes, state.v.tensor != nullptr ? state.v.tensor->type : GGML_TYPE_COUNT);
                             rocknpu_w8_tensor * k_w8 = rocknpu_w8_sidecar_get(
-                                context, k_name.c_str(), 2048, 256, state.k.data, state.k.bytes);
+                                context, k_name.c_str(), 2048, 256, state.k.data, state.k.bytes, state.k.tensor != nullptr ? state.k.tensor->type : GGML_TYPE_COUNT);
                             const bool native_w8 = q_w8 != nullptr && v_w8 != nullptr && k_w8 != nullptr;
                             const ggml_tensor * v_tensor = state.v.tensor;
                             const ggml_tensor * k_tensor = state.k.tensor;
@@ -1064,10 +1124,10 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                             if (pair_m == 1) {
                                 rocknpu_w8_tensor * first_w8 = rocknpu_w8_sidecar_get(
                                     context, first_weights->name, k_pair, 5632,
-                                    static_cast<const uint8_t *>(first_weights->data), ggml_nbytes(first_weights));
+                                    static_cast<const uint8_t *>(first_weights->data), ggml_nbytes(first_weights), first_weights->type);
                                 rocknpu_w8_tensor * second_w8 = rocknpu_w8_sidecar_get(
                                     context, second_weights->name, k_pair, 5632,
-                                    static_cast<const uint8_t *>(second_weights->data), ggml_nbytes(second_weights));
+                                    static_cast<const uint8_t *>(second_weights->data), ggml_nbytes(second_weights), second_weights->type);
                                 native_w8 = first_w8 != nullptr && second_w8 != nullptr;
                                 if (pair_m == 1 && native_w8 &&
                                     rocknpu_env_enabled("ROCKNPU_FFN_COMPOSITE")) {
@@ -1203,10 +1263,10 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                             const size_t k_pair = static_cast<size_t>(first_weights->ne[0]);
                             rocknpu_w8_tensor * first_w8 = rocknpu_w8_sidecar_get(
                                 context, first_weights->name, k_pair, 256,
-                                static_cast<const uint8_t *>(first_weights->data), ggml_nbytes(first_weights));
+                                static_cast<const uint8_t *>(first_weights->data), ggml_nbytes(first_weights), first_weights->type);
                             rocknpu_w8_tensor * second_w8 = rocknpu_w8_sidecar_get(
                                 context, second_weights->name, k_pair, 256,
-                                static_cast<const uint8_t *>(second_weights->data), ggml_nbytes(second_weights));
+                                static_cast<const uint8_t *>(second_weights->data), ggml_nbytes(second_weights), second_weights->type);
                             const bool native_w8 = first_w8 != nullptr && second_w8 != nullptr;
                             const int status = native_w8 ? rocknpu_matmul_w8a8_pair_f32_f32_m1(
                                 context->runtime,
@@ -1335,7 +1395,7 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                     // server concurrency despite avoiding first-use conversion.
                     rocknpu_w8_tensor * native_w8 = m == 1 ? rocknpu_w8_sidecar_get(
                         context, weights->name, k, n,
-                        static_cast<const uint8_t *>(weights->data), ggml_nbytes(weights)) : nullptr;
+                        static_cast<const uint8_t *>(weights->data), ggml_nbytes(weights), weights->type) : nullptr;
                     const int hybrid_status = native_w8 != nullptr && m == 1
                         ? rocknpu_hybrid_m1(context, weights, activations, node, native_w8, k, n)
                         : -1;
