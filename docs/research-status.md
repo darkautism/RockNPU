@@ -261,6 +261,13 @@ Quality (Mean KLD / same top-1 vs CPU): prefill W8A8 0.0232 / 93.1 %; NPU decode
 - Q+V+K single concat call across splits: +2 % steady, extra resident W8 copy of Q/K/V; closed. (C4)
 - Qwen steady-state prefill CPU samples: flash attention 36 %, SwiGLU 10 %, CPU output head 10 %, activation quantization 10 %.
 
+### Frontend integration (later on 2026-09-26)
+
+- Ollama 0.34.4 (ggml 0.24.0) runs llama-server as its runner, passes `--flash-attn auto` and no `-t`, and its GPU discovery only probes library subdirectories, so ROCKNPU0 is not listed as an Ollama compute device; the runner still loads the plugin from `GGML_BACKEND_PATH` and honours `LLAMA_ARG_DEVICE` / `LLAMA_ARG_REPACK` (weights land in `ROCKNPU_HOST`).
+- With `auto`, llama.cpp disables flash attention because the NPU device does not run it ("Flash Attention not supported, set to disabled"); with 8 threads the A55 cluster stalls every step. Through Ollama: prompt 70–83 tok/s, sporadic < 1 tok/s generation on the first request. Env fix (KEEP): `LLAMA_ARG_THREADS=4`, `LLAMA_ARG_FLASH_ATTN=on`, `OLLAMA_FLASH_ATTENTION=1` → prompt ≈ 300 tok/s, generation ≈ 30 (stock CPU Ollama ≈ 100 / 23; TinyLlama, 329-token prompt).
+- Stock llama.cpp CPU with weight repacking decodes 5–20 % faster than the no-repack CPU path RockNPU needs (TinyLlama 32.2 vs 30.7, Llama‑3.2‑1B 26.0 vs 22.8, Qwen2.5‑1.5B 22.5 vs 18.8); repacked weights are unreadable by the NPU and the repacked layout is private to ggml-cpu, so this is a documented trade-off.
+- Qwen2.5‑1.5B vs RKLLM (published W8A8, TTFT 378 ms @128, 16.7 tok/s): RockNPU pp128 ≈ 350, CPU decode 18.8–19.8 (o16/o8).
+
 ### Next
 
 1. CPU share of prefill: flash attention (17 % TinyLlama, 36 % Qwen of CPU samples); move QK^T/AV to the NPU (H2) or overlap it.
