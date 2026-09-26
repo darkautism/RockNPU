@@ -66,6 +66,7 @@ Disposition:
 | Hybrid helper thread (big cores or A55 cluster) | Oversubscribes the OpenMP team or slows NPU submission; replaced by the overlap callback. | C4 | CLOSED |
 | NPU 1 GHz (850 mV) for LLM work | Decode primitive and pp128 unchanged within 2 % vs 700 MHz. | C4 | CLOSED |
 | `-fa off` with NPU prefill | pp128 452 → 326. | C4 | CLOSED |
+| Prefill Q+V+K as one concatenated M-tile call (Q node stashes V/K for the later split) | Steady pp128 556 → ~567 (+2 %), but the first measured run drops to 290 (concat weight build) and a third resident W8 copy of Q/K/V is kept (~115 MB TinyLlama, ~440 MB at 3B). Not worth the memory on 8 GB boards. | C4 | CLOSED |
 
 ## Important measurement lessons
 

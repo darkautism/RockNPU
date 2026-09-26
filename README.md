@@ -69,6 +69,9 @@ llama-server -m 你的模型.gguf
 然後用瀏覽器開啟 `http://開發板IP:8080`。
 確認有用到 NPU：`llama-server --list-devices` 會列出 `ROCKNPU0: RockNPU RK3588`。
 
+小技巧：`taskset -c 4-7 llama-server -m 你的模型.gguf -t 4` 把 llama.cpp 固定在 4 顆大核上，讀提示詞再快約 10%。
+載入模型後的**第一個**請求會稍慢（NPU 正在把權重轉成 8-bit，TinyLlama 約 1 秒），之後就是全速。
+
 ### Ollama
 
 ```sh
@@ -77,8 +80,10 @@ sudo systemctl stop ollama                         # 停掉系統服務，改用
 . ~/.local/share/rocknpu/rocknpu.env
 ollama serve
 # 另開一個終端機：
-ollama run tinyllama
+ollama run tinyllama:1.1b-chat-v1-q4_K_M
 ```
+
+模型請選 `Q4_K_M` 之類的 K-quant 版本（Ollama 的預設標籤常是 `Q4_0`，NPU 不加速）。
 
 Ollama 0.34.x 使用與 RockNPU 相同的 llama.cpp 版本（`b10969`），不需要修改 Ollama。
 其他版本請以 `LLAMA_REF=<該版本 llama.cpp 的 tag> ./scripts/install.sh` 重新編譯。
