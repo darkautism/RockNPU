@@ -49,11 +49,14 @@ cd RockNPU
 
 第一次使用若提示沒有 `/dev/accel/accel0` 權限，執行 `sudo usermod -aG render $USER` 後重新登入即可。
 
-（選用，建議）套用系統調校，讓 NPU 中斷不打擾運算核心：
+（選用，強烈建議）讓 NPU 跑在 700 MHz，並套用系統調校：
 
 ```sh
+sudo ./scripts/rocknpu-tune.sh dvfs      # 編譯並載入 NPU 調頻驅動模組（需要核心 headers）
 sudo ./scripts/rocknpu-tune.sh install   # 開機自動套用；要還原：sudo ./scripts/rocknpu-tune.sh restore
 ```
+
+主線核心的 NPU 驅動沒有調頻功能，NPU 會停在開機時的 200 MHz：讀提示詞約慢 40%。`dvfs` 使用社群的 [rk3588-npu-gpu](https://github.com/sky-rk3588/rk3588-npu-gpu) 調頻模組（不改電壓、不寫入系統檔案，`restore` 後重開機即恢復原廠）。
 
 ## 開始使用
 
@@ -98,8 +101,8 @@ Ollama 0.34.x 使用與 RockNPU 相同的 llama.cpp 版本（`b10969`），不�
 GGUF 的 Q4_K / Q6_K 權重（例如常見的 `Q4_K_M`）。NPU 以 W8A8 執行投影層；其餘運算與不支援的格式自動交給 CPU，所以任何 llama.cpp 能跑的模型都能跑，只是加速程度不同。
 記憶體：NPU 需要另外保存一份 8-bit 權重，約為模型參數量（1B 模型約 1 GB）。
 
-**Q：NPU 超頻到 1 GHz 有幫助嗎？**
-實測在 LLM 工作上 700 MHz 與 1 GHz 幾乎沒有差異（瓶頸在記憶體與主機端，不在 NPU 運算），不需要冒險加壓超頻。細節見 [架構.md](架構.md#npu-頻率)。
+**Q：NPU 頻率重要嗎？要超頻到 1 GHz 嗎？**
+200 MHz（主線預設）→ 700 MHz 很重要：讀提示詞 326 → 556 tok/s。700 MHz → 1 GHz（需加壓到 850 mV）實測幾乎沒有差異（瓶頸在記憶體與主機端），不需要冒險。細節見 [架構.md](架構.md#npu-頻率)。
 
 ## 更多
 

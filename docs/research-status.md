@@ -232,7 +232,7 @@ Boards o8/o16 (Orange Pi 5, LPDDR4X-2112), NPU 700 MHz unless stated, TinyLlama 
 
 ### Promoted (KEEP)
 
-- Cached regcmd replay per resident weight and dropping four redundant BO syncs per worker in the direct-scratch M=1 path: NPU decode 18.5 → 20.9 tok/s; outputs bit-identical (KL). 
+- Cached regcmd replay per resident weight and dropping four redundant BO syncs per worker in the direct-scratch M=1 path: NPU decode 18.5 → 20.9 tok/s; outputs bit-identical (KL).
 - In-process GGUF → W8 conversion with the sidecar's exact semantics; sidecar becomes an optional startup cache (KL bit-identical).
 - Direct-submit M-tile prefill: per-core threads stage/submit/wait, int32 rescaled straight from the mapped BO into the destination (N-split) or summed per row (K-split); same-input projection grouping (concat-N); any M tiled as 128-row tiles + zero-padded tail (default ubatch 512 and odd prompt lengths now stay on the NPU). pp128 116 → 344 (flags) → 496; KL bit-identical to the threaded path for ub 100/128.
 - `GOMP_SPINCOUNT=20000` for the frontend: default libgomp spinning of idle llama.cpp threads starves the backend's host work; pp128 496 → 551, pp512 371 → 408, CPU decode unchanged (33.2 vs 32.9). 5000 hurts CPU decode.

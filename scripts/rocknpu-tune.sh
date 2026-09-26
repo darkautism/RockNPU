@@ -4,6 +4,7 @@
 #
 #   sudo ./scripts/rocknpu-tune.sh apply     # apply now (until reboot)
 #   sudo ./scripts/rocknpu-tune.sh install   # apply now and at every boot (systemd)
+#   sudo ./scripts/rocknpu-tune.sh dvfs      # optional: NPU frequency scaling module (see below)
 #   sudo ./scripts/rocknpu-tune.sh restore   # back to the distribution defaults
 #   ./scripts/rocknpu-tune.sh status         # show the current state
 #
@@ -15,7 +16,21 @@
 #   * CPU frequency governor = performance;
 #   * if the NPU exposes devfreq, it runs at the highest frequency the
 #     current rail voltage allows.
+#
+# `dvfs` (optional): the mainline rocket driver has no frequency scaling and
+# leaves the NPU at its 200 MHz boot clock (prompt processing ~40 % slower,
+# NPU decode ~60 % slower than at 700 MHz). It builds the out-of-tree rocket
+# driver with devfreq from https://github.com/sky-rk3588/rk3588-npu-gpu
+# (pinned commit below) against the running kernel's headers, swaps it in
+# and, once `install` has been run, again at every boot. Nothing is written
+# to /lib/modules or the boot files; `restore` returns to the stock module at
+# the next reboot. No voltage change is made: at the stock 800 mV rail the
+# driver allows up to 700 MHz, which is also where LLM throughput saturates.
 set -eu
+
+DVFS_REPO=https://github.com/sky-rk3588/rk3588-npu-gpu
+DVFS_COMMIT=ed52a89afa8e68fedf636c8e891bd8fc47e82d26
+DVFS_KO=/usr/local/lib/rocknpu/rocket-devfreq.ko
 
 mode=${1:-status}
 npu_devfreq=/sys/class/devfreq/fdab0000.npu
@@ -53,8 +68,46 @@ set_cpu_sleep() {
     done
 }
 
+swap_dvfs_module() {
+    [ -f "$DVFS_KO" ] || return 0
+    [ -d "$npu_devfreq" ] && return 0
+    if command -v modinfo >/dev/null 2>&1 &&
+        ! modinfo -F vermagic "$DVFS_KO" 2>/dev/null | grep -q "^$(uname -r) "; then
+        echo "rocket-devfreq.ko was built for another kernel; run: sudo $0 dvfs" >&2
+        return 0
+    fi
+    if command -v fuser >/dev/null 2>&1 && fuser /dev/accel/accel0 >/dev/null 2>&1; then
+        echo "the NPU is in use; stop llama.cpp/Ollama first" >&2
+        return 0
+    fi
+    rmmod rocket 2>/dev/null || true
+    if ! insmod "$DVFS_KO"; then
+        echo "loading rocket-devfreq.ko failed; restoring the stock driver" >&2
+        modprobe rocket || true
+    fi
+}
+
+build_dvfs() {
+    need_root
+    src=/usr/local/src/rk3588-npu-gpu
+    [ -d /lib/modules/"$(uname -r)"/build ] || {
+        echo "kernel headers missing (Armbian: sudo armbian-config -> Kernel headers, or apt install linux-headers-current-rockchip64)" >&2
+        exit 1
+    }
+    if [ ! -d "$src/.git" ]; then
+        git clone "$DVFS_REPO" "$src"
+    fi
+    git -C "$src" fetch -q origin || true
+    git -C "$src" checkout -q "$DVFS_COMMIT"
+    make -C /lib/modules/"$(uname -r)"/build M="$src/npu/driver" modules
+    install -D -m 0644 "$src/npu/driver/rocket.ko" "$DVFS_KO"
+    swap_dvfs_module
+    apply
+}
+
 apply() {
     need_root
+    swap_dvfs_module
     core=0
     for dev in fdab0000.npu fdac0000.npu fdad0000.npu; do
         irq=$(irq_for "$dev")
@@ -89,6 +142,7 @@ restore() {
     for p in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do
         echo schedutil >"$p" 2>/dev/null || echo ondemand >"$p" 2>/dev/null || true
     done
+    rm -f "$DVFS_KO"
     [ -f /etc/systemd/system/rocknpu-tune.service ] && {
         systemctl disable --now rocknpu-tune.service >/dev/null 2>&1 || true
         rm -f /etc/systemd/system/rocknpu-tune.service /usr/local/sbin/rocknpu-tune
@@ -102,8 +156,9 @@ install_unit() {
     install -m 0755 "$0" /usr/local/sbin/rocknpu-tune
     cat >/etc/systemd/system/rocknpu-tune.service <<'EOF'
 [Unit]
-Description=RockNPU system tuning (NPU IRQ routing, CPU idle, governors)
-After=multi-user.target
+Description=RockNPU system tuning (NPU IRQ routing, CPU idle, governors, NPU clock)
+After=systemd-modules-load.service
+Before=ollama.service
 
 [Service]
 Type=oneshot
@@ -121,7 +176,8 @@ EOF
 case "$mode" in
     apply) apply ;;
     install) install_unit ;;
+    dvfs) build_dvfs ;;
     restore) restore ;;
     status) status ;;
-    *) echo "usage: $0 {apply|install|restore|status}" >&2; exit 2 ;;
+    *) echo "usage: $0 {apply|install|dvfs|restore|status}" >&2; exit 2 ;;
 esac
