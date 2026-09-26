@@ -252,11 +252,20 @@ pp128 555–564, pp301 432, pp512 415, tg64 32–33 (CPU decode); `npu` decode �
 
 Quality (Mean KLD / same top-1 vs CPU): prefill W8A8 0.0232 / 93.1 %; NPU decode 0.0220 / 93.7 %; hybrid decode 0.0099 / 97.0 %; CPU decode exact.
 
+### Other models (later on 2026-09-26)
+
+- Shape generalization (KEEP): K-split for any 512-aligned K ≤ 12288; 128-row tiles whose per-core K slice would exceed 2048 run as two 64-row halves (also fixes a hard error for 2048 < K ≤ 4096 at 128 rows); N > 8192 as ≤ 8192 column chunks; K ≡ 256 (mod 512) zero-padded (exact); N-split pool from N ≥ 768. pp128: Llama‑3.2‑1B 260 → 580 (CPU 42), Qwen2.5‑1.5B 31 → 311 (CPU 28); TinyLlama unchanged and KL bit-identical. (C4)
+- Qwen2.5‑0.5B (hidden 896) has no K-quant projection tensors and stays on the CPU (correct, no speedup).
+- Prompt-quality: per-token int8 activation quantization is the dominant W8A8 error for all three models. Two-part activation encoding (int8 + int8 residual rows through the same kernels, `ROCKNPU_PREFILL_HILO`) cuts KLD 4–5× (TinyLlama 0.0232 → 0.0043, Llama 0.0180 → 0.0042, Qwen 0.0425 → 0.0119) but halves prefill speed; FFN-down only gives ~half the gain for −23 %. Kept opt-in. (C4)
+- Outlier census (8×RMS threshold): outliers are per-token and spread over 20–40 channels (attention/FFN inputs) to hundreds (down inputs); removing them narrows the scale only 2–4×. An LLM.int8()-style fixed outlier-channel split is not a cheap substitute. (C4)
+- Q+V+K single concat call across splits: +2 % steady, extra resident W8 copy of Q/K/V; closed. (C4)
+- Qwen steady-state prefill CPU samples: flash attention 36 %, SwiGLU 10 %, CPU output head 10 %, activation quantization 10 %.
+
 ### Next
 
-1. CPU share of prefill: flash attention is ~17 % of prefill samples; move QK^T/AV to the NPU (H2) or overlap it.
-2. Host share of prefill: activation quantization (~40 ms per 128-token batch before grouping), Q not yet grouped with V/K (different GGML splits; needs a cross-split stash like the M=1 triple).
-3. W8A8 prefill quality: per-row activation int8 is the main error term (KLD 0.023); investigate outlier-aware activation handling.
+1. CPU share of prefill: flash attention (17 % TinyLlama, 36 % Qwen of CPU samples); move QK^T/AV to the NPU (H2) or overlap it.
+2. A cheaper precision mechanism than doubling NPU rows (e.g. per-K-group activation scales inside the K-split, or residual rows only for the rows/tiles whose scale is outlier-dominated).
+3. Host share of prefill: activation quantization (~10 % of CPU samples).
 
 ## Current hypotheses
 
