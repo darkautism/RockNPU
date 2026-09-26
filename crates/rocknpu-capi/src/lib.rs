@@ -1928,18 +1928,17 @@ fn native_mtile_routes_enabled() -> bool {
 /// precision. Models with large activation outliers (Qwen) lose most of
 /// their W8A8 error this way, at the cost of twice the NPU rows.
 ///
-/// `ROCKNPU_PREFILL_HILO`: `0` off, `1` always, `auto` only when some row's
-/// largest value exceeds `HILO_AUTO_RATIO` times its RMS.
+/// `ROCKNPU_PREFILL_HILO`: `0` off (default), `1` every prompt projection,
+/// `down` only wide-K projections (FFN down), whose SwiGLU inputs carry the
+/// largest per-token outliers.
 fn hilo_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match env::var("ROCKNPU_PREFILL_HILO").ok().as_deref() {
-        Some("1") | Some("always") => 2,
-        Some("auto") => 1,
+        Some("1") | Some("all") => 2,
+        Some("down") => 1,
         _ => 0,
     })
 }
-
-const HILO_AUTO_RATIO: f32 = 24.0;
 
 thread_local! {
     static HILO_INNER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1967,24 +1966,8 @@ fn hilo_stack(activations: &[f32], m: usize, k: usize) -> Option<Vec<f32>> {
     if mode == 0 || m < 2 || k == 0 || activations.len() != m * k || HILO_INNER.with(|inner| inner.get()) {
         return None;
     }
-    if mode == 1 {
-        let limit = HILO_AUTO_RATIO * HILO_AUTO_RATIO;
-        let needed = activations.par_chunks_exact(k).any(|row| {
-            let mut max_sq = 0.0f32;
-            let mut sum_sq = 0.0f32;
-            for &value in row {
-                let sq = value * value;
-                max_sq = max_sq.max(sq);
-                sum_sq += sq;
-            }
-            max_sq > limit * (sum_sq / k as f32)
-        });
-        if env_enabled("ROCKNPU_HILO_TRACE") {
-            eprintln!("ROCKNPU HILO M={m} K={k} needed={needed}");
-        }
-        if !needed {
-            return None;
-        }
+    if mode == 1 && k <= 4096 && k.is_multiple_of(512) {
+        return None;
     }
     let mut stacked = vec![0.0f32; 2 * m * k];
     let (hi, lo) = stacked.split_at_mut(m * k);
