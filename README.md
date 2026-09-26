@@ -15,21 +15,21 @@
 |---|---:|---:|---:|
 | 讀提示詞（prefill，128 tokens） | 73 tok/s | **≈ 570 tok/s** | ≈ 525 tok/s（TTFT 244 ms） |
 | 讀提示詞（prefill，512 tokens） | 69 tok/s | **≈ 420 tok/s** | — |
-| 生成（decode） | 33 tok/s | **≈ 32–33 tok/s** | 24.4 tok/s |
+| 生成（decode） | 32–33 tok/s | **≈ 31–33 tok/s** | 24.4 tok/s |
 | 輸出品質 | 基準 | 生成階段與 CPU 完全相同；讀提示詞為 W8A8 | W8A8 |
 
 \* RKLLM 無法在測試環境執行，數字取自 [airockchip/rknn-llm 官方 benchmark](https://github.com/airockchip/rknn-llm/blob/main/benchmark.md)（W8A8，最高 CPU/NPU 頻率）。
 RockNPU 數字為 NPU 700 MHz、llama-bench、4 個 A76 執行緒。詳細方法與原始數據見 [架構.md](架構.md#效能與量測方法)。
 
-其他模型（讀提示詞 128 tokens，tok/s）：
+其他模型（tok/s；「只用 CPU」為原版 llama.cpp 預設設定）：
 
-| 模型（Q4_K_M） | 只用 CPU | **RockNPU** | 參考：RKLLM 官方* |
-|---|---:|---:|---:|
-| Llama‑3.2‑1B‑Instruct | 42 | **≈ 580** | — |
-| Qwen2.5‑1.5B‑Instruct | 28 | **≈ 350** | ≈ 340（TTFT 378 ms） |
-| Qwen2.5‑0.5B‑Instruct | 71 | 71（不加速，見常見問題） | — |
+| 模型（Q4_K_M） | 讀提示詞 128：只用 CPU | **RockNPU** | RKLLM* | 生成：只用 CPU | **RockNPU** | RKLLM* |
+|---|---:|---:|---:|---:|---:|---:|
+| Llama‑3.2‑1B‑Instruct | 71 | **≈ 580** | — | 26 | 23 | — |
+| Qwen2.5‑1.5B‑Instruct | 55 | **≈ 350** | ≈ 340 | 22.5 | 19–20 | 16.7 |
+| Qwen2.5‑0.5B‑Instruct | 71 | 71（不加速，見常見問題） | — | — | — | 41.6（Qwen2 0.5B） |
 
-白話：**貼長文件、長對話歷史給模型時，等待回應的時間大約縮短為 1/7**；生成速度維持 CPU 的最佳水準（RK3588 的 LPDDR4X 記憶體頻寬決定了生成速度的上限，CPU 的 4-bit 路徑在這一步已是最快，所以 RockNPU 預設讓 CPU 負責生成、NPU 負責讀提示詞）。
+白話：**貼長文件、長對話歷史給模型時，等待回應的時間縮短為 1/6–1/8**；生成仍由 CPU 負責（RK3588 的記憶體頻寬決定了生成速度的上限，CPU 的 4-bit 路徑在這一步最快），但比原版 llama.cpp 慢 5–15 %，原因見常見問題「生成比原版 llama.cpp 慢一點？」。
 
 ---
 
@@ -110,6 +110,9 @@ Ollama 0.34.x 使用與 RockNPU 相同的 llama.cpp 版本（`b10969`），不�
 **Q：讀提示詞的結果跟純 CPU 完全一樣嗎？**
 不完全一樣：NPU 以 8-bit 整數（W8A8，與閉源 RKLLM 相同的做法）計算讀提示詞的部分，下一個字與 CPU 相同的比例約 91–94 %；生成階段預設由 CPU 計算，與原版 llama.cpp 相同。
 重視精度可設 `export ROCKNPU_PREFILL_HILO=down`（誤差約減半，讀提示詞慢約 23 %）或 `=1`（誤差約為 1/5，慢約一半，仍比 CPU 快 3–6 倍）。
+
+**Q：生成比原版 llama.cpp 慢一點？**
+是的，約 5–15 %（模型越大差越多）。原版 llama.cpp 會把權重「重新排列」成 CPU 專用格式（repack），生成時快一些；但 NPU 讀不了重新排列後的權重，所以 RockNPU 需要 `LLAMA_ARG_REPACK=false`。如果你的用法幾乎都是很短的提示詞、很長的輸出，可以不載入 RockNPU 設定（或 `export LLAMA_ARG_REPACK=true`），改回純 CPU。
 
 **Q：想讓 NPU 也負責生成（把 CPU 讓給別的程式）？**
 `export ROCKNPU_DECODE=npu`（約 20 tok/s，CPU 幾乎閒置）或 `ROCKNPU_DECODE=hybrid`（CPU 與 NPU 一起算，約 26 tok/s）。預設 `cpu` 最快。
