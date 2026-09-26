@@ -76,6 +76,7 @@ struct rocknpu_backend_context {
     size_t ffn_pair_calls = 0;
     size_t qkv_triple_calls = 0;
     size_t qkv_stash_hits = 0;
+    size_t mtile_group_calls = 0;
     size_t native_w8_calls = 0;
     size_t m4_calls = 0;
     size_t m8_calls = 0;
@@ -673,7 +674,7 @@ void rocknpu_backend_free(ggml_backend_t backend) {
     auto * context = static_cast<rocknpu_backend_context *>(backend->context);
     if (rocknpu_trace_enabled() || rocknpu_env_enabled("ROCKNPU_DISPATCH_SUMMARY")) {
         std::fprintf(stderr,
-            "ROCKNPU GGML TRACE summary q4_K_mul_mat=%zu q6_K_mul_mat=%zu f16_mul_mat=%zu w4a4_m1_mul_mat=%zu w8a8_m1_mul_mat=%zu native_w8_calls=%zu vk_pair_calls=%zu ffn_pair_calls=%zu qkv_triple_calls=%zu qkv_stash_hits=%zu\n",
+            "ROCKNPU GGML TRACE summary q4_K_mul_mat=%zu q6_K_mul_mat=%zu f16_mul_mat=%zu w4a4_m1_mul_mat=%zu w8a8_m1_mul_mat=%zu native_w8_calls=%zu vk_pair_calls=%zu ffn_pair_calls=%zu qkv_triple_calls=%zu qkv_stash_hits=%zu mtile_group_calls=%zu\n",
             context->q4_k_mul_mat_calls,
             context->q6_k_mul_mat_calls,
             context->f16_mul_mat_calls,
@@ -683,7 +684,8 @@ void rocknpu_backend_free(ggml_backend_t backend) {
             context->vk_pair_calls,
             context->ffn_pair_calls,
             context->qkv_triple_calls,
-            context->qkv_stash_hits);
+            context->qkv_stash_hits,
+            context->mtile_group_calls);
         rocknpu_decode_cache_stats cache = {};
         if (rocknpu_context_decode_cache_stats(context->runtime, &cache) == ROCKNPU_STATUS_OK) {
             const double hit_ms = static_cast<double>(cache.hit_ns) / 1.0e6;
@@ -782,6 +784,77 @@ void rocknpu_backend_free(ggml_backend_t backend) {
     rocknpu_context_destroy(context->runtime);
     delete context;
     delete backend;
+}
+
+// Prefill-sized quantized projection eligible for same-input grouping.
+bool rocknpu_mtile_group_m1_candidate(const ggml_tensor * node) {
+    static const bool enabled = rocknpu_env_enabled_default("ROCKNPU_MTILE_GROUP", true);
+    if (!enabled || node == nullptr || node->op != GGML_OP_MUL_MAT) return false;
+    const ggml_tensor * w = node->src[0];
+    const ggml_tensor * a = node->src[1];
+    if (w == nullptr || a == nullptr || (w->type != GGML_TYPE_Q4_K && w->type != GGML_TYPE_Q6_K)) return false;
+    const int64_t m = a->ne[1];
+    const int64_t k = w->ne[0];
+    return (m == 32 || m == 48 || m == 64 || m == 128) && a->type == GGML_TYPE_F32 &&
+           node->type == GGML_TYPE_F32 && ggml_is_contiguous(a) && ggml_is_contiguous(node) &&
+           a->ne[2] == 1 && a->ne[3] == 1 && k % 512 == 0 && k <= (m > 64 ? 2048 : 4096) &&
+           w->ne[1] % 32 == 0;
+}
+
+// Run the projection at graph node `first` together with the later
+// projections of this split that read the same activations, as one
+// concatenated-N NPU M-tile call. Returns how many projections ran (0 = none).
+int rocknpu_mtile_group(rocknpu_backend_context * context, ggml_cgraph * graph, int first,
+                        std::vector<const ggml_tensor *> & done) {
+    ggml_tensor * lead = graph->nodes[first];
+    const ggml_tensor * activations = lead->src[1];
+    ggml_tensor * members[4] = { lead };
+    int count = 1;
+    for (int j = first + 1; j < graph->n_nodes && count < 4; ++j) {
+        ggml_tensor * candidate = graph->nodes[j];
+        if (candidate == nullptr || (candidate->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) continue;
+        if (candidate->op == GGML_OP_MUL_MAT && candidate->src[1] == activations &&
+            candidate->src[0]->ne[0] == lead->src[0]->ne[0] &&
+            rocknpu_mtile_group_m1_candidate(candidate) && rocknpu_mul_mat_supported(candidate)) {
+            members[count++] = candidate;
+        }
+    }
+    int64_t total_n = 0;
+    for (int g = 0; g < count; ++g) total_n += members[g]->src[0]->ne[1];
+    // A single wide projection keeps its dedicated (K-split capable) path.
+    if (count == 1) return 0;
+    if (total_n > 3 * 8192) return 0;
+    const uint8_t * weights[4];
+    size_t bytes[4];
+    uint32_t kinds[4];
+    size_t ns[4];
+    float * outputs[4];
+    for (int g = 0; g < count; ++g) {
+        const ggml_tensor * w = members[g]->src[0];
+        weights[g] = static_cast<const uint8_t *>(w->data);
+        bytes[g] = ggml_nbytes(w);
+        kinds[g] = w->type == GGML_TYPE_Q4_K ? 4 : 6;
+        ns[g] = static_cast<size_t>(w->ne[1]);
+        outputs[g] = static_cast<float *>(members[g]->data);
+    }
+    const size_t m = static_cast<size_t>(activations->ne[1]);
+    const size_t k = static_cast<size_t>(lead->src[0]->ne[0]);
+    const int status = rocknpu_matmul_q_concat_f32_f32_mtile(
+        context->runtime, static_cast<size_t>(count), weights, bytes, kinds, ns,
+        static_cast<const float *>(activations->data), outputs, m, k);
+    if (status != ROCKNPU_STATUS_OK) return 0;
+    for (int g = 0; g < count; ++g) {
+        const ggml_tensor * w = members[g]->src[0];
+        if (w->type == GGML_TYPE_Q4_K) context->q4_k_mul_mat_calls++; else context->q6_k_mul_mat_calls++;
+        if (g > 0) done.push_back(members[g]);
+    }
+    context->m_other_calls += static_cast<size_t>(count);
+    context->mtile_group_calls++;
+    if (rocknpu_trace_enabled()) {
+        std::fprintf(stderr, "ROCKNPU GGML TRACE mtile_group lead=%s count=%d M=%zu K=%zu N=%lld\n",
+            lead->src[0]->name, count, m, k, static_cast<long long>(total_n));
+    }
+    return count;
 }
 
 enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
@@ -890,9 +963,15 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
         }
     } timer { context, std::chrono::steady_clock::now() };
     context->graph_compute_nodes += static_cast<size_t>(graph->n_nodes);
+    // Projections already computed by a same-input group earlier in this split.
+    std::vector<const ggml_tensor *> grouped_done;
     for (int i = 0; i < graph->n_nodes; ++i) {
         ggml_tensor * node = graph->nodes[i];
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (!grouped_done.empty() &&
+            std::find(grouped_done.begin(), grouped_done.end(), node) != grouped_done.end()) {
             continue;
         }
 
@@ -900,6 +979,10 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
             case GGML_OP_MUL_MAT: {
                 if (!rocknpu_mul_mat_supported(node)) {
                     return GGML_STATUS_FAILED;
+                }
+                if (rocknpu_mtile_group_m1_candidate(node)) {
+                    const int grouped = rocknpu_mtile_group(context, graph, i, grouped_done);
+                    if (grouped > 0) break;
                 }
                 if (rocknpu_env_enabled("ROCKNPU_NPU_OUTPUT_HEAD")) {
                     const ggml_tensor * output_weights = node->src[0];

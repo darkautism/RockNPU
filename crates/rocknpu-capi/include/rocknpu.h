@@ -44,6 +44,14 @@ void rocknpu_context_destroy(rocknpu_context * context);
 typedef void (*rocknpu_overlap_fn)(void * user_data);
 int rocknpu_context_set_overlap(rocknpu_context * context, rocknpu_overlap_fn callback, void * user_data);
 
+/* 1..4 same-input Q4_K/Q6_K projections (kinds 4/6) executed as one
+ * concatenated-N direct M-tile NPU call; outputs[i] receives [m, ns[i]].
+ * Returns non-zero when the grouped path is unavailable. */
+int rocknpu_matmul_q_concat_f32_f32_mtile(
+    rocknpu_context * context, size_t count,
+    const uint8_t * const * weights, const size_t * bytes, const uint32_t * kinds, const size_t * ns,
+    const float * activations_mk_f32, float * const * outputs, size_t m, size_t k);
+
 int rocknpu_prewarm_quantized_m16(
     rocknpu_context * context,
     const uint8_t * weights,

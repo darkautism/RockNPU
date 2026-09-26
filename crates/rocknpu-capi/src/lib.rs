@@ -228,6 +228,8 @@ pub struct RockNpuContext {
     decode_ksplit_calls: usize,
     /// Reused int32 [M,N] accumulator for the direct M-tile path.
     mtile_i32: Vec<i32>,
+    /// Same-input projections concatenated along N for the direct M-tile path.
+    decode_mtile_concat_weights: HashMap<Vec<DecodeWeightKey>, CachedW8MtilePoolWeight>,
     /// One-shot host work to run while the next M=1 NPU projection is in
     /// flight (see `rocknpu_context_set_overlap`).
     overlap: Option<(OverlapFn, usize)>,
@@ -1828,6 +1830,250 @@ where
     STATUS_OK
 }
 
+/// Direct-submit M-tile execution of 1..=4 same-input projections whose W8
+/// rows are concatenated along N into one resident matrix: activations are
+/// quantized, staged and submitted once, and the output columns are rescaled
+/// back into each projection's own [M, n_i] buffer.
+fn execute_cached_w8a8_mtile_concat<F>(
+    context: &mut RockNpuContext,
+    keys: Vec<DecodeWeightKey>,
+    m: usize,
+    activations_mk_f32: &[f32],
+    outputs: &mut [&mut [f32]],
+    prepare: F,
+) -> i32
+where
+    F: FnOnce() -> Option<(Vec<i8>, Vec<f32>)>,
+{
+    if !matches!(m, 4 | 8 | 12 | 16 | 32 | 48 | 64 | 128)
+        || keys.is_empty()
+        || keys.len() != outputs.len()
+        || !context.decode_pool.direct_enabled()
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let k = keys[0].k;
+    let total_n: usize = keys.iter().map(|key| key.n).sum();
+    if keys.iter().any(|key| key.k != k || !key.n.is_multiple_of(32))
+        || k == 0
+        || !k.is_multiple_of(512)
+        || k > if m > 64 { 2048 } else { 4096 }
+        || total_n < 96
+        || total_n > 3 * 8192
+        || activations_mk_f32.len() != m.saturating_mul(k)
+        || outputs
+            .iter()
+            .zip(&keys)
+            .any(|(out, key)| out.len() != m.saturating_mul(key.n))
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    let quant_started = context.mtile_profile.as_ref().map(|_| Instant::now());
+    let mut activations_i8 = vec![0i8; m * k];
+    let mut activation_scales = vec![0.0f32; m];
+    let quantized_ok = activations_mk_f32
+        .par_chunks_exact(k)
+        .zip(activations_i8.par_chunks_exact_mut(k))
+        .zip(activation_scales.par_iter_mut())
+        .all(|((row, out), scale)| match quantize_symmetric_into(row, out) {
+            Some(row_scale) => {
+                *scale = row_scale;
+                true
+            }
+            None => false,
+        });
+    if !quantized_ok {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    if let (Some(profile), Some(started)) = (context.mtile_profile.as_mut(), quant_started) {
+        profile.quant_ns += started.elapsed().as_nanos();
+    }
+
+    let RockNpuContext {
+        decode_pool,
+        decode_mtile_concat_weights,
+        mtile_profile,
+        mtile_i32,
+        ..
+    } = context;
+    let cached = match decode_mtile_concat_weights.entry(keys.clone()) {
+        Entry::Occupied(entry) => {
+            if let Some(profile) = mtile_profile.as_mut() {
+                profile.cache_hits += 1;
+            }
+            entry.into_mut()
+        }
+        Entry::Vacant(entry) => {
+            let started = Instant::now();
+            let Some((weights_i8, scales)) = prepare() else {
+                return STATUS_INVALID_ARGUMENT;
+            };
+            if weights_i8.len() != total_n.saturating_mul(k) || scales.len() != total_n {
+                return STATUS_INVALID_ARGUMENT;
+            }
+            let workers = (total_n / 32).min(3);
+            let prepared = match decode_pool.prepare_weights_mtile_direct_with_split(
+                Arc::<[i8]>::from(weights_i8),
+                k,
+                total_n,
+                workers,
+                Int8DecodeSplit::N,
+            ) {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    if env_enabled("ROCKNPU_MTILE_TRACE") {
+                        eprintln!("ROCKNPU MTILE ERROR concat prepare M={m} K={k} N={total_n}: {err}");
+                    }
+                    return STATUS_EXECUTION_ERROR;
+                }
+            };
+            if let Some(profile) = mtile_profile.as_mut() {
+                profile.cache_misses += 1;
+                profile.weight_prepare_ns += started.elapsed().as_nanos();
+            }
+            entry.insert(CachedW8MtilePoolWeight { prepared, scales })
+        }
+    };
+    if !cached.prepared.is_direct() {
+        return STATUS_EXECUTION_ERROR;
+    }
+
+    let started = Instant::now();
+    mtile_i32.resize(m * total_n, 0);
+    if let Err(err) =
+        decode_pool.execute_prepared_mtile_direct(m, &activations_i8, &cached.prepared, mtile_i32)
+    {
+        if env_enabled("ROCKNPU_MTILE_TRACE") {
+            eprintln!("ROCKNPU MTILE ERROR concat execute M={m} K={k} N={total_n}: {err}");
+        }
+        return STATUS_EXECUTION_ERROR;
+    }
+    if let Some(profile) = mtile_profile.as_mut() {
+        profile.calls += 1;
+        profile.execute_total_ns += started.elapsed().as_nanos();
+    }
+
+    let rescale_started = mtile_profile.as_ref().map(|_| Instant::now());
+    let scales = &cached.scales;
+    let values = &mtile_i32[..];
+    let mut column = 0usize;
+    for (output, key) in outputs.iter_mut().zip(&keys) {
+        let n = key.n;
+        let member_scales = &scales[column..column + n];
+        output
+            .par_chunks_exact_mut(n)
+            .enumerate()
+            .for_each(|(row, out)| {
+                let start = row * total_n + column;
+                rescale_i32_row(
+                    &values[start..start + n],
+                    member_scales,
+                    activation_scales[row],
+                    out,
+                );
+            });
+        column += n;
+    }
+    if let (Some(profile), Some(started)) = (mtile_profile.as_mut(), rescale_started) {
+        profile.rescale_ns += started.elapsed().as_nanos();
+    }
+    STATUS_OK
+}
+
+/// Run 1..=4 same-input Q4_K/Q6_K projections as one concatenated-N direct
+/// M-tile NPU call. `kinds` holds 4 (Q4_K) or 6 (Q6_K) per projection.
+/// Returns an error status when the grouped path is unavailable so callers
+/// can fall back to per-projection execution.
+///
+/// # Safety
+/// Every pointer array must hold `count` entries whose buffers satisfy the
+/// stated lengths (weights `bytes[i]`, outputs `m * ns[i]` floats) and the
+/// activations `m * k` floats, for the duration of this synchronous call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rocknpu_matmul_q_concat_f32_f32_mtile(
+    context: *mut RockNpuContext,
+    count: usize,
+    weights: *const *const u8,
+    bytes: *const usize,
+    kinds: *const u32,
+    ns: *const usize,
+    activations_mk_f32: *const f32,
+    outputs: *const *mut f32,
+    m: usize,
+    k: usize,
+) -> i32 {
+    if context.is_null()
+        || !(1..=4).contains(&count)
+        || weights.is_null()
+        || bytes.is_null()
+        || kinds.is_null()
+        || ns.is_null()
+        || activations_mk_f32.is_null()
+        || outputs.is_null()
+        || m == 0
+        || k == 0
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let (weights, bytes, kinds, ns, outputs_raw) = unsafe {
+        (
+            slice::from_raw_parts(weights, count),
+            slice::from_raw_parts(bytes, count),
+            slice::from_raw_parts(kinds, count),
+            slice::from_raw_parts(ns, count),
+            slice::from_raw_parts(outputs, count),
+        )
+    };
+    let mut keys = Vec::with_capacity(count);
+    let mut sources = Vec::with_capacity(count);
+    for i in 0..count {
+        if weights[i].is_null() || outputs_raw[i].is_null() || ns[i] == 0 {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let kind = match kinds[i] {
+            4 => DecodeWeightKind::Q4K,
+            6 => DecodeWeightKind::Q6K,
+            _ => return STATUS_INVALID_ARGUMENT,
+        };
+        let source = unsafe { slice::from_raw_parts(weights[i], bytes[i]) };
+        keys.push(DecodeWeightKey {
+            address: source.as_ptr() as usize,
+            bytes: bytes[i],
+            k,
+            n: ns[i],
+            kind,
+        });
+        sources.push(source);
+    }
+    let Some(a_len) = m.checked_mul(k) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let activations = unsafe { slice::from_raw_parts(activations_mk_f32, a_len) };
+    let mut outputs: Vec<&mut [f32]> = Vec::with_capacity(count);
+    for i in 0..count {
+        let Some(len) = m.checked_mul(ns[i]) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        outputs.push(unsafe { slice::from_raw_parts_mut(outputs_raw[i], len) });
+    }
+    let context = unsafe { &mut *context };
+    let prepare_keys = keys.clone();
+    execute_cached_w8a8_mtile_concat(context, keys, m, activations, &mut outputs, move || {
+        let mut all_weights = Vec::new();
+        let mut all_scales = Vec::new();
+        for (key, source) in prepare_keys.iter().zip(sources) {
+            let (w, sc) = match key.kind {
+                DecodeWeightKind::Q4K => prepare_q4_k_w8a8(source, key.k, key.n)?,
+                DecodeWeightKind::Q6K => prepare_q6_k_w8a8(source, key.k, key.n)?,
+            };
+            all_weights.extend_from_slice(&w);
+            all_scales.extend_from_slice(&sc);
+        }
+        Some((all_weights, all_scales))
+    })
+}
+
 fn execute_cached_w8a8_mtile_pair_pool<F>(
     context: &mut RockNpuContext,
     key: DecodePairKey,
@@ -2984,6 +3230,7 @@ pub extern "C" fn rocknpu_context_create() -> *mut RockNpuContext {
             decode_worker_calls: [0; 3],
             decode_ksplit_calls: 0,
             mtile_i32: Vec::new(),
+            decode_mtile_concat_weights: HashMap::new(),
             overlap: None,
         })),
         _ => ptr::null_mut(),
