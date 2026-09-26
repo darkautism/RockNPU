@@ -4,6 +4,7 @@ use rocket_runtime::{RocketBuffer, RocketDevice, RocketOwnedBuffer, Task};
 use rocknpu_regcmd::{
     INT8_REGCMD_COUNT, Int8DecodeDesc, Int8EncodeError, encode_int8_decode_m1, encode_int8_mtile,
 };
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::os::fd::RawFd;
@@ -127,7 +128,16 @@ pub(crate) struct Int8OwnedScratch {
     regcmd: RocketOwnedBuffer,
     input: RocketOwnedBuffer,
     partials: RocketOwnedBuffer,
+    /// Register commands only depend on the resident weight slice and this
+    /// scratch's fixed input/output addresses, so they are encoded once per
+    /// weight and replayed. Key: (weight DMA address, K, N, slices).
+    regcmd_slots: HashMap<(u64, usize, usize, usize), (usize, Vec<Task>)>,
+    regcmd_used: usize,
 }
+
+/// Regcmd arena slots per persistent scratch: one per resident weight of the
+/// same shape (e.g. one per transformer layer) before the arena is recycled.
+const REGCMD_ARENA_SLOTS: usize = 64;
 
 pub struct Int8MtileScratch {
     regcmd: RocketOwnedBuffer,
@@ -397,9 +407,15 @@ impl<'a> Int8DecodeExecutor<'a> {
             .map(|v| v & !4095)
             .ok_or(Int8DecodeError::SizeOverflow)?;
         let regcmd_stride = REGCMD_BYTES;
-        let input_bytes = input_stride.checked_mul(count).ok_or(Int8DecodeError::SizeOverflow)?;
-        let output_bytes = output_stride.checked_mul(count).ok_or(Int8DecodeError::SizeOverflow)?;
-        let regcmd_bytes = regcmd_stride.checked_mul(count).ok_or(Int8DecodeError::SizeOverflow)?;
+        let input_bytes = input_stride
+            .checked_mul(count)
+            .ok_or(Int8DecodeError::SizeOverflow)?;
+        let output_bytes = output_stride
+            .checked_mul(count)
+            .ok_or(Int8DecodeError::SizeOverflow)?;
+        let regcmd_bytes = regcmd_stride
+            .checked_mul(count)
+            .ok_or(Int8DecodeError::SizeOverflow)?;
 
         let alloc_start = Instant::now();
         let needs_grow = scratch_slot.as_ref().is_none_or(|scratch| {
@@ -1192,7 +1208,10 @@ impl<'a> Int8DecodeExecutor<'a> {
         });
         if needs_grow {
             let old = scratch_slot.as_ref();
-            let regcmd_capacity = old.map_or(regcmd_bytes, |s| s.regcmd.len().max(regcmd_bytes));
+            let arena_bytes = regcmd_bytes
+                .checked_mul(REGCMD_ARENA_SLOTS)
+                .ok_or(Int8DecodeError::SizeOverflow)?;
+            let regcmd_capacity = old.map_or(arena_bytes, |s| s.regcmd.len().max(arena_bytes));
             let input_capacity = old.map_or(k, |s| s.input.len().max(k));
             let partial_capacity =
                 old.map_or(partial_bytes, |s| s.partials.len().max(partial_bytes));
@@ -1200,6 +1219,8 @@ impl<'a> Int8DecodeExecutor<'a> {
                 regcmd: self.device.alloc_owned_buffer(regcmd_capacity)?,
                 input: self.device.alloc_owned_buffer(input_capacity)?,
                 partials: self.device.alloc_owned_buffer(partial_capacity)?,
+                regcmd_slots: HashMap::new(),
+                regcmd_used: 0,
             };
             for (addr, len) in [
                 (scratch.regcmd.dma_address(), scratch.regcmd.len()),
@@ -1217,7 +1238,9 @@ impl<'a> Int8DecodeExecutor<'a> {
 
         let pack_start = Instant::now();
         let input_stage_start = Instant::now();
-        scratch.input.prep_relative(0)?;
+        // The CPU only writes this BO and every earlier job that read it was
+        // already completed (waited through the partial BO), so no acquire is
+        // needed; fini cleans the written lines for the device.
         for (dst, src) in scratch.input.as_mut_slice()[..k]
             .iter_mut()
             .zip(a_k.iter().copied())
@@ -1233,47 +1256,63 @@ impl<'a> Int8DecodeExecutor<'a> {
         let partial_stage_ns = 0;
 
         let regcmd_stage_start = Instant::now();
-        scratch.regcmd.prep_relative(0)?;
-        scratch.regcmd.as_mut_slice()[..regcmd_bytes].fill(0);
-        let mut tasks = Vec::with_capacity(slices);
-        for slice in 0..slices {
-            let k0 = slice_k0(slices, slice);
-            let kp = slice_kp(k, slices, slice);
-            let output_offset = slice
-                .checked_mul(n)
-                .and_then(|v| v.checked_mul(4))
-                .ok_or(Int8DecodeError::SizeOverflow)?;
-            let weight_dma = weights
-                .bo
-                .dma_address()
-                .checked_add(
-                    u64::try_from(weights.offsets[slice])
+        let regcmd_key = (weights.bo.dma_address(), k, n, slices);
+        let tasks = if let Some((_, tasks)) = scratch.regcmd_slots.get(&regcmd_key) {
+            tasks.clone()
+        } else {
+            if scratch.regcmd_used + regcmd_bytes > scratch.regcmd.len() {
+                scratch.regcmd_slots.clear();
+                scratch.regcmd_used = 0;
+            }
+            let arena_base = scratch.regcmd_used;
+            scratch.regcmd.as_mut_slice()[arena_base..arena_base + regcmd_bytes].fill(0);
+            let mut tasks = Vec::with_capacity(slices);
+            for slice in 0..slices {
+                let k0 = slice_k0(slices, slice);
+                let kp = slice_kp(k, slices, slice);
+                let output_offset = slice
+                    .checked_mul(n)
+                    .and_then(|v| v.checked_mul(4))
+                    .ok_or(Int8DecodeError::SizeOverflow)?;
+                let weight_dma = weights
+                    .bo
+                    .dma_address()
+                    .checked_add(
+                        u64::try_from(weights.offsets[slice])
+                            .map_err(|_| Int8DecodeError::SizeOverflow)?,
+                    )
+                    .ok_or(Int8DecodeError::SizeOverflow)?;
+                let ops = encode_int8_decode_m1(Int8DecodeDesc::new(
+                    kp,
+                    n,
+                    scratch.input.dma_address()
+                        + u64::try_from(k0).map_err(|_| Int8DecodeError::SizeOverflow)?,
+                    weight_dma,
+                    scratch.partials.dma_address()
+                        + u64::try_from(output_offset)
+                            .map_err(|_| Int8DecodeError::SizeOverflow)?,
+                ))?;
+                let reg_offset = slice
+                    .checked_mul(REGCMD_BYTES)
+                    .and_then(|v| v.checked_add(arena_base))
+                    .ok_or(Int8DecodeError::SizeOverflow)?;
+                write_regcmd_bytes(scratch.regcmd.as_mut_slice(), reg_offset, &ops)?;
+                let reg_addr = scratch.regcmd.dma_address()
+                    + u64::try_from(reg_offset).map_err(|_| Int8DecodeError::SizeOverflow)?;
+                tasks.push(Task {
+                    regcmd: u32::try_from(reg_addr)
+                        .map_err(|_| Int8DecodeError::AddressAbove32Bit(reg_addr))?,
+                    regcmd_count: u32::try_from(ops.len())
                         .map_err(|_| Int8DecodeError::SizeOverflow)?,
-                )
-                .ok_or(Int8DecodeError::SizeOverflow)?;
-            let ops = encode_int8_decode_m1(Int8DecodeDesc::new(
-                kp,
-                n,
-                scratch.input.dma_address()
-                    + u64::try_from(k0).map_err(|_| Int8DecodeError::SizeOverflow)?,
-                weight_dma,
-                scratch.partials.dma_address()
-                    + u64::try_from(output_offset).map_err(|_| Int8DecodeError::SizeOverflow)?,
-            ))?;
-            let reg_offset = slice
-                .checked_mul(REGCMD_BYTES)
-                .ok_or(Int8DecodeError::SizeOverflow)?;
-            write_regcmd_bytes(scratch.regcmd.as_mut_slice(), reg_offset, &ops)?;
-            let reg_addr = scratch.regcmd.dma_address()
-                + u64::try_from(reg_offset).map_err(|_| Int8DecodeError::SizeOverflow)?;
-            tasks.push(Task {
-                regcmd: u32::try_from(reg_addr)
-                    .map_err(|_| Int8DecodeError::AddressAbove32Bit(reg_addr))?,
-                regcmd_count: u32::try_from(ops.len())
-                    .map_err(|_| Int8DecodeError::SizeOverflow)?,
-            });
-        }
-        scratch.regcmd.fini()?;
+                });
+            }
+            scratch.regcmd.fini()?;
+            scratch.regcmd_used += regcmd_bytes;
+            scratch
+                .regcmd_slots
+                .insert(regcmd_key, (arena_base, tasks.clone()));
+            tasks
+        };
         let regcmd_stage_ns = regcmd_stage_start.elapsed().as_nanos();
         let pack_ns = pack_start.elapsed().as_nanos();
 
@@ -1336,9 +1375,10 @@ impl<'a> Int8DecodeExecutor<'a> {
             }
         }
         let host_accum_ns = accum_start.elapsed().as_nanos();
-        let output_fini_start = Instant::now();
-        scratch.partials.fini()?;
-        let output_fini_ns = output_fini_start.elapsed().as_nanos();
+        // The CPU never writes the partial BO: its cached lines stay clean and
+        // the next prep invalidates them after the device write, so no
+        // release is needed here.
+        let output_fini_ns = 0;
 
         Ok(Int8DecodeStats {
             k_slices: pending.slices,
