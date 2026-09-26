@@ -1758,20 +1758,26 @@ where
     if cached.prepared.is_direct() {
         let started = Instant::now();
         mtile_i32.resize(expected_out, 0);
-        if let Err(err) = decode_pool.execute_prepared_mtile_direct(
+        let timings = match decode_pool.execute_prepared_mtile_direct(
             m,
             &activations_i8,
             &cached.prepared,
             mtile_i32,
         ) {
-            if env_enabled("ROCKNPU_MTILE_TRACE") {
-                eprintln!("ROCKNPU MTILE ERROR direct M={m} K={} N={} split={split:?}: {err}", key.k, key.n);
+            Ok(timings) => timings,
+            Err(err) => {
+                if env_enabled("ROCKNPU_MTILE_TRACE") {
+                    eprintln!("ROCKNPU MTILE ERROR direct M={m} K={} N={} split={split:?}: {err}", key.k, key.n);
+                }
+                return STATUS_EXECUTION_ERROR;
             }
-            return STATUS_EXECUTION_ERROR;
-        }
+        };
         if let Some(profile) = mtile_profile.as_mut() {
             profile.calls += 1;
             profile.execute_total_ns += started.elapsed().as_nanos();
+            profile.input_stage_ns += timings.stage_submit_ns;
+            profile.wait_ns += timings.wait_ns;
+            profile.host_accum_ns += timings.consume_ns;
         }
         let rescale_started = mtile_profile.as_ref().map(|_| Instant::now());
         let scales = &cached.scales;
@@ -1941,17 +1947,26 @@ where
 
     let started = Instant::now();
     mtile_i32.resize(m * total_n, 0);
-    if let Err(err) =
-        decode_pool.execute_prepared_mtile_direct(m, &activations_i8, &cached.prepared, mtile_i32)
-    {
-        if env_enabled("ROCKNPU_MTILE_TRACE") {
-            eprintln!("ROCKNPU MTILE ERROR concat execute M={m} K={k} N={total_n}: {err}");
+    let timings = match decode_pool.execute_prepared_mtile_direct(
+        m,
+        &activations_i8,
+        &cached.prepared,
+        mtile_i32,
+    ) {
+        Ok(timings) => timings,
+        Err(err) => {
+            if env_enabled("ROCKNPU_MTILE_TRACE") {
+                eprintln!("ROCKNPU MTILE ERROR concat execute M={m} K={k} N={total_n}: {err}");
+            }
+            return STATUS_EXECUTION_ERROR;
         }
-        return STATUS_EXECUTION_ERROR;
-    }
+    };
     if let Some(profile) = mtile_profile.as_mut() {
         profile.calls += 1;
         profile.execute_total_ns += started.elapsed().as_nanos();
+        profile.input_stage_ns += timings.stage_submit_ns;
+        profile.wait_ns += timings.wait_ns;
+        profile.host_accum_ns += timings.consume_ns;
     }
 
     let rescale_started = mtile_profile.as_ref().map(|_| Instant::now());

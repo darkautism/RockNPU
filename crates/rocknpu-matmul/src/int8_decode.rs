@@ -494,11 +494,14 @@ impl<'a> Int8DecodeExecutor<'a> {
         pending: Int8MtileDirectPending,
         scratch_slot: &mut Option<Int8MtileDirectScratch>,
         consume: &mut dyn FnMut(&[i32]),
-    ) -> Result<(), Int8DecodeError> {
+    ) -> Result<(u128, u128), Int8DecodeError> {
         let scratch = scratch_slot.as_mut().ok_or(Int8DecodeError::InvalidInput(
             "direct M-tile scratch missing",
         ))?;
+        let wait_start = Instant::now();
         scratch.output.prep_relative(WAIT_NS)?;
+        let wait_ns = wait_start.elapsed().as_nanos();
+        let consume_start = Instant::now();
         let values = pending.m * pending.n;
         let bytes = &scratch.output.as_slice()[..values * 4];
         match bytemuck::try_cast_slice::<u8, i32>(bytes) {
@@ -509,7 +512,7 @@ impl<'a> Int8DecodeExecutor<'a> {
             }
         }
         // The CPU only reads this BO; the next acquire invalidates again.
-        Ok(())
+        Ok((wait_ns, consume_start.elapsed().as_nanos()))
     }
 
     /// Execute several same-shape resident W8A8 M-tiles as one Rocket job.

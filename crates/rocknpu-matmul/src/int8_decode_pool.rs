@@ -113,6 +113,14 @@ pub struct Int8DecodePoolStats {
     pub worker_stats: Vec<Int8DecodeStats>,
 }
 
+/// Host/NPU phase split of one direct M-tile call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Int8MtileDirectTimings {
+    pub stage_submit_ns: u128,
+    pub wait_ns: u128,
+    pub consume_ns: u128,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Int8DecodePoolOutput {
     pub values: Vec<i32>,
@@ -609,7 +617,8 @@ impl Int8DecodePool {
         activation: &[i8],
         weights: &Int8DecodePoolPreparedWeights,
         out: &mut [i32],
-    ) -> Result<(), Int8DecodePoolError> {
+    ) -> Result<Int8MtileDirectTimings, Int8DecodePoolError> {
+        let started = Instant::now();
         let direct_workers = self
             .direct_workers
             .as_mut()
@@ -641,6 +650,10 @@ impl Int8DecodePool {
                 })?;
             pendings.push((worker, slice, key, pending));
         }
+        let mut timings = Int8MtileDirectTimings {
+            stage_submit_ns: started.elapsed().as_nanos(),
+            ..Int8MtileDirectTimings::default()
+        };
         let n = weights.n;
         for (index, (worker, slice, key, pending)) in pendings.into_iter().enumerate() {
             let state = &mut direct_workers[worker];
@@ -666,15 +679,17 @@ impl Int8DecodePool {
                     }
                 }
             };
-            executor
+            let (wait_ns, consume_ns) = executor
                 .finish_mtile_direct(pending, slot, &mut consume)
                 .map_err(|err| {
                     Int8DecodePoolError::Worker(format!(
                         "direct M-tile worker {worker} finish: {err}"
                     ))
                 })?;
+            timings.wait_ns += wait_ns;
+            timings.consume_ns += consume_ns;
         }
-        Ok(())
+        Ok(timings)
     }
 
     pub fn prepare_weights_m1_with_split(
