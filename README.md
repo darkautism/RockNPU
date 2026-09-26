@@ -1,141 +1,209 @@
 # RockNPU
 
-**讓 RK3588 的 NPU 幫 llama.cpp / Ollama 跑大語言模型。**
-開源、免 RKNN/RKLLM 閉源函式庫、不必改 llama.cpp 或 Ollama 原始碼，也不必換模型格式：直接用你手上的 GGUF 模型。
+**English** | [繁體中文](README-zh-TW.md)
 
-*English: RockNPU is an open-source RK3588 NPU backend for stock llama.cpp and Ollama. It runs your existing GGUF models, needs no vendor blobs and no frontend patches. Technical documentation: [架構.md](架構.md).*
+**Run large language models through the RK3588 NPU from stock llama.cpp and Ollama.**  
+Open source, no RKNN/RKLLM proprietary runtime required, no llama.cpp/Ollama source patch required, and no model conversion: use your existing GGUF models.
 
 ---
 
-## 能帶來什麼
+## What it does
 
-以 TinyLlama‑1.1B Q4_K_M、Orange Pi 5（RK3588，LPDDR4X）實測：
+Measured with TinyLlama-1.1B Q4_K_M on Orange Pi 5 (RK3588, LPDDR4X):
 
-| 項目 | 只用 CPU（llama.cpp） | **RockNPU** | 參考：閉源 RKLLM 官方數據* |
+| Workload | CPU only (llama.cpp) | **RockNPU** | Reference: published RKLLM result* |
 |---|---:|---:|---:|
-| 讀提示詞（prefill，128 tokens） | 73 tok/s | **≈ 570 tok/s** | ≈ 525 tok/s（TTFT 244 ms） |
-| 讀提示詞（prefill，512 tokens） | 69 tok/s | **≈ 420 tok/s** | — |
-| 生成（decode） | 32–33 tok/s | **≈ 31–33 tok/s** | 24.4 tok/s |
-| 輸出品質 | 基準 | 生成階段與 CPU 完全相同；讀提示詞為 W8A8 | W8A8 |
+| Prefill, 128 tokens | 73 tok/s | **≈ 570 tok/s** | ≈ 525 tok/s (TTFT 244 ms) |
+| Prefill, 512 tokens | 69 tok/s | **≈ 420 tok/s** | — |
+| Decode / generation | 32–33 tok/s | **≈ 31–33 tok/s** | 24.4 tok/s |
+| Output quality | reference | CPU-exact decode; W8A8 prefill | W8A8 |
 
-\* RKLLM 無法在測試環境執行，數字取自 [airockchip/rknn-llm 官方 benchmark](https://github.com/airockchip/rknn-llm/blob/main/benchmark.md)（W8A8，最高 CPU/NPU 頻率）。
-RockNPU 數字為 NPU 700 MHz、llama-bench、4 個 A76 執行緒。詳細方法與原始數據見 [架構.md](架構.md#效能與量測方法)。
+\* RKLLM cannot run in the current validation environment without replacing the kernel, so its numbers are taken from the [official airockchip/rknn-llm benchmark](https://github.com/airockchip/rknn-llm/blob/main/benchmark.md) (W8A8, maximum CPU/NPU clocks).  
+RockNPU numbers use a 700 MHz NPU, llama-bench, and four Cortex-A76 threads. See [架構.md](架構.md#效能與量測方法) for methodology and raw-data notes.
 
-其他模型（tok/s；「只用 CPU」為原版 llama.cpp 預設設定）：
+Other models (tok/s; “CPU only” means stock llama.cpp defaults):
 
-| 模型（Q4_K_M） | 讀提示詞 128：只用 CPU | **RockNPU** | RKLLM* | 生成：只用 CPU | **RockNPU** | RKLLM* |
+| Model (Q4_K_M) | Prefill 128 CPU | **RockNPU** | RKLLM* | Decode CPU | **RockNPU** | RKLLM* |
 |---|---:|---:|---:|---:|---:|---:|
-| Llama‑3.2‑1B‑Instruct | 71 | **≈ 580** | — | 26 | 23 | — |
-| Qwen2.5‑1.5B‑Instruct | 55 | **≈ 350** | ≈ 340 | 22.5 | 19–20 | 16.7 |
-| Qwen2.5‑0.5B‑Instruct | 71 | 71（不加速，見常見問題） | — | — | — | 41.6（Qwen2 0.5B） |
+| Llama-3.2-1B-Instruct | 71 | **≈ 580** | — | 26 | 23 | — |
+| Qwen2.5-1.5B-Instruct | 55 | **≈ 350** | ≈ 340 | 22.5 | 19–20 | 16.7 |
+| Qwen2.5-0.5B-Instruct | 71 | 71 (no acceleration; see FAQ) | — | — | — | 41.6 (Qwen2 0.5B) |
 
-白話：**貼長文件、長對話歷史給模型時，等待回應的時間縮短為 1/6–1/8**；生成仍由 CPU 負責（RK3588 的記憶體頻寬決定了生成速度的上限，CPU 的 4-bit 路徑在這一步最快），但比原版 llama.cpp 慢 5–15 %，原因見常見問題「生成比原版 llama.cpp 慢一點？」。
+For long documents and long conversation history, prompt processing is typically **6–8× faster**. Single-stream decode defaults to the CPU because RK3588 memory bandwidth makes the CPU Q4_K path faster than resident W8 NPU decode. Compared with stock llama.cpp, decode can still be 5–15% slower because RockNPU must disable CPU weight repacking; see the FAQ below.
 
 ---
 
-## 你需要
+## Requirements
 
-- 一塊 RK3588 / RK3588S 開發板（Orange Pi 5 系列、Rock 5 系列……）
-- Linux 核心內建 `rocket` NPU 驅動（Linux 6.18 以上，例如 Armbian 的 *current* 核心）。
-  確認方式：`ls /dev/accel/accel0` 有東西就對了。
-- 約 2 GB 空閒硬碟空間（編譯用）。
+- An RK3588 / RK3588S board, such as Orange Pi 5 or Rock 5.
+- A Linux kernel exposing the mainline-style `rocket` accelerator interface, typically Linux 6.18 or newer.
+  Check with: `ls /dev/accel/accel0`
+- About 2 GB of free disk space for building.
 
-## 安裝（3 步）
+## Install in 3 steps
 
 ```sh
-# 1. 取得 RockNPU
+# 1. Clone RockNPU
 git clone https://github.com/darkautism/RockNPU.git
 cd RockNPU
 
-# 2. 一鍵安裝（自動安裝編譯工具、Rust，並編譯 RockNPU）
-#    還沒有 llama.cpp 的話加上 --with-llama，會順便編譯 llama-server
+# 2. Install build dependencies, Rust, and RockNPU.
+#    Add --with-llama to also build llama-server when llama.cpp is not already installed.
 ./scripts/install.sh --with-llama
 
-# 3. 載入設定（建議把這行加進 ~/.bashrc）
+# 3. Load the generated environment.
+#    Add this line to ~/.bashrc if desired.
 . ~/.local/share/rocknpu/rocknpu.env
 ```
 
-第一次使用若提示沒有 `/dev/accel/accel0` 權限，執行 `sudo usermod -aG render $USER` 後重新登入即可。
+If `/dev/accel/accel0` exists but is not accessible, run `sudo usermod -aG render $USER` and log in again.
 
-（選用，強烈建議）讓 NPU 跑在 700 MHz，並套用系統調校：
-
-```sh
-sudo ./scripts/rocknpu-tune.sh dvfs      # 編譯並載入 NPU 調頻驅動模組（需要核心 headers）
-sudo ./scripts/rocknpu-tune.sh install   # 開機自動套用；要還原：sudo ./scripts/rocknpu-tune.sh restore
-```
-
-主線核心的 NPU 驅動沒有調頻功能，NPU 會停在開機時的 200 MHz：讀提示詞約慢 40%。`dvfs` 使用社群的 [rk3588-npu-gpu](https://github.com/sky-rk3588/rk3588-npu-gpu) 調頻模組（不改電壓、不寫入系統檔案，`restore` 後重開機即恢復原廠）。
-
-## 開始使用
-
-### llama.cpp（網頁聊天介面 / OpenAI 相容 API）
+### Optional but strongly recommended: run the NPU at 700 MHz
 
 ```sh
-llama-server -m 你的模型.gguf
+sudo ./scripts/rocknpu-tune.sh dvfs      # build and load the external devfreq-capable driver; kernel headers required
+sudo ./scripts/rocknpu-tune.sh install   # apply tuning at boot; restore with: sudo ./scripts/rocknpu-tune.sh restore
 ```
 
-然後用瀏覽器開啟 `http://開發板IP:8080`。
-確認有用到 NPU：`llama-server --list-devices` 會列出 `ROCKNPU0: RockNPU RK3588`。
+The mainline `rocket` driver does not currently expose frequency scaling on these systems, so the NPU may remain at its 200 MHz boot clock and prompt processing can be roughly 40% slower.
 
-小技巧：`taskset -c 4-7 llama-server -m 你的模型.gguf -t 4` 把 llama.cpp 固定在 4 顆大核上，讀提示詞再快約 10%。
-載入模型後的**第一個**請求會稍慢（NPU 正在把權重轉成 8-bit，TinyLlama 約 1 秒），之後就是全速。
+`dvfs` directly downloads, builds, and loads the community-maintained [rk3588-npu-gpu](https://github.com/sky-rk3588/rk3588-npu-gpu) module. **RockNPU does not modify or maintain that kernel module.** It does not change the NPU voltage or replace the boot kernel; `restore` followed by a reboot returns to the distribution driver.
+
+For the RockNPU LLM path, performance is already near saturation around 700 MHz. Testing at 1 GHz showed no reproducible throughput gain, so 700 MHz is the recommended performance target.
+
+## Usage
+
+### llama.cpp / llama-server
+
+```sh
+llama-server -m your-model.gguf
+```
+
+Open `http://BOARD_IP:8080`.
+
+Confirm the backend is visible:
+
+```sh
+llama-server --list-devices
+```
+
+Expected output includes:
+
+```text
+ROCKNPU0: RockNPU RK3588
+```
+
+For best results, pin llama.cpp to the four large cores:
+
+```sh
+taskset -c 4-7 llama-server -m your-model.gguf -t 4
+```
+
+This improves prompt processing by roughly another 10% on the validated systems.
+
+The first request after model loading is slower because RockNPU prepares 8-bit NPU weights. For TinyLlama this takes roughly one second; steady-state requests are faster.
 
 ### Ollama
 
 ```sh
-curl -fsSL https://ollama.com/install.sh | sh     # 安裝 Ollama（已安裝可略過）
-sudo systemctl stop ollama                         # 停掉系統服務，改用帶 RockNPU 設定的版本
+curl -fsSL https://ollama.com/install.sh | sh
+sudo systemctl stop ollama
 . ~/.local/share/rocknpu/rocknpu.env
 ollama serve
-# 另開一個終端機：
+
+# In another terminal:
 ollama run tinyllama:1.1b-chat-v1-q4_K_M
 ```
 
-模型請選 `Q4_K_M` 之類的 K-quant 版本（Ollama 的預設標籤常是 `Q4_0`，NPU 不加速）。
+Use a K-quant model such as `Q4_K_M`. Ollama's default tags are often `Q4_0`, which RockNPU does not accelerate.
 
-Ollama 0.34.x 使用與 RockNPU 相同的 llama.cpp 版本（`b10969`），不需要修改 Ollama（實測 0.34.4）。
-其他版本請以 `LLAMA_REF=<該版本 llama.cpp 的 tag> ./scripts/install.sh` 重新編譯。
+Ollama 0.34.x uses the same llama.cpp line validated by RockNPU (`b10969`); 0.34.4 has been tested without source patches. For another Ollama/llama.cpp revision, rebuild with:
 
-設定檔已替 Ollama 處理好兩件事：只用 4 顆大核（`LLAMA_ARG_THREADS=4`；Ollama 預設用 8 顆，小核會拖慢每一步）以及保持 flash attention 開啟（`OLLAMA_FLASH_ATTENTION=1`）。
-Ollama（TinyLlama Q4_K_M，329 tokens 提示詞）實測：讀提示詞 **≈ 300 tok/s**、生成 **≈ 30 tok/s**；原版 Ollama（只用 CPU）為 ≈ 100 / ≈ 23 tok/s。
-模型載入後的前一兩個請求會慢一些（NPU 正在準備 8-bit 權重）。
+```sh
+LLAMA_REF=<matching llama.cpp tag> ./scripts/install.sh
+```
 
-> 提醒：Ollama 本體約 2 GB。系統裝在 eMMC/SD 卡的板子，建議把 Ollama 與模型放在 NVMe/SSD 上。
+The generated environment config also applies the two settings needed for good Ollama performance:
 
-## 常見問題
+- `LLAMA_ARG_THREADS=4`, avoiding the A55 cores that otherwise stall each step.
+- `OLLAMA_FLASH_ATTENTION=1`, keeping flash attention enabled.
 
-**Q：`--list-devices` 沒有 `ROCKNPU0`？**
-確認已執行 `. ~/.local/share/rocknpu/rocknpu.env`，且 `/dev/accel/accel0` 存在並有讀寫權限。
+Measured with TinyLlama Q4_K_M and a 329-token prompt, Ollama reaches roughly **300 tok/s prefill** and **30 tok/s decode** through RockNPU. Stock CPU-only Ollama on the same setup is roughly 100 / 23 tok/s.
 
-**Q：有列出 NPU，但速度跟 CPU 一樣？**
-請確認環境變數 `LLAMA_ARG_REPACK=false` 有生效（安裝腳本產生的設定檔已包含）。llama.cpp 預設會把權重「重新排列」成只有 CPU 看得懂的格式，NPU 就拿不到工作。
-自行下指令時也可以加上 `--no-repack`。
+> Ollama itself occupies about 2 GB. On boards booting from eMMC or SD, keep Ollama and model storage on NVMe/SSD where possible.
 
-**Q：讀提示詞的結果跟純 CPU 完全一樣嗎？**
-不完全一樣：NPU 以 8-bit 整數（W8A8，與閉源 RKLLM 相同的做法）計算讀提示詞的部分，下一個字與 CPU 相同的比例約 91–94 %；生成階段預設由 CPU 計算，與原版 llama.cpp 相同。
-重視精度可設 `export ROCKNPU_PREFILL_HILO=down`（誤差約減半，讀提示詞慢約 23 %）或 `=1`（誤差約為 1/5，慢約一半，仍比 CPU 快 3–6 倍）。
+## FAQ
 
-**Q：生成比原版 llama.cpp 慢一點？**
-是的，約 5–15 %（模型越大差越多）。原版 llama.cpp 會把權重「重新排列」成 CPU 專用格式（repack），生成時快一些；但 NPU 讀不了重新排列後的權重，所以 RockNPU 需要 `LLAMA_ARG_REPACK=false`。如果你的用法幾乎都是很短的提示詞、很長的輸出，可以不載入 RockNPU 設定（或 `export LLAMA_ARG_REPACK=true`），改回純 CPU。
+**`--list-devices` does not show `ROCKNPU0`. What should I check?**  
+Make sure `. ~/.local/share/rocknpu/rocknpu.env` has been loaded and `/dev/accel/accel0` exists with read/write permission.
 
-**Q：想讓 NPU 也負責生成（把 CPU 讓給別的程式）？**
-`export ROCKNPU_DECODE=npu`（約 20 tok/s，CPU 幾乎閒置）或 `ROCKNPU_DECODE=hybrid`（CPU 與 NPU 一起算，約 26 tok/s）。預設 `cpu` 最快。
+**The NPU appears, but performance is similar to CPU. Why?**  
+Make sure `LLAMA_ARG_REPACK=false` is active. The install script already sets it. llama.cpp's CPU repacking transforms weights into a private CPU-only layout that RockNPU cannot consume. When invoking llama.cpp manually, `--no-repack` is equivalent.
 
-**Q：支援哪些模型？**
-GGUF 的 Q4_K / Q6_K 權重（例如常見的 `Q4_K_M`），隱藏層寬度是 256 的倍數的模型：Llama 3.x、TinyLlama、Qwen2.5 1.5B 以上等。NPU 以 W8A8 執行投影層；其餘運算與不支援的格式自動交給 CPU，所以任何 llama.cpp 能跑的模型都能跑，只是加速程度不同。
-Qwen2.5‑0.5B（寬度 896）的 GGUF 權重不是 K-quant 格式，會完整由 CPU 執行（結果正確，只是沒有加速）。
-記憶體：NPU 需要另外保存一份 8-bit 權重，約為模型參數量（1B 模型約 1 GB）。
+**Is NPU prefill bit-identical to CPU?**  
+No. Prompt projections use W8A8 integer execution, the same broad quantization class used by RKLLM. On the validated models, the next-token top-1 result matches CPU roughly 91–94% of the time. Decode defaults to CPU and is therefore identical to the corresponding no-repack CPU path.
 
-**Q：NPU 頻率重要嗎？要超頻到 1 GHz 嗎？**
-200 MHz（主線預設）→ 700 MHz 很重要：讀提示詞 326 → 556 tok/s。700 MHz → 1 GHz（需加壓到 850 mV）實測幾乎沒有差異（瓶頸在記憶體與主機端），不需要冒險。細節見 [架構.md](架構.md#npu-頻率)。
+For higher prompt accuracy:
 
-## 更多
+```sh
+export ROCKNPU_PREFILL_HILO=down
+```
 
-- 技術架構、所有設定參數、效能量測方法：[架構.md](架構.md)
-- 研究紀錄與已驗證/已否決的方向：[docs/research-status.md](docs/research-status.md)、[trialanderror.md](trialanderror.md)
+This roughly halves quantization error for about a 23% prefill throughput cost.
 
-## 致謝與授權
+Or:
 
-感謝 [oRKLLM/ork-driver](https://github.com/oRKLLM/ork-driver) 對 RK35xx NPU 開創性的逆向工程，RockNPU 以其作為硬體與 regcmd 研究參考。
+```sh
+export ROCKNPU_PREFILL_HILO=1
+```
 
-RockNPU 原創程式碼以 MIT 授權釋出。直接衍生自 ork-driver 的 regcmd 基準保留原 ISC 授權，位於 `crates/rocknpu-regcmd/src/int8/ork_isc.rs`，授權聲明見 `docs/licenses/ork-driver-ISC.txt`。
+This reduces the measured KLD by roughly 4–5× while cutting prefill throughput by about half; it is still substantially faster than CPU on supported models.
+
+**Why is generation a little slower than stock llama.cpp?**  
+Typically by about 5–15%, depending on the model. Stock llama.cpp can repack weights into a CPU-specific layout and decode faster. RockNPU needs `LLAMA_ARG_REPACK=false` so the original GGUF layout remains available to the NPU.
+
+If your workload is almost entirely short prompts followed by very long outputs, pure CPU with repacking may be faster overall.
+
+**Can the NPU perform generation too?**  
+Yes:
+
+```sh
+export ROCKNPU_DECODE=npu
+```
+
+This is roughly 20 tok/s for TinyLlama while leaving the CPU mostly idle.
+
+Or:
+
+```sh
+export ROCKNPU_DECODE=hybrid
+```
+
+This runs CPU and NPU concurrently and reaches roughly 26 tok/s. The default `cpu` mode is fastest for single-stream generation.
+
+**Which models are supported?**  
+RockNPU accelerates Q4_K / Q6_K GGUF projection weights, including common `Q4_K_M` models, when the relevant hidden dimensions match the supported NPU geometry. Llama 3.x, TinyLlama, and Qwen2.5 1.5B and larger are representative supported cases.
+
+Unsupported operations and formats remain on the CPU, so models that llama.cpp can run still work; they simply receive less or no NPU acceleration.
+
+Qwen2.5-0.5B has hidden width 896 and its GGUF projection weights do not use the supported K-quant path, so it currently stays on CPU.
+
+The NPU keeps an additional 8-bit copy of accelerated weights. Budget roughly one extra byte per parameter, around 1 GB for a 1B-parameter model.
+
+**Does NPU frequency matter? Should I overclock to 1 GHz?**  
+200 → 700 MHz matters: measured TinyLlama prefill rose from roughly 326 to 556 tok/s.  
+700 MHz → 1 GHz, which also requires raising the NPU rail to about 850 mV, did not produce a meaningful reproducible improvement. The bottleneck has already moved to memory/host-side work, so 1 GHz is not recommended for this workload.
+
+See [架構.md](架構.md#npu-頻率) for details.
+
+## More documentation
+
+- Architecture, settings, and performance methodology: [架構.md](架構.md)
+- Research status and validated/closed experiments: [docs/research-status.md](docs/research-status.md)
+- Trial-and-error ledger: [trialanderror.md](trialanderror.md)
+
+## Credits and license
+
+[oRKLLM/ork-driver](https://github.com/oRKLLM/ork-driver) is an important reverse-engineering reference for RK35xx hardware behavior and register-command research.
+
+Original RockNPU code is MIT licensed. Regcmd reference material directly derived from ork-driver remains under its ISC license in `crates/rocknpu-regcmd/src/int8/ork_isc.rs`; see `docs/licenses/ork-driver-ISC.txt`.
