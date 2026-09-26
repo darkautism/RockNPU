@@ -940,6 +940,19 @@ impl Int8DecodePool {
         activation: Arc<[i8]>,
         weights: &Int8DecodePoolPreparedWeights,
     ) -> Result<Int8DecodePoolOutput, Int8DecodePoolError> {
+        self.execute_prepared_overlap(activation, weights, None)
+    }
+
+    /// Like `execute_prepared`, but runs `overlap` on the calling thread while
+    /// the NPU work is in flight (between submission and completion wait) on
+    /// the direct-submit paths. Other paths run it before executing. It runs
+    /// exactly once when the call succeeds far enough to submit.
+    pub fn execute_prepared_overlap(
+        &mut self,
+        activation: Arc<[i8]>,
+        weights: &Int8DecodePoolPreparedWeights,
+        overlap: Option<&mut dyn FnMut()>,
+    ) -> Result<Int8DecodePoolOutput, Int8DecodePoolError> {
         if activation.len() != weights.k {
             return Err(Int8DecodePoolError::InvalidInput(
                 "activation length must equal prepared K",
@@ -947,9 +960,12 @@ impl Int8DecodePool {
         }
         if self.direct_workers.is_some() {
             if env::var_os("ROCKNPU_EXPERIMENT_DIRECT_SCRATCH").is_some() {
-                return self.execute_prepared_direct_scratch(&activation, weights);
+                return self.execute_prepared_direct_scratch(&activation, weights, overlap);
             }
-            return self.execute_prepared_direct(&activation, weights);
+            return self.execute_prepared_direct(&activation, weights, overlap);
+        }
+        if let Some(overlap) = overlap {
+            overlap();
         }
         let request_id = self.allocate_request_id();
         let start = Instant::now();
@@ -1024,6 +1040,7 @@ impl Int8DecodePool {
         &self,
         activation: &[i8],
         weights: &Int8DecodePoolPreparedWeights,
+        overlap: Option<&mut dyn FnMut()>,
     ) -> Result<Int8DecodePoolOutput, Int8DecodePoolError> {
         let direct_workers = self
             .direct_workers
@@ -1057,6 +1074,9 @@ impl Int8DecodePool {
                     Int8DecodePoolError::Worker(format!("direct worker {worker} begin: {err}"))
                 })?;
             pendings.push((worker, slice, pending));
+        }
+        if let Some(overlap) = overlap {
+            overlap();
         }
 
         let mut values = vec![0i32; weights.n];
@@ -1111,6 +1131,7 @@ impl Int8DecodePool {
         &mut self,
         activation: &[i8],
         weights: &Int8DecodePoolPreparedWeights,
+        overlap: Option<&mut dyn FnMut()>,
     ) -> Result<Int8DecodePoolOutput, Int8DecodePoolError> {
         let direct_workers = self
             .direct_workers
@@ -1152,6 +1173,9 @@ impl Int8DecodePool {
                     ))
                 })?;
             pendings.push((worker, slice, key, pending));
+        }
+        if let Some(overlap) = overlap {
+            overlap();
         }
 
         let mut values = vec![0i32; weights.n];

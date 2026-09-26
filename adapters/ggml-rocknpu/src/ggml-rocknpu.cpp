@@ -3,11 +3,8 @@
 #include "ggml-impl.h"
 #include "rocknpu.h"
 
-#include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
-#include <mutex>
 #include <thread>
 #include <cstdint>
 #include <cstdio>
@@ -57,23 +54,13 @@ struct rocknpu_shape_profile {
     uint64_t ns = 0;
 };
 
-// Concurrent CPU/NPU N-split for M=1 projections. The NPU computes the first
-// n_npu output rows from the resident W8 sidecar while the frontend's own CPU
-// backend computes the remaining rows from the original GGUF blocks.
-struct rocknpu_hybrid_worker {
-    std::thread thread;
-    std::mutex mutex;
-    std::condition_variable cv;
-    std::function<void()> job;
-    bool has_job = false;
-    bool done = false;
-    bool stop = false;
-};
-
+// Concurrent CPU/NPU N-split for M=1 projections: the NPU computes the first
+// rows of a projection from the resident W8 weights while the frontend's own
+// CPU backend computes the remaining rows from the original GGUF blocks on the
+// calling thread, between NPU submission and completion wait.
 struct rocknpu_backend_context {
     rocknpu_context * runtime;
     ggml_backend_t hybrid_cpu = nullptr;
-    rocknpu_hybrid_worker * hybrid_worker = nullptr;
     std::vector<uint8_t> hybrid_graph_mem;
     uint64_t hybrid_npu_ns = 0;
     uint64_t hybrid_cpu_ns = 0;
@@ -339,21 +326,6 @@ bool rocknpu_qkv_triple_enabled() {
     return rocknpu_env_enabled_default("ROCKNPU_QKV_TRIPLE", true);
 }
 
-void rocknpu_hybrid_worker_loop(rocknpu_hybrid_worker * worker) {
-    std::unique_lock<std::mutex> lock(worker->mutex);
-    for (;;) {
-        worker->cv.wait(lock, [&] { return worker->has_job || worker->stop; });
-        if (worker->stop) return;
-        std::function<void()> job = std::move(worker->job);
-        worker->has_job = false;
-        lock.unlock();
-        job();
-        lock.lock();
-        worker->done = true;
-        worker->cv.notify_all();
-    }
-}
-
 struct rocknpu_hybrid_item {
     const ggml_tensor * weights;
     const rocknpu_w8_tensor * w8;
@@ -366,7 +338,7 @@ bool rocknpu_hybrid_init(rocknpu_backend_context * context) {
     if (context->hybrid_cpu != nullptr) return true;
     context->hybrid_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (context->hybrid_cpu == nullptr) return false;
-    int threads = 3;
+    int threads = 4;
     if (const char * value = std::getenv("ROCKNPU_HYBRID_THREADS")) {
         const int parsed = std::atoi(value);
         if (parsed > 0) threads = parsed;
@@ -378,8 +350,6 @@ bool rocknpu_hybrid_init(rocknpu_backend_context * context) {
             ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_set_n_threads"));
         if (set_n_threads != nullptr) set_n_threads(context->hybrid_cpu, threads);
     }
-    context->hybrid_worker = new rocknpu_hybrid_worker {};
-    context->hybrid_worker->thread = std::thread(rocknpu_hybrid_worker_loop, context->hybrid_worker);
     return true;
 }
 
@@ -419,54 +389,55 @@ int rocknpu_hybrid_group(
         ggml_build_forward_expand(graph, d);
     }
 
+    struct overlap_state {
+        ggml_backend_t backend;
+        ggml_cgraph * graph;
+        ggml_status status;
+        bool ran;
+        uint64_t ns;
+    } overlap { context->hybrid_cpu, graph, GGML_STATUS_FAILED, false, 0 };
+    const auto run_cpu = [](void * user_data) {
+        auto * state = static_cast<overlap_state *>(user_data);
+        const auto started = std::chrono::steady_clock::now();
+        state->status = ggml_backend_graph_compute(state->backend, state->graph);
+        state->ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count());
+        state->ran = true;
+    };
     const float * input = static_cast<const float *>(activations->data);
-    int npu_status = ROCKNPU_STATUS_OK;
-    uint64_t npu_ns = 0;
-    rocknpu_hybrid_worker * worker = context->hybrid_worker;
-    {
-        std::lock_guard<std::mutex> lock(worker->mutex);
-        worker->job = [&] {
-            const auto started = std::chrono::steady_clock::now();
-            const rocknpu_hybrid_item & x = items[0];
-            if (count == 1) {
-                npu_status = rocknpu_matmul_w8a8_f32_f32_m1(
-                    context->runtime, x.w8->weights.data(), x.w8->scales.data(), input, x.output, k, x.n_npu);
-            } else if (count == 2) {
-                const rocknpu_hybrid_item & y = items[1];
-                npu_status = rocknpu_matmul_w8a8_pair_f32_f32_m1(
-                    context->runtime,
-                    x.w8->weights.data(), x.w8->scales.data(), x.n_npu,
-                    y.w8->weights.data(), y.w8->scales.data(), y.n_npu,
-                    input, x.output, y.output, k);
-            } else {
-                const rocknpu_hybrid_item & y = items[1];
-                const rocknpu_hybrid_item & z = items[2];
-                npu_status = rocknpu_matmul_w8a8_triple_f32_f32_m1(
-                    context->runtime,
-                    x.w8->weights.data(), x.w8->scales.data(), x.n_npu,
-                    y.w8->weights.data(), y.w8->scales.data(), y.n_npu,
-                    z.w8->weights.data(), z.w8->scales.data(), z.n_npu,
-                    input, x.output, y.output, z.output, k);
-            }
-            npu_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - started).count());
-        };
-        worker->has_job = true;
-        worker->done = false;
+    const auto started = std::chrono::steady_clock::now();
+    rocknpu_context_set_overlap(context->runtime, run_cpu, &overlap);
+    int npu_status;
+    const rocknpu_hybrid_item & x = items[0];
+    if (count == 1) {
+        npu_status = rocknpu_matmul_w8a8_f32_f32_m1(
+            context->runtime, x.w8->weights.data(), x.w8->scales.data(), input, x.output, k, x.n_npu);
+    } else if (count == 2) {
+        const rocknpu_hybrid_item & y = items[1];
+        npu_status = rocknpu_matmul_w8a8_pair_f32_f32_m1(
+            context->runtime,
+            x.w8->weights.data(), x.w8->scales.data(), x.n_npu,
+            y.w8->weights.data(), y.w8->scales.data(), y.n_npu,
+            input, x.output, y.output, k);
+    } else {
+        const rocknpu_hybrid_item & y = items[1];
+        const rocknpu_hybrid_item & z = items[2];
+        npu_status = rocknpu_matmul_w8a8_triple_f32_f32_m1(
+            context->runtime,
+            x.w8->weights.data(), x.w8->scales.data(), x.n_npu,
+            y.w8->weights.data(), y.w8->scales.data(), y.n_npu,
+            z.w8->weights.data(), z.w8->scales.data(), z.n_npu,
+            input, x.output, y.output, z.output, k);
     }
-    worker->cv.notify_all();
-    const auto cpu_started = std::chrono::steady_clock::now();
-    const ggml_status cpu_status = ggml_backend_graph_compute(context->hybrid_cpu, graph);
-    context->hybrid_cpu_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now() - cpu_started).count());
-    {
-        std::unique_lock<std::mutex> lock(worker->mutex);
-        worker->cv.wait(lock, [&] { return worker->done; });
-    }
-    context->hybrid_npu_ns += npu_ns;
+    rocknpu_context_set_overlap(context->runtime, nullptr, nullptr);
+    if (!overlap.ran) run_cpu(&overlap);
+    const uint64_t total_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - started).count());
+    context->hybrid_cpu_ns += overlap.ns;
+    context->hybrid_npu_ns += total_ns;
     context->hybrid_calls++;
     ggml_free(graph_ctx);
-    if (cpu_status != GGML_STATUS_SUCCESS) return ROCKNPU_STATUS_INVALID_ARGUMENT;
+    if (overlap.status != GGML_STATUS_SUCCESS) return ROCKNPU_STATUS_INVALID_ARGUMENT;
     return npu_status;
 }
 
@@ -797,19 +768,10 @@ void rocknpu_backend_free(ggml_backend_t backend) {
     }
     if (context->hybrid_calls > 0 && (rocknpu_trace_enabled() || rocknpu_env_enabled("ROCKNPU_DISPATCH_SUMMARY"))) {
         std::fprintf(stderr,
-            "ROCKNPU GGML TRACE hybrid calls=%zu npu_avg_ms=%.3f cpu_avg_ms=%.3f\n",
+            "ROCKNPU GGML TRACE hybrid calls=%zu total_avg_ms=%.3f cpu_avg_ms=%.3f\n",
             context->hybrid_calls,
             static_cast<double>(context->hybrid_npu_ns) / 1.0e6 / static_cast<double>(context->hybrid_calls),
             static_cast<double>(context->hybrid_cpu_ns) / 1.0e6 / static_cast<double>(context->hybrid_calls));
-    }
-    if (context->hybrid_worker != nullptr) {
-        {
-            std::lock_guard<std::mutex> lock(context->hybrid_worker->mutex);
-            context->hybrid_worker->stop = true;
-        }
-        context->hybrid_worker->cv.notify_all();
-        context->hybrid_worker->thread.join();
-        delete context->hybrid_worker;
     }
     if (context->hybrid_cpu != nullptr) {
         ggml_backend_free(context->hybrid_cpu);

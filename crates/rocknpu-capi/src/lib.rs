@@ -226,6 +226,23 @@ pub struct RockNpuContext {
     decode_cache_miss_ns: u64,
     decode_worker_calls: [usize; 3],
     decode_ksplit_calls: usize,
+    /// One-shot host work to run while the next M=1 NPU projection is in
+    /// flight (see `rocknpu_context_set_overlap`).
+    overlap: Option<(OverlapFn, usize)>,
+}
+
+/// Host callback executed between NPU submission and completion wait.
+pub type OverlapFn = unsafe extern "C" fn(user_data: *mut core::ffi::c_void);
+
+/// Take the pending one-shot overlap callback as a closure for the pool.
+fn take_overlap(overlap: &mut Option<(OverlapFn, usize)>) -> Option<impl FnMut()> {
+    overlap.take().map(|(callback, user_data)| {
+        move || {
+            // SAFETY: the caller of rocknpu_context_set_overlap guarantees the
+            // callback and user data stay valid until the next NPU call returns.
+            unsafe { callback(user_data as *mut core::ffi::c_void) }
+        }
+    })
 }
 
 #[repr(C)]
@@ -1506,6 +1523,7 @@ where
         decode_worker_calls,
         decode_ksplit_calls,
         m1_profile,
+        overlap,
         ..
     } = context;
 
@@ -1558,7 +1576,12 @@ where
         }
     };
 
-    let result = match decode_pool.execute_prepared(Arc::clone(&activation), &cached.prepared) {
+    let mut overlap_fn = take_overlap(overlap);
+    let result = match decode_pool.execute_prepared_overlap(
+        Arc::clone(&activation),
+        &cached.prepared,
+        overlap_fn.as_mut().map(|f| f as &mut dyn FnMut()),
+    ) {
         Ok(result) => result,
         Err(_) => return STATUS_EXECUTION_ERROR,
     };
@@ -2447,6 +2470,7 @@ where
         decode_worker_calls,
         decode_ksplit_calls,
         m1_profile,
+        overlap,
         ..
     } = context;
 
@@ -2520,7 +2544,12 @@ where
         }
     };
 
-    let result = match decode_pool.execute_prepared(Arc::clone(&activation), &cached.prepared) {
+    let mut overlap_fn = take_overlap(overlap);
+    let result = match decode_pool.execute_prepared_overlap(
+        Arc::clone(&activation),
+        &cached.prepared,
+        overlap_fn.as_mut().map(|f| f as &mut dyn FnMut()),
+    ) {
         Ok(result) => result,
         Err(_) => return STATUS_EXECUTION_ERROR,
     };
@@ -2618,6 +2647,7 @@ where
         decode_worker_calls,
         decode_ksplit_calls,
         m1_profile,
+        overlap,
         ..
     } = context;
 
@@ -2673,7 +2703,12 @@ where
         }
     };
 
-    let result = match decode_pool.execute_prepared(Arc::clone(&activation), &cached.prepared) {
+    let mut overlap_fn = take_overlap(overlap);
+    let result = match decode_pool.execute_prepared_overlap(
+        Arc::clone(&activation),
+        &cached.prepared,
+        overlap_fn.as_mut().map(|f| f as &mut dyn FnMut()),
+    ) {
         Ok(result) => result,
         Err(_) => return STATUS_EXECUTION_ERROR,
     };
@@ -2895,6 +2930,7 @@ pub extern "C" fn rocknpu_context_create() -> *mut RockNpuContext {
             decode_cache_miss_ns: 0,
             decode_worker_calls: [0; 3],
             decode_ksplit_calls: 0,
+            overlap: None,
         })),
         _ => ptr::null_mut(),
     }
@@ -2968,6 +3004,29 @@ pub unsafe extern "C" fn rocknpu_context_decode_cache_stats(
             ksplit_calls: context.decode_ksplit_calls,
         };
     }
+    STATUS_OK
+}
+
+/// Register a one-shot host callback for the next M=1 W8 projection
+/// (single, pair or triple). The NPU path invokes it after submitting the
+/// work and before waiting for completion, so host work overlaps the NPU.
+/// It runs at most once; a null callback clears it. Callers must check
+/// whether it ran and run it themselves otherwise (e.g. on errors).
+///
+/// # Safety
+/// `context` must be a live context. The callback and `user_data` must stay
+/// valid until the next NPU projection call returns or the callback is cleared.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rocknpu_context_set_overlap(
+    context: *mut RockNpuContext,
+    callback: Option<OverlapFn>,
+    user_data: *mut core::ffi::c_void,
+) -> i32 {
+    if context.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let context = unsafe { &mut *context };
+    context.overlap = callback.map(|callback| (callback, user_data as usize));
     STATUS_OK
 }
 

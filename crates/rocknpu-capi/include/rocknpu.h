@@ -38,6 +38,12 @@ int rocknpu_context_decode_cache_stats(
     rocknpu_decode_cache_stats * out);
 void rocknpu_context_destroy(rocknpu_context * context);
 
+/* One-shot host callback run between NPU submission and completion wait of
+ * the next M=1 W8 projection (single/pair/triple). Null clears it. The
+ * caller must run the work itself if the callback did not run. */
+typedef void (*rocknpu_overlap_fn)(void * user_data);
+int rocknpu_context_set_overlap(rocknpu_context * context, rocknpu_overlap_fn callback, void * user_data);
+
 int rocknpu_prewarm_quantized_m16(
     rocknpu_context * context,
     const uint8_t * weights,
