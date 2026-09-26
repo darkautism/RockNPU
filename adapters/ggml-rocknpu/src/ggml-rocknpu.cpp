@@ -625,10 +625,10 @@ bool rocknpu_mul_mat_supported(const ggml_tensor * op) {
     const int64_t n = weights->ne[1];
     const int64_t m = activations->ne[1];
     const bool quantized = weights->type == GGML_TYPE_Q4_K || weights->type == GGML_TYPE_Q6_K;
-    // The native W8 M-tile path is validated only up to N=8192. In particular,
-    // TinyLlama's N=32000 vocabulary head is dramatically slower through the
-    // generic FP16 bridge, so leave it on the optimized CPU backend.
-    if (quantized && m > 1 && n > 8192) {
+    // The native W8 M-tile path takes N up to 8192 per tile (wider FFNs run
+    // as column chunks, up to 3 tiles). Vocabulary heads (N=32000+) stay on
+    // the optimized CPU backend.
+    if (quantized && m > 1 && n > (rocknpu_native_mtile_routes() ? 3 * 8192 : 8192)) {
         return false;
     }
     // Large quantized prompt batches are dramatically slower through the
@@ -683,9 +683,9 @@ bool rocknpu_mul_mat_supported(const ggml_tensor * op) {
         return quantized && k > 0 && n > 0 && k % 512 == 0 && n % 32 == 0 && n <= 8192;
     }
     if (quantized && rocknpu_native_mtile_routes()) {
-        // Any batch size runs as native W8A8 M-tiles (the runtime tiles and
-        // pads rows); the full-K tile needs K%512 and N within one tile.
-        return k % 512 == 0 && n % 32 == 0 && n <= 8192;
+        // Any batch size runs as native W8A8 M-tiles: the runtime tiles and
+        // pads rows, zero-pads K to a multiple of 512 and chunks N.
+        return k % 256 == 0 && (k + 511) / 512 * 512 <= 3 * 4096 && n % 32 == 0 && n <= 3 * 8192;
     }
     if (quantized && (m == 4 || m == 8 || m == 12)) {
         // Small-M decode is only useful through the validated persistent W8 path.
@@ -829,7 +829,7 @@ bool rocknpu_mtile_group_m1_candidate(const ggml_tensor * node) {
     // Larger batches are tiled into <=128-row NPU tiles by the runtime.
     return m >= 32 && a->type == GGML_TYPE_F32 &&
            node->type == GGML_TYPE_F32 && ggml_is_contiguous(a) && ggml_is_contiguous(node) &&
-           a->ne[2] == 1 && a->ne[3] == 1 && k % 512 == 0 && k <= (m > 64 ? 2048 : 4096) &&
+           a->ne[2] == 1 && a->ne[3] == 1 && k % 512 == 0 && k <= 4096 &&
            w->ne[1] % 32 == 0;
 }
 
@@ -1411,7 +1411,8 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                         k,
                         n,
                         m == 1 ? (w4a4_m1 ? "w4a4_m1" : "w8a8_m1") :
-                        (rocknpu_small_native_mtile_supported(m, k, n) ? "native_mtile" : "fp16_bridge"));
+                        (rocknpu_small_native_mtile_supported(m, k, n) || rocknpu_native_mtile_routes()
+                             ? "native_mtile" : "fp16_bridge"));
                 }
                 const auto node_started = std::chrono::steady_clock::now();
                 int status;

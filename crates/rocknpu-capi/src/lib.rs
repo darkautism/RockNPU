@@ -1673,7 +1673,7 @@ where
         return STATUS_INVALID_ARGUMENT;
     };
     const MAX_POOL_K: usize = 3 * 4096;
-    const MIN_POOL_N: usize = 2048;
+    const MIN_POOL_N: usize = MTILE_POOL_MIN_N;
     const MAX_POOL_N: usize = 8192;
     let split_shape_valid = match split {
         Int8DecodeSplit::N => key.k <= 4096 && key.n >= MIN_POOL_N,
@@ -1910,11 +1910,230 @@ where
 /// Tile heights the native W8A8 M-tile path executes directly.
 const MTILE_ROWS: [usize; 8] = [4, 8, 12, 16, 32, 48, 64, 128];
 
+/// Prompt projections at least this wide split N across the three NPU cores
+/// (>= 256 columns per core); narrower ones run on one core.
+const MTILE_POOL_MIN_N: usize = 768;
+
 fn native_mtile_routes_enabled() -> bool {
     env_enabled("ROCKNPU_NATIVE_MTILE")
         && env_enabled("ROCKNPU_MTILE_PERSIST")
         && env_enabled("ROCKNPU_W8_MTILE")
         && env_enabled("ROCKNPU_MTILE_MC")
+}
+
+/// Two-part activation encoding for prompt projections: each activation row
+/// is quantized to int8 as usual, and its quantization residual is stacked
+/// as an extra row. The int8 NPU then computes both with the same weights
+/// and the two output halves are added, which gives ~15-bit activation
+/// precision. Models with large activation outliers (Qwen) lose most of
+/// their W8A8 error this way, at the cost of twice the NPU rows.
+///
+/// `ROCKNPU_PREFILL_HILO`: `0` off, `1` always, `auto` only when some row's
+/// largest value exceeds `HILO_AUTO_RATIO` times its RMS.
+fn hilo_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match env::var("ROCKNPU_PREFILL_HILO").ok().as_deref() {
+        Some("1") | Some("always") => 2,
+        Some("auto") => 1,
+        _ => 0,
+    })
+}
+
+const HILO_AUTO_RATIO: f32 = 24.0;
+
+thread_local! {
+    static HILO_INNER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct HiloInner;
+
+impl HiloInner {
+    fn enter() -> Self {
+        HILO_INNER.with(|inner| inner.set(true));
+        HiloInner
+    }
+}
+
+impl Drop for HiloInner {
+    fn drop(&mut self) {
+        HILO_INNER.with(|inner| inner.set(false));
+    }
+}
+
+/// Rows `[x; residual(x)]` for the two-part encoding, or `None` when it is
+/// off or not needed.
+fn hilo_stack(activations: &[f32], m: usize, k: usize) -> Option<Vec<f32>> {
+    let mode = hilo_mode();
+    if mode == 0 || m < 2 || k == 0 || activations.len() != m * k || HILO_INNER.with(|inner| inner.get()) {
+        return None;
+    }
+    if mode == 1 {
+        let limit = HILO_AUTO_RATIO * HILO_AUTO_RATIO;
+        let needed = activations.par_chunks_exact(k).any(|row| {
+            let mut max_sq = 0.0f32;
+            let mut sum_sq = 0.0f32;
+            for &value in row {
+                let sq = value * value;
+                max_sq = max_sq.max(sq);
+                sum_sq += sq;
+            }
+            max_sq > limit * (sum_sq / k as f32)
+        });
+        if env_enabled("ROCKNPU_HILO_TRACE") {
+            eprintln!("ROCKNPU HILO M={m} K={k} needed={needed}");
+        }
+        if !needed {
+            return None;
+        }
+    }
+    let mut stacked = vec![0.0f32; 2 * m * k];
+    let (hi, lo) = stacked.split_at_mut(m * k);
+    hi.copy_from_slice(activations);
+    let ok = activations
+        .par_chunks_exact(k)
+        .zip(lo.par_chunks_exact_mut(k))
+        .all(|(row, residual)| {
+            let mut q = vec![0i8; k];
+            let Some(scale) = quantize_symmetric_into(row, &mut q) else {
+                return false;
+            };
+            for ((r, &x), &qv) in residual.iter_mut().zip(row).zip(&q) {
+                *r = x - f32::from(qv) * scale;
+            }
+            true
+        });
+    ok.then_some(stacked)
+}
+
+/// `output[i] = stacked[i] + stacked[len + i]` for the two output halves.
+fn hilo_sum(output: &mut [f32], stacked: &[f32]) {
+    let (hi, lo) = stacked.split_at(output.len());
+    output
+        .par_chunks_mut(4096)
+        .zip(hi.par_chunks(4096).zip(lo.par_chunks(4096)))
+        .for_each(|(out, (h, l))| {
+            for ((o, &a), &b) in out.iter_mut().zip(h).zip(l) {
+                *o = a + b;
+            }
+        });
+}
+
+/// Split a prompt-batch projection the M-tile kernels cannot take in one
+/// piece. Returns `None` when the shape needs no split.
+///
+/// * Tiles taller than 64 rows allow at most 2048 K per core, so a 128-row
+///   tile whose K is neither <= 2048 nor K-splittable into 2048-wide core
+///   slices (4096 < K <= 6144) runs as two 64-row halves.
+/// * Projections wider than one tile (N > 8192, e.g. an 8960-wide FFN) run
+///   as column chunks of at most 8192 weight rows.
+///
+/// `call(weights, bytes, activations, output, rows, cols)` runs one piece.
+///
+/// # Safety
+/// `weights` must hold `weights_bytes` bytes of `n` equally sized rows,
+/// `activations` `m * k` floats and `output` `m * n` floats.
+unsafe fn split_wide_mtile(
+    m: usize,
+    k: usize,
+    n: usize,
+    weights: *const u8,
+    weights_bytes: usize,
+    activations: *const f32,
+    output: *mut f32,
+    call: impl Fn(*const u8, usize, *const f32, *mut f32, usize, usize) -> i32,
+) -> Option<i32> {
+    let kp = k.next_multiple_of(512);
+    if m == 128 && kp > 2048 && !(kp > 4096 && kp <= 3 * 2048) {
+        for half in 0..2 {
+            let status = unsafe {
+                call(
+                    weights,
+                    weights_bytes,
+                    activations.add(half * 64 * k),
+                    output.add(half * 64 * n),
+                    64,
+                    n,
+                )
+            };
+            if status != STATUS_OK {
+                return Some(status);
+            }
+        }
+        return Some(STATUS_OK);
+    }
+    if n > 8192 && n.is_multiple_of(32) && weights_bytes.is_multiple_of(n) {
+        let row_bytes = weights_bytes / n;
+        let per = (n / 32).div_ceil(n.div_ceil(8192)) * 32;
+        let mut tmp = vec![0.0f32; m * per];
+        let mut n0 = 0;
+        while n0 < n {
+            let cols = per.min(n - n0);
+            let status = call(
+                unsafe { weights.add(n0 * row_bytes) },
+                cols * row_bytes,
+                activations,
+                tmp.as_mut_ptr(),
+                m,
+                cols,
+            );
+            if status != STATUS_OK {
+                return Some(status);
+            }
+            for row in 0..m {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        tmp.as_ptr().add(row * cols),
+                        output.add(row * n + n0),
+                        cols,
+                    );
+                }
+            }
+            n0 += cols;
+        }
+        return Some(STATUS_OK);
+    }
+    None
+}
+
+/// Prompt projections whose K is a multiple of 256 but not of 512 (e.g. an
+/// 8960-wide FFN down projection) run with K zero-padded to the next
+/// multiple of 512. Exact: the padded weights and activations are zero.
+fn execute_padded_k_mtile<F>(
+    context: &mut RockNpuContext,
+    key: DecodeWeightKey,
+    m: usize,
+    activations_mk_f32: &[f32],
+    output_mn_f32: &mut [f32],
+    prepare: F,
+) -> i32
+where
+    F: FnOnce() -> Option<(Vec<i8>, Vec<f32>)>,
+{
+    let k = key.k;
+    let kp = k.next_multiple_of(512);
+    if activations_mk_f32.len() != m * k {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let mut padded = vec![0.0f32; m * kp];
+    for (dst, src) in padded.chunks_exact_mut(kp).zip(activations_mk_f32.chunks_exact(k)) {
+        dst[..k].copy_from_slice(src);
+    }
+    let key = DecodeWeightKey { k: kp, ..key };
+    let prepare = || {
+        let (weights, scales) = prepare()?;
+        let mut padded_weights = vec![0i8; key.n * kp];
+        for (dst, src) in padded_weights.chunks_exact_mut(kp).zip(weights.chunks_exact(k)) {
+            dst[..k].copy_from_slice(src);
+        }
+        Some((padded_weights, scales))
+    };
+    if kp > 4096 {
+        execute_cached_w8a8_mtile_pool(context, key, m, Int8DecodeSplit::K, &padded, output_mn_f32, prepare)
+    } else if key.n >= MTILE_POOL_MIN_N {
+        execute_cached_w8a8_mtile_pool(context, key, m, Int8DecodeSplit::N, &padded, output_mn_f32, prepare)
+    } else {
+        execute_cached_w8a8_mtile(context, key, m, &padded, output_mn_f32, prepare)
+    }
 }
 
 /// Run a row-independent M-row projection as native M-tiles: full 128-row
@@ -2160,6 +2379,41 @@ pub unsafe extern "C" fn rocknpu_matmul_q_concat_f32_f32_mtile(
     {
         return STATUS_INVALID_ARGUMENT;
     }
+    {
+        let activations = unsafe { slice::from_raw_parts(activations_mk_f32, m * k) };
+        if let Some(stacked) = hilo_stack(activations, m, k) {
+            let (ns_slice, outs_slice) =
+                unsafe { (slice::from_raw_parts(ns, count), slice::from_raw_parts(outputs, count)) };
+            let mut stacked_outs: Vec<Vec<f32>> = ns_slice.iter().map(|&cols| vec![0.0f32; 2 * m * cols]).collect();
+            let ptrs: Vec<*mut f32> = stacked_outs.iter_mut().map(|out| out.as_mut_ptr()).collect();
+            let status = {
+                let _inner = HiloInner::enter();
+                unsafe {
+                    rocknpu_matmul_q_concat_f32_f32_mtile(
+                        context,
+                        count,
+                        weights,
+                        bytes,
+                        kinds,
+                        ns,
+                        stacked.as_ptr(),
+                        ptrs.as_ptr(),
+                        2 * m,
+                        k,
+                    )
+                }
+            };
+            if status == STATUS_OK {
+                for ((&out, &cols), stacked_out) in outs_slice.iter().zip(ns_slice).zip(&stacked_outs) {
+                    if out.is_null() {
+                        return STATUS_INVALID_ARGUMENT;
+                    }
+                    hilo_sum(unsafe { slice::from_raw_parts_mut(out, m * cols) }, stacked_out);
+                }
+            }
+            return status;
+        }
+    }
     if !MTILE_ROWS.contains(&m) {
         let (ns_slice, outs_slice) =
             unsafe { (slice::from_raw_parts(ns, count), slice::from_raw_parts(outputs, count)) };
@@ -2170,6 +2424,36 @@ pub unsafe extern "C" fn rocknpu_matmul_q_concat_f32_f32_mtile(
                 )
             })
         };
+    }
+    if m == 128 && k > 2048 {
+        // Tiles taller than 64 rows allow at most 2048 K: two 64-row halves.
+        let (ns_slice, outs_slice) =
+            unsafe { (slice::from_raw_parts(ns, count), slice::from_raw_parts(outputs, count)) };
+        for half in 0..2 {
+            let outs: Vec<*mut f32> = outs_slice
+                .iter()
+                .zip(ns_slice)
+                .map(|(&out, &cols)| out.wrapping_add(half * 64 * cols))
+                .collect();
+            let status = unsafe {
+                rocknpu_matmul_q_concat_f32_f32_mtile(
+                    context,
+                    count,
+                    weights,
+                    bytes,
+                    kinds,
+                    ns,
+                    activations_mk_f32.add(half * 64 * k),
+                    outs.as_ptr(),
+                    64,
+                    k,
+                )
+            };
+            if status != STATUS_OK {
+                return status;
+            }
+        }
+        return STATUS_OK;
     }
     let (weights, bytes, kinds, ns, outputs_raw) = unsafe {
         (
@@ -4592,6 +4876,31 @@ pub unsafe extern "C" fn rocknpu_matmul_q4_k_f32_f32(
 
     // SAFETY: pointer/null/size contracts are validated above. The caller owns
     // the buffers for the duration of this synchronous call.
+    if m > 1 && native_mtile_routes_enabled() {
+        let activations = unsafe { slice::from_raw_parts(activations_mk_f32, a_len) };
+        if let Some(stacked) = hilo_stack(activations, m, k) {
+            let mut stacked_out = vec![0.0f32; 2 * out_len];
+            let status = {
+                let _inner = HiloInner::enter();
+                unsafe {
+                    rocknpu_matmul_q4_k_f32_f32(
+                        context,
+                        weights_nk_q4_k,
+                        weights_bytes,
+                        stacked.as_ptr(),
+                        stacked_out.as_mut_ptr(),
+                        2 * m,
+                        k,
+                        n,
+                    )
+                }
+            };
+            if status == STATUS_OK {
+                hilo_sum(unsafe { slice::from_raw_parts_mut(output_mn_f32, out_len) }, &stacked_out);
+            }
+            return status;
+        }
+    }
     if m > 1 && !MTILE_ROWS.contains(&m) && native_mtile_routes_enabled() {
         // Other prompt/batch sizes run as native tiles: 128-row tiles plus a
         // zero-padded tail.
@@ -4600,6 +4909,25 @@ pub unsafe extern "C" fn rocknpu_matmul_q4_k_f32_f32(
                 rocknpu_matmul_q4_k_f32_f32(context, weights_nk_q4_k, weights_bytes, a, outs[0], tile, k, n)
             })
         };
+    }
+    if m > 1 && native_mtile_routes_enabled() {
+        let split = unsafe {
+            split_wide_mtile(
+                m,
+                k,
+                n,
+                weights_nk_q4_k,
+                weights_bytes,
+                activations_mk_f32,
+                output_mn_f32,
+                |w, bytes, a, out, rows, cols| {
+                    rocknpu_matmul_q4_k_f32_f32(context, w, bytes, a, out, rows, k, cols)
+                },
+            )
+        };
+        if let Some(status) = split {
+            return status;
+        }
     }
 
     let (weight_bytes, activations, output, context) = unsafe {
@@ -4657,8 +4985,31 @@ pub unsafe extern "C" fn rocknpu_matmul_q4_k_f32_f32(
     }
 
     if matches!(m, 4 | 8 | 12 | 16 | 32 | 48 | 64 | 128)
-        && k == 5632
-        && n == 2048
+        && !k.is_multiple_of(512)
+        && k.next_multiple_of(512) <= 3 * 4096
+        && n.is_multiple_of(32)
+        && n <= 8192
+        && native_mtile_routes_enabled()
+        && env_enabled("ROCKNPU_NATIVE_MTILE_DOWN")
+    {
+        let key = DecodeWeightKey {
+            address: weight_bytes.as_ptr() as usize,
+            bytes: weight_bytes.len(),
+            k,
+            n,
+            kind: DecodeWeightKind::Q4K,
+        };
+        return execute_padded_k_mtile(context, key, m, activations, output, || {
+            prepare_q4_k_w8a8(weight_bytes, k, n)
+        });
+    }
+
+    if matches!(m, 4 | 8 | 12 | 16 | 32 | 48 | 64 | 128)
+        && k > 4096
+        && k <= 3 * 4096
+        && k.is_multiple_of(512)
+        && n.is_multiple_of(32)
+        && n <= 8192
         && env_enabled("ROCKNPU_NATIVE_MTILE")
         && env_enabled("ROCKNPU_NATIVE_MTILE_DOWN")
         && env_enabled("ROCKNPU_MTILE_PERSIST")
@@ -4699,7 +5050,7 @@ pub unsafe extern "C" fn rocknpu_matmul_q4_k_f32_f32(
             n,
             kind: DecodeWeightKind::Q4K,
         };
-        if env_enabled("ROCKNPU_MTILE_MC") && n >= 2048 {
+        if env_enabled("ROCKNPU_MTILE_MC") && n >= MTILE_POOL_MIN_N {
             return execute_cached_w8a8_mtile_pool(
                 context,
                 key,
@@ -4862,6 +5213,31 @@ pub unsafe extern "C" fn rocknpu_matmul_q6_k_f32_f32(
 
     // SAFETY: pointer/null/size contracts are validated above. The caller owns
     // the buffers for the duration of this synchronous call.
+    if m > 1 && native_mtile_routes_enabled() {
+        let activations = unsafe { slice::from_raw_parts(activations_mk_f32, a_len) };
+        if let Some(stacked) = hilo_stack(activations, m, k) {
+            let mut stacked_out = vec![0.0f32; 2 * out_len];
+            let status = {
+                let _inner = HiloInner::enter();
+                unsafe {
+                    rocknpu_matmul_q6_k_f32_f32(
+                        context,
+                        weights_nk_q6_k,
+                        weights_bytes,
+                        stacked.as_ptr(),
+                        stacked_out.as_mut_ptr(),
+                        2 * m,
+                        k,
+                        n,
+                    )
+                }
+            };
+            if status == STATUS_OK {
+                hilo_sum(unsafe { slice::from_raw_parts_mut(output_mn_f32, out_len) }, &stacked_out);
+            }
+            return status;
+        }
+    }
     if m > 1 && !MTILE_ROWS.contains(&m) && native_mtile_routes_enabled() {
         // Other prompt/batch sizes run as native tiles: 128-row tiles plus a
         // zero-padded tail.
@@ -4870,6 +5246,25 @@ pub unsafe extern "C" fn rocknpu_matmul_q6_k_f32_f32(
                 rocknpu_matmul_q6_k_f32_f32(context, weights_nk_q6_k, weights_bytes, a, outs[0], tile, k, n)
             })
         };
+    }
+    if m > 1 && native_mtile_routes_enabled() {
+        let split = unsafe {
+            split_wide_mtile(
+                m,
+                k,
+                n,
+                weights_nk_q6_k,
+                weights_bytes,
+                activations_mk_f32,
+                output_mn_f32,
+                |w, bytes, a, out, rows, cols| {
+                    rocknpu_matmul_q6_k_f32_f32(context, w, bytes, a, out, rows, k, cols)
+                },
+            )
+        };
+        if let Some(status) = split {
+            return status;
+        }
     }
 
     let (weight_bytes, activations, output, context) = unsafe {
@@ -4895,8 +5290,31 @@ pub unsafe extern "C" fn rocknpu_matmul_q6_k_f32_f32(
     }
 
     if matches!(m, 4 | 8 | 12 | 16 | 32 | 48 | 64 | 128)
-        && k == 5632
-        && n == 2048
+        && !k.is_multiple_of(512)
+        && k.next_multiple_of(512) <= 3 * 4096
+        && n.is_multiple_of(32)
+        && n <= 8192
+        && native_mtile_routes_enabled()
+        && env_enabled("ROCKNPU_NATIVE_MTILE_DOWN")
+    {
+        let key = DecodeWeightKey {
+            address: weight_bytes.as_ptr() as usize,
+            bytes: weight_bytes.len(),
+            k,
+            n,
+            kind: DecodeWeightKind::Q6K,
+        };
+        return execute_padded_k_mtile(context, key, m, activations, output, || {
+            prepare_q6_k_w8a8(weight_bytes, k, n)
+        });
+    }
+
+    if matches!(m, 4 | 8 | 12 | 16 | 32 | 48 | 64 | 128)
+        && k > 4096
+        && k <= 3 * 4096
+        && k.is_multiple_of(512)
+        && n.is_multiple_of(32)
+        && n <= 8192
         && env_enabled("ROCKNPU_NATIVE_MTILE")
         && env_enabled("ROCKNPU_NATIVE_MTILE_DOWN")
         && env_enabled("ROCKNPU_MTILE_PERSIST")
@@ -4937,7 +5355,7 @@ pub unsafe extern "C" fn rocknpu_matmul_q6_k_f32_f32(
             n,
             kind: DecodeWeightKind::Q6K,
         };
-        if env_enabled("ROCKNPU_MTILE_MC") && n >= 2048 {
+        if env_enabled("ROCKNPU_MTILE_MC") && n >= MTILE_POOL_MIN_N {
             return execute_cached_w8a8_mtile_pool(
                 context,
                 key,
