@@ -1,391 +1,113 @@
 # RockNPU
 
-Open-source Rust userspace runtime/compiler/backend for Rockchip RK3588 NPUs.
+**讓 RK3588 的 NPU 幫 llama.cpp / Ollama 跑大語言模型。**
+開源、免 RKNN/RKLLM 閉源函式庫、不必改 llama.cpp 或 Ollama 原始碼，也不必換模型格式：直接用你手上的 GGUF 模型。
 
-RockNPU fills the userspace gap between standard model/framework frontends and the RK3588 NPU. It owns graph lowering, tensor layouts, quantization, resident weights, register-command generation, userspace scheduling, and framework integration. For llama.cpp-family frontends, the distributable RockNPU backend is a single `libggml-rocknpu.so`; the Rust runtime bridge is linked into that plugin.
+*English: RockNPU is an open-source RK3588 NPU backend for stock llama.cpp and Ollama. It runs your existing GGUF models, needs no vendor blobs and no frontend patches. Technical documentation: [架構.md](架構.md).*
 
-## Quick start
+---
 
-### llama.cpp
+## 能帶來什麼
+
+以 TinyLlama‑1.1B Q4_K_M、Orange Pi 5（RK3588，LPDDR4X）實測：
+
+| 項目 | 只用 CPU（llama.cpp） | **RockNPU** | 參考：閉源 RKLLM 官方數據* |
+|---|---:|---:|---:|
+| 讀提示詞（prefill，128 tokens） | 73 tok/s | **≈ 555 tok/s** | ≈ 525 tok/s（TTFT 244 ms） |
+| 讀提示詞（prefill，512 tokens） | 69 tok/s | **≈ 415 tok/s** | — |
+| 生成（decode） | 33 tok/s | **≈ 32–33 tok/s** | 24.4 tok/s |
+| 輸出品質 | 基準 | 生成階段與 CPU 完全相同；讀提示詞為 W8A8 | W8A8 |
+
+\* RKLLM 無法在測試環境執行，數字取自 [airockchip/rknn-llm 官方 benchmark](https://github.com/airockchip/rknn-llm/blob/main/benchmark.md)（W8A8，最高 CPU/NPU 頻率）。
+RockNPU 數字為 NPU 700 MHz、llama-bench、4 個 A76 執行緒。詳細方法與原始數據見 [架構.md](架構.md#效能與量測方法)。
+
+白話：**貼長文件、長對話歷史給模型時，等待回應的時間大約縮短為 1/7**；生成速度維持 CPU 的最佳水準（RK3588 的 LPDDR4X 記憶體頻寬決定了生成速度的上限，CPU 的 4-bit 路徑在這一步已是最快，所以 RockNPU 預設讓 CPU 負責生成、NPU 負責讀提示詞）。
+
+---
+
+## 你需要
+
+- 一塊 RK3588 / RK3588S 開發板（Orange Pi 5 系列、Rock 5 系列……）
+- Linux 核心內建 `rocket` NPU 驅動（Linux 6.18 以上，例如 Armbian 的 *current* 核心）。
+  確認方式：`ls /dev/accel/accel0` 有東西就對了。
+- 約 2 GB 空閒硬碟空間（編譯用）。
+
+## 安裝（3 步）
 
 ```sh
-git clone --depth 1 -b b10969 https://github.com/ggml-org/llama.cpp.git llama.cpp
-cmake -S llama.cpp -B llama.cpp/build -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_NATIVE=ON -DLLAMA_CURL=OFF && cmake --build llama.cpp/build --target llama-cli -j
-cmake -S adapters/ggml-rocknpu -B target/ggml-rocknpu -DCMAKE_BUILD_TYPE=Release -DGGML_SOURCE_DIR="$PWD/llama.cpp/ggml" && cmake --build target/ggml-rocknpu -j
-export GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so"
-./llama.cpp/build/bin/llama-cli --list-devices && ./llama.cpp/build/bin/llama-cli -dev ROCKNPU0 -m /path/to/model.gguf
+# 1. 取得 RockNPU
+git clone https://github.com/darkautism/RockNPU.git
+cd RockNPU
+
+# 2. 一鍵安裝（自動安裝編譯工具、Rust，並編譯 RockNPU）
+#    還沒有 llama.cpp 的話加上 --with-llama，會順便編譯 llama-server
+./scripts/install.sh --with-llama
+
+# 3. 載入設定（建議把這行加進 ~/.bashrc）
+. ~/.local/share/rocknpu/rocknpu.env
 ```
 
-A usable RK3588 should list `ROCKNPU0: RockNPU RK3588`.
+第一次使用若提示沒有 `/dev/accel/accel0` 權限，執行 `sudo usermod -aG render $USER` 後重新登入即可。
+
+（選用，建議）套用系統調校，讓 NPU 中斷不打擾運算核心：
+
+```sh
+sudo ./scripts/rocknpu-tune.sh install   # 開機自動套用；要還原：sudo ./scripts/rocknpu-tune.sh restore
+```
+
+## 開始使用
+
+### llama.cpp（網頁聊天介面 / OpenAI 相容 API）
+
+```sh
+llama-server -m 你的模型.gguf
+```
+
+然後用瀏覽器開啟 `http://開發板IP:8080`。
+確認有用到 NPU：`llama-server --list-devices` 會列出 `ROCKNPU0: RockNPU RK3588`。
 
 ### Ollama
 
-Build the RockNPU backend once with the llama.cpp steps above, then:
-
 ```sh
-curl -fsSL https://ollama.com/install.sh | sh
-sudo systemctl stop ollama 2>/dev/null || true
-GGML_BACKEND_PATH="$PWD/target/ggml-rocknpu/libggml-rocknpu.so" LLAMA_ARG_DEVICE=ROCKNPU0 ollama serve
-# in another shell:
-ollama run tinyllama:1.1b-chat-v1-q4_K_M
+curl -fsSL https://ollama.com/install.sh | sh     # 安裝 Ollama（已安裝可略過）
+sudo systemctl stop ollama                         # 停掉系統服務，改用帶 RockNPU 設定的版本
+. ~/.local/share/rocknpu/rocknpu.env
+ollama serve
+# 另開一個終端機：
+ollama run tinyllama
 ```
 
-Current Ollama 0.34.x pins llama.cpp `b10969` (commit `391fac16460f15233a7740550d858ac96df3419d`), the same llama.cpp revision used by the validated RockNPU GGML backend. No Ollama source patch is required. `LLAMA_ARG_DEVICE=ROCKNPU0` is the standard llama.cpp device selector inherited by Ollama's runner. The optional W8 sidecar described later improves repeat startup/decode preparation but is not part of the basic install. Real llama.cpp/Ollama CPU-vs-NPU checks are recorded in [the frontend benchmark](docs/benchmarks/2026-09-22/frontend-cpu-npu.md).
+Ollama 0.34.x 使用與 RockNPU 相同的 llama.cpp 版本（`b10969`），不需要修改 Ollama。
+其他版本請以 `LLAMA_REF=<該版本 llama.cpp 的 tag> ./scripts/install.sh` 重新編譯。
 
-> RK3588 storage note: the current Ollama ARM64 bundle itself is about 2 GB before models. On boards whose root filesystem is eMMC/SD, keep the Ollama runtime and `OLLAMA_MODELS` on NVMe/SSD.
+> 提醒：Ollama 本體約 2 GB。系統裝在 eMMC/SD 卡的板子，建議把 Ollama 與模型放在 NVMe/SSD 上。
 
-> You may also like oRKLLM/ork-driver, an important open reverse-engineering reference for RK35xx regcmd, quantized matmul, decode layouts, and multi-core execution.
+## 常見問題
 
-## Project scope
+**Q：`--list-devices` 沒有 `ROCKNPU0`？**
+確認已執行 `. ~/.local/share/rocknpu/rocknpu.env`，且 `/dev/accel/accel0` 存在並有讀寫權限。
 
-RockNPU is a userspace project.
+**Q：有列出 NPU，但速度跟 CPU 一樣？**
+請確認環境變數 `LLAMA_ARG_REPACK=false` 有生效（安裝腳本產生的設定檔已包含）。llama.cpp 預設會把權重「重新排列」成只有 CPU 看得懂的格式，NPU 就拿不到工作。
+自行下指令時也可以加上 `--no-repack`。
 
-It owns:
+**Q：想讓 NPU 也負責生成（把 CPU 讓給別的程式）？**
+`export ROCKNPU_DECODE=npu`（約 20 tok/s，CPU 幾乎閒置）或 `ROCKNPU_DECODE=hybrid`（CPU 與 NPU 一起算，約 26 tok/s）。預設 `cpu` 最快。
 
-- frontend adapters;
-- frontend-neutral IR;
-- tensor/layout contracts;
-- RK3588 operation lowering;
-- register-command synthesis;
-- resident buffers and prepared weights;
-- quantization/dataflow choices;
-- userspace worker/task scheduling;
-- framework/backend integration;
-- correctness and performance validation.
+**Q：支援哪些模型？**
+GGUF 的 Q4_K / Q6_K 權重（例如常見的 `Q4_K_M`）。NPU 以 W8A8 執行投影層；其餘運算與不支援的格式自動交給 CPU，所以任何 llama.cpp 能跑的模型都能跑，只是加速程度不同。
+記憶體：NPU 需要另外保存一份 8-bit 權重，約為模型參數量（1B 模型約 1 GB）。
 
-It does not own or maintain system-space implementation.
+**Q：NPU 超頻到 1 GHz 有幫助嗎？**
+實測在 LLM 工作上 700 MHz 與 1 GHz 幾乎沒有差異（瓶頸在記憶體與主機端，不在 NPU 運算），不需要冒險加壓超頻。細節見 [架構.md](架構.md#npu-頻率)。
 
-If the host exposes a compatible accelerator device at /dev/accel/accel0, RockNPU uses it. If a desired capability is unavailable there, the feature remains unsupported or pending instead of becoming a system-space subproject.
+## 更多
 
-## Current status
+- 技術架構、所有設定參數、效能量測方法：[架構.md](架構.md)
+- 研究紀錄與已驗證/已否決的方向：[docs/research-status.md](docs/research-status.md)、[trialanderror.md](trialanderror.md)
 
-Developer preview.
+## 致謝與授權
 
-Real pretrained models run on real RK3588 hardware.
+感謝 [oRKLLM/ork-driver](https://github.com/oRKLLM/ork-driver) 對 RK35xx NPU 開創性的逆向工程，RockNPU 以其作為硬體與 regcmd 研究參考。
 
-Validated areas include:
-
-- FP16 MatMul and Conv2D;
-- resident/prepacked static weights;
-- ONNX dense/CNN subsets;
-- stock llama.cpp dynamic backend integration;
-- stock Ollama dynamic backend integration with no Ollama source patch;
-- Candle eager/module adapter with a real prepared RockNpuLinear NPU path;
-- TinyLlama Q4_K_M prefill and decode;
-- W8A8 M=1 decode;
-- K=5632 full-K decode;
-- adaptive 1/2/3-worker routing;
-- V/K, gate/up, and Q/V/K userspace projection grouping;
-- native M16/M32/M48/M64/M128 execution;
-- fused FP16 residual for compatible prefill projections;
-- same-job INT8 weight reuse primitive;
-- independent CPU/model correctness oracles.
-
-The largest current LLM performance problem is ordinary M=1 autoregressive decode.
-
-The canonical research direction is docs/research-status.md.
-
-## Architecture
-
-    llama.cpp / GGUF / Candle / ONNX / future framework frontend
-                         |
-                         v
-                    adapter/importer
-                         |
-                         v
-                     rocknpu-ir
-                         |
-                         v
-              executable preparation
-       shape / partition / lowering / placement
-       layout / tiling / quantization / residency
-                         |
-               +---------+---------+
-               |                   |
-               v                   v
-          CPU fallback       RK3588 NPU backend
-                                   |
-                                   v
-                         existing accel device
-
-The frontend-neutral public direction is:
-
-    Graph -> Executable -> Session
-
-Detailed crate ownership is documented in docs/architecture.md.
-
-## Build
-
-Install a current stable Rust toolchain.
-
-    cargo build --workspace
-    cargo test --workspace
-
-Normal RockNPU code does not require proprietary RKNN/RKLLM runtime libraries.
-
-## Device requirement
-
-The NPU backend currently targets RK3588 and expects an accessible accelerator device:
-
-    /dev/accel/accel0
-
-Check:
-
-    test -r /dev/accel/accel0 -a -w /dev/accel/accel0 && echo "accelerator available"
-
-CPU-only tests can run elsewhere, but hardware claims require a real RK3588 NPU.
-
-## Basic hardware smoke
-
-    cargo run --release -p rocket-smoke
-
-This exercises the Rust buffer/submit/register-command path and compares NPU results with CPU references.
-
-Useful decode gates:
-
-    cargo run --release -p rocket-smoke --bin int8_decode_m1 -- 2048 256
-    cargo run --release -p rocket-smoke --bin int8_decode_m1 -- 2048 2048
-    cargo run --release -p rocket-smoke --bin int8_decode_m1 -- 5632 2048
-    cargo run --release -p rocket-smoke --bin int8_mtile -- 128
-    cargo run --release -p rocket-smoke --bin fused_residual -- 16 2048 2048
-    cargo run --release -p rocket-smoke --bin int8_weight_reuse -- 128 256 reuse
-
-See docs/repro.md for the current validation matrix.
-
-## llama.cpp / GGML backend
-
-RockNPU can be loaded by stock, unmodified llama.cpp as an out-of-tree dynamic GGML backend.
-
-Assume:
-
-    export ROCKNPU_DIR=/path/to/RockNPU
-    export LLAMA_CPP_DIR=/path/to/llama.cpp
-
-Build llama.cpp with dynamic backends:
-
-    cmake -S "$LLAMA_CPP_DIR" \
-      -B "$LLAMA_CPP_DIR/build-rocknpu" \
-      -DGGML_BACKEND_DL=ON \
-      -DGGML_NATIVE=ON
-    cmake --build "$LLAMA_CPP_DIR/build-rocknpu" -j
-
-Build the RockNPU plugin:
-
-    cmake -S "$ROCKNPU_DIR/adapters/ggml-rocknpu" \
-      -B "$ROCKNPU_DIR/target/ggml-rocknpu" \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DGGML_SOURCE_DIR="$LLAMA_CPP_DIR/ggml"
-    cmake --build "$ROCKNPU_DIR/target/ggml-rocknpu" -j
-
-Load it:
-
-    export GGML_BACKEND_PATH="$ROCKNPU_DIR/target/ggml-rocknpu/libggml-rocknpu.so"
-
-Verify:
-
-    "$LLAMA_CPP_DIR/build-rocknpu/bin/llama-cli" --list-devices
-
-Expected:
-
-    ROCKNPU0: RockNPU RK3588
-
-The currently validated GGML slice is intentionally model-driven rather than broad for its own sake.
-
-Important TinyLlama paths:
-
-- Q4_K/Q6_K projection import;
-- W8 sidecar;
-- resident decode weights;
-- adaptive M=1 worker routing;
-- V/K pair;
-- gate/up pair;
-- Q/V/K triple grouping;
-- native M-tile verifier/prefill route.
-
-The N=32000 LM head remains on CPU.
-
-## W8 sidecar
-
-The sidecar is provenance-bound to the source GGUF.
-
-Current canonical TinyLlama model SHA-256:
-
-    5c66751b61537f9e55177b1b67e06af88e0e2df88f86de4909f5bf87fb1ae583
-
-Do not reuse a sidecar generated from another model revision.
-
-## TinyLlama status
-
-RockNPU has a real autoregressive TinyLlama path.
-
-Validated model-level work includes:
-
-- all transformer layers;
-- NPU projection execution;
-- resident decode weights;
-- CPU/NPU mixed execution;
-- deterministic greedy comparison with independent llama.cpp / llama-gguf references;
-- explicit handling of near-tie numerical divergences.
-
-Ordinary M=1 decode remains slower than the native CPU reference and is the highest-priority performance target.
-
-Current clean CPU reference:
-
-- native ARM llama.cpp tg128: about 33.88 tok/s on the validated board/settings.
-
-Old NPU absolute throughput results from mixed experimental environments are not current project toplines.
-
-## Current validated userspace performance conclusions
-
-### M128 vs M64
-
-Fresh A-B-B-A at 100% acceptance:
-
-- M64: 126.174 / 122.309 tok/s;
-- M128: 137.932 / 136.478 tok/s.
-
-The useful conclusion is roughly +10.4% at the two-run centers for M128.
-
-### Projection grouping
-
-Default userspace grouping includes:
-
-- V + K;
-- gate + up;
-- Q + V + K.
-
-These execute as larger combined projections rather than merely changing graph labels.
-
-### Weight reuse
-
-Same-job repeated-weight reuse is a real primitive.
-
-Do not force wide TinyLlama projections into narrow column segments merely to trigger it; measured wide-N production attempts regressed substantially.
-
-### W4A4
-
-W4A4 hardware execution is real and locally fast, but tested TinyLlama routes did not preserve model behavior well enough and did not establish a whole-model speed win.
-
-It remains research-only.
-
-## Real pretrained ONNX gates
-
-When corresponding artifacts are available:
-
-    cargo run --release -p rocket-smoke --bin prepared_mnist
-    python3 scripts/verify_real_mnist.py prepared-mnist-npu
-
-    cargo run --release -p rocket-smoke --bin mnist8_cnn_prepared
-    python3 scripts/verify_mnist8.py mnist8-prepared
-
-    cargo run --release -p rocket-smoke --bin cifar10_edgeinfer
-    python3 scripts/verify_cifar10_edgeinfer.py
-
-The Python paths are independent validation oracles.
-
-## Frontend-neutral API
-
-A frontend can lower into RockNPU without using ONNX bytes at runtime:
-
-    use rocknpu::{Executable, Graph, Session};
-
-    let graph: Graph = frontend.lower_to_rocknpu()?;
-    let executable = Executable::compile(graph)?;
-    let session = Session::from_executable(executable)?;
-    let output = session.run(input)?;
-
-ONNX import is one frontend over this contract.
-
-GGML integration is another.
-
-Candle integration is a third: Candle tensors/modules stay in the adapter, while execution uses the same frontend-neutral RockNPU userspace ops/runtime primitives. The first supported Candle module is prepared Linear; this is not yet a full Candle graph compiler.
-
-## Correctness policy
-
-A successful build is not proof that an NPU path works.
-
-Preferred evidence chain:
-
-    independent mathematical/model reference
-                    |
-                    v
-          tensor / primitive differential
-                    |
-                    v
-              real RK3588 NPU
-                    |
-                    v
-            model-level behavior
-
-For risky quantized/dataflow changes:
-
-1. primitive oracle;
-2. layer differential;
-3. deterministic model output;
-4. whole-model performance A/B.
-
-A local microbenchmark is never enough to promote a model path.
-
-## Performance policy
-
-For small expected gains:
-
-- warm both variants;
-- use same-process or tightly interleaved ABBA;
-- record selected worker topology;
-- separate cold preparation from hot execution;
-- keep raw evidence;
-- measure the whole model/request, not only the local operator.
-
-The helper script scripts/bench_llama_cpu_npu.py stores CPU/NPU ABBA evidence and hashes.
-
-## Current research priorities
-
-1. profile current ordinary M=1 decode;
-2. find the next real userspace dataflow/projection reduction after existing QKV and gate/up grouping;
-3. prototype an exact end-to-end NPU attention slice;
-4. find a quality-equivalent FFN intermediate representation;
-5. improve speculative proposer acceptance so M128 verifier capacity is useful;
-6. revisit output head/cold-start work only after the above.
-
-See docs/research-status.md for hypotheses, evidence, and closed directions.
-
-## Workspace
-
-    rocknpu           high-level Graph/Executable/Session API
-    rocknpu-capi      C ABI for external adapters
-    rocknpu-ir        frontend-neutral graph/tensor metadata
-    rocknpu-llm       transformer runtime building blocks
-    rocket-uapi       narrow accelerator ABI wrappers
-    rocket-runtime    safe userspace device/buffer/submit layer
-    rocknpu-regcmd    RK3588 register-command encoders/planners
-    rocknpu-conv      Conv2D execution
-    rocknpu-matmul    MatMul/decode/tiling/residency/worker pools
-    rocknpu-tensor    tensor contracts
-    rocknpu-ops       operator/backend dispatch
-    rocknpu-onnx      ONNX importer/reference executor
-    rocket-smoke      real-hardware gates
-    adapters/ggml-rocknpu
-                      stock llama.cpp dynamic backend
-    adapters/candle-rocknpu
-                      Candle Tensor/Module frontend adapter
-
-## Documentation
-
-- docs/goal.md — project boundary and success criteria
-- docs/architecture.md — userspace architecture
-- docs/research-status.md — canonical current research direction
-- trialanderror.md — closed/validated experiment ledger
-- docs/repro.md — reproducible userspace gates
-
-## Thanks
-
-Special thanks to oRKLLM/ork-driver for pioneering open RK35xx NPU reverse engineering.
-
-RockNPU uses that work as hardware/regcmd research input while maintaining its own Rust userspace architecture.
-
-## License
-
-RockNPU original code is MIT licensed.
-
-The directly source-derived ork-driver regcmd baseline remains isolated with its original ISC attribution under crates/rocknpu-regcmd/src/int8/ork_isc.rs, with the notice also preserved in docs/licenses/ork-driver-ISC.txt.
+RockNPU 原創程式碼以 MIT 授權釋出。直接衍生自 ork-driver 的 regcmd 基準保留原 ISC 授權，位於 `crates/rocknpu-regcmd/src/int8/ork_isc.rs`，授權聲明見 `docs/licenses/ork-driver-ISC.txt`。

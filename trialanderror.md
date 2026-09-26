@@ -30,6 +30,11 @@ Disposition:
 | Keep architecture-specific host preparation such as the validated NEON path when it reduces measured userspace work. | C4 | KEEP |
 | Stock llama.cpp dynamic backend loading is sufficient; do not maintain a llama.cpp fork merely to load RockNPU. | C5 | KEEP |
 | Correctness gates must include an independent model/reference path when model semantics are involved. | C5 | KEEP |
+| Replay cached regcmds per resident weight and skip redundant BO syncs in the direct M=1 path (NPU decode 18.5 → 20.9 tok/s, bit-identical). | C4 | KEEP |
+| Convert GGUF weights to W8 in-process; the sidecar is only a startup cache (KL bit-identical). | C5 | KEEP |
+| Direct-submit M-tile prefill with per-core parallel staging, fused rescale, same-input grouping and any-M tiling (pp128 116 → 496 at defaults; bit-identical KL). | C5 correctness / C4 perf | KEEP |
+| Recommend `GOMP_SPINCOUNT=20000` for frontends (pp128 496 → 551; CPU decode unchanged). | C4 | KEEP |
+| Default single-sequence decode on the CPU (`ROCKNPU_DECODE=cpu`); decode is DRAM-bound on LPDDR4X and Q4_K moves fewer bytes than W8. NPU/hybrid stay opt-in. | C4 | KEEP |
 
 ## Closed experiments
 
@@ -57,6 +62,10 @@ Disposition:
 | Tested n-gram proposers | Neutral or negative on representative prompts. | C4 | CLOSED |
 | CPU thread-count escalation for TinyLlama | More threads are not a stable win; four A76 threads remain the reference. | C4 | CLOSED |
 | Head-only extra CPU threads | Exact but slower. | C4 | CLOSED |
+| Hybrid CPU/NPU M=1 row split as default decode | Best 26.2 tok/s vs CPU 32–33; CPU share slows ~1.4× under NPU DMA (serial/overlap A/B). Kept opt-in. | C4 | CLOSED |
+| Hybrid helper thread (big cores or A55 cluster) | Oversubscribes the OpenMP team or slows NPU submission; replaced by the overlap callback. | C4 | CLOSED |
+| NPU 1 GHz (850 mV) for LLM work | Decode primitive and pp128 unchanged within 2 % vs 700 MHz. | C4 | CLOSED |
+| `-fa off` with NPU prefill | pp128 452 → 326. | C4 | CLOSED |
 
 ## Important measurement lessons
 

@@ -1,6 +1,6 @@
 # RockNPU research status
 
-Last consolidated: 2026-09-22.
+Last consolidated: 2026-09-26 (see "2026-09-26 — decode is bandwidth-bound, prefill becomes the NPU's job" below for the current state; earlier sections are kept as history).
 
 This is the canonical research-direction document. RockNPU is a userspace RK3588 NPU runtime/compiler/backend project. Research is limited to model integration, graph partitioning, tensor/layout work, register-command generation, device submission through the existing public interface, quantization, residency, userspace scheduling, and model-level performance/correctness.
 
@@ -10,7 +10,7 @@ Historical system-driver tuning is intentionally excluded from this document and
 
 Improve real TinyLlama-class inference on RK3588 while preserving reproducibility and model quality.
 
-The immediate performance problem is ordinary autoregressive M=1 decode. Large-M verifier/prefill execution is substantially healthier than M=1 decode, so work should not optimize a local primitive merely because it benchmarks well in isolation.
+Since 2026-09-26 the measured picture is: single-sequence M=1 decode is DRAM-bandwidth bound on LPDDR4X boards and the CPU Q4_K path is the fastest place for it (default `ROCKNPU_DECODE=cpu`); prompt processing and batched decode are the NPU's job (native W8A8 M-tile, direct submit). Remaining NPU work is host-side overhead and the CPU share of prefill (attention). Work should still not optimize a local primitive merely because it benchmarks well in isolation.
 
 Success requires all three:
 
@@ -218,6 +218,45 @@ The `GGML_NATIVE=ON, GGML_CPU_REPACK=ON` llama.cpp build can load `ROCKNPU0` yet
 A separate `GGML_NATIVE=ON, GGML_CPU_REPACK=OFF` build of llama.cpp `391fac1` permits genuine dispatch without changing frontend source. On o8g with the same TinyLlama GGUF, four A76 threads, and the matching W8 sidecar, 32-token warm decode A-B-B-A measured CPU 32.920/32.494 tok/s and NPU 7.307/7.297 tok/s. Each NPU run recorded 10,010 quantized matmul dispatches, including benchmark warmup. RockNPU was about 22.3% of CPU throughput by mean timed latency. This confirms that ordinary M=1 decode still needs a major userspace dataflow or execution improvement.
 
 `scripts/bench_llama_cpu_npu.py` now requests a teardown-only dispatch summary and rejects a nominal NPU run when zero matmuls actually reach RockNPU. The probe intentionally excludes per-op trace logging from the timed path.
+
+## 2026-09-26 — decode is bandwidth-bound, prefill becomes the NPU's job
+
+Boards o8/o16 (Orange Pi 5, LPDDR4X-2112), NPU 700 MHz unless stated, TinyLlama Q4_K_M, llama.cpp `391fac1` (`GGML_CPU_REPACK=OFF` build), 4 A76 threads, `-fa on`. Quality: `llama-perplexity -c 128 -b 128 --chunks 8` KL against CPU logits on wikitext-2 test (`-ub 1` = M=1 decode path, `-ub 128` = prefill path).
+
+### Measured bounds
+
+- NPU M=1 primitive, one core: ~9 GB/s of weight streaming; three cores ~22–31 GB/s marginal. Per-projection fixed cost ~0.12 ms (submit, drm_sched run_job, IRQ, wake). Whole-token NPU decode ≈ 924 MB of W8 per token + 88 × fixed cost → ≈ 20–21 tok/s.
+- CPU llama.cpp decode scales linearly with threads (18.4 / 25.5 / 32 tok/s for 2/3/4 threads): compute-bound at ~0.64 GB/token.
+- NPU clock 700 → 1000 MHz (850 mV rail): M=1 decode primitive and pp128 unchanged within 2 %. Neither path is NPU-compute-bound. (C4)
+- M-tile primitive K=N=2048, one core: M16 450 µs, M32 460 µs, M64 515 µs, M128 715 µs — weight streaming dominates until M≈64.
+
+### Promoted (KEEP)
+
+- Cached regcmd replay per resident weight and dropping four redundant BO syncs per worker in the direct-scratch M=1 path: NPU decode 18.5 → 20.9 tok/s; outputs bit-identical (KL). 
+- In-process GGUF → W8 conversion with the sidecar's exact semantics; sidecar becomes an optional startup cache (KL bit-identical).
+- Direct-submit M-tile prefill: per-core threads stage/submit/wait, int32 rescaled straight from the mapped BO into the destination (N-split) or summed per row (K-split); same-input projection grouping (concat-N); any M tiled as 128-row tiles + zero-padded tail (default ubatch 512 and odd prompt lengths now stay on the NPU). pp128 116 → 344 (flags) → 496; KL bit-identical to the threaded path for ub 100/128.
+- `GOMP_SPINCOUNT=20000` for the frontend: default libgomp spinning of idle llama.cpp threads starves the backend's host work; pp128 496 → 551, pp512 371 → 408, CPU decode unchanged (33.2 vs 32.9). 5000 hurts CPU decode.
+- Validated routes are plugin defaults (setenv without overwrite).
+- Decode placement: `ROCKNPU_DECODE=cpu|npu|hybrid`, default cpu.
+
+### Closed (do not repeat without a new mechanism)
+
+- Hybrid CPU/NPU M=1 N-split as the default decode: best 26.2 tok/s (NPU share 0.2–0.4, overlap on the caller thread) vs CPU 32–33. The CPU share runs ~1.4× slower while the NPU streams (serial vs overlapped A/B: 0.221 vs 0.309 ms for 70 % of rows), so DRAM contention, not scheduling, caps it. Kept as an opt-in mode (KLD 0.0099). (C4)
+- Hybrid helper thread on the big cores (oversubscribes the OpenMP team) or pinned to the A55 cluster (NPU submit path 0.32 → 0.53 ms). Replaced by `rocknpu_context_set_overlap`. (C4)
+- NPU overclock to 1 GHz for LLM work: no measurable gain (see bounds). (C4)
+- `-fa off` for NPU prefill: attention via mul_mat is slower (pp128 452 → 326). (C4)
+
+### Current numbers (o16, 700 MHz, defaults + GOMP_SPINCOUNT=20000)
+
+pp128 555–564, pp301 432, pp512 415, tg64 32–33 (CPU decode); `npu` decode ≈ 20, `hybrid` ≈ 26. Reference points: CPU with repack pp128 73 / pp512 69 / tg 33.3; RKLLM (vendor benchmark, W8A8, max clocks) TinyLlama TTFT 244 ms @128 (≈ 525 tok/s) and 24.43 tok/s decode.
+
+Quality (Mean KLD / same top-1 vs CPU): prefill W8A8 0.0232 / 93.1 %; NPU decode 0.0220 / 93.7 %; hybrid decode 0.0099 / 97.0 %; CPU decode exact.
+
+### Next
+
+1. CPU share of prefill: flash attention is ~17 % of prefill samples; move QK^T/AV to the NPU (H2) or overlap it.
+2. Host share of prefill: activation quantization (~40 ms per 128-token batch before grouping), Q not yet grouped with V/K (different GGML splits; needs a cross-split stash like the M=1 triple).
+3. W8A8 prefill quality: per-row activation int8 is the main error term (KLD 0.023); investigate outlier-aware activation handling.
 
 ## Current hypotheses
 
