@@ -1907,6 +1907,64 @@ where
     STATUS_OK
 }
 
+/// Tile heights the native W8A8 M-tile path executes directly.
+const MTILE_ROWS: [usize; 8] = [4, 8, 12, 16, 32, 48, 64, 128];
+
+fn native_mtile_routes_enabled() -> bool {
+    env_enabled("ROCKNPU_NATIVE_MTILE")
+        && env_enabled("ROCKNPU_MTILE_PERSIST")
+        && env_enabled("ROCKNPU_W8_MTILE")
+        && env_enabled("ROCKNPU_MTILE_MC")
+}
+
+/// Run a row-independent M-row projection as native M-tiles: full 128-row
+/// tiles plus a tail zero-padded up to the next supported tile height.
+/// `run(activations, outputs, tile_m)` executes one tile.
+///
+/// # Safety
+/// `activations` must hold `m * k` floats and `outputs[i]` `m * ns[i]` floats.
+unsafe fn run_mtile_row_chunks(
+    m: usize,
+    k: usize,
+    activations: *const f32,
+    outputs: &[*mut f32],
+    ns: &[usize],
+    mut run: impl FnMut(*const f32, &[*mut f32], usize) -> i32,
+) -> i32 {
+    let mut row = 0usize;
+    while row < m {
+        let rows = (m - row).min(128);
+        let tile = MTILE_ROWS.iter().copied().find(|&t| t >= rows).unwrap_or(128);
+        let a = unsafe { activations.add(row * k) };
+        let status = if tile == rows {
+            let outs: Vec<*mut f32> = outputs
+                .iter()
+                .zip(ns)
+                .map(|(&out, &n)| unsafe { out.add(row * n) })
+                .collect();
+            run(a, &outs, tile)
+        } else {
+            let mut padded_a = vec![0.0f32; tile * k];
+            padded_a[..rows * k].copy_from_slice(unsafe { slice::from_raw_parts(a, rows * k) });
+            let mut padded_out: Vec<Vec<f32>> = ns.iter().map(|&n| vec![0.0f32; tile * n]).collect();
+            let outs: Vec<*mut f32> = padded_out.iter_mut().map(|o| o.as_mut_ptr()).collect();
+            let status = run(padded_a.as_ptr(), &outs, tile);
+            if status == STATUS_OK {
+                for ((&out, &n), tmp) in outputs.iter().zip(ns).zip(&padded_out) {
+                    unsafe { slice::from_raw_parts_mut(out.add(row * n), rows * n) }
+                        .copy_from_slice(&tmp[..rows * n]);
+                }
+            }
+            status
+        };
+        if status != STATUS_OK {
+            return status;
+        }
+        row += rows;
+    }
+    STATUS_OK
+}
+
 /// Direct-submit M-tile execution of 1..=4 same-input projections whose W8
 /// rows are concatenated along N into one resident matrix: activations are
 /// quantized, staged and submitted once, and the output columns are rescaled
@@ -2101,6 +2159,17 @@ pub unsafe extern "C" fn rocknpu_matmul_q_concat_f32_f32_mtile(
         || k == 0
     {
         return STATUS_INVALID_ARGUMENT;
+    }
+    if !MTILE_ROWS.contains(&m) {
+        let (ns_slice, outs_slice) =
+            unsafe { (slice::from_raw_parts(ns, count), slice::from_raw_parts(outputs, count)) };
+        return unsafe {
+            run_mtile_row_chunks(m, k, activations_mk_f32, outs_slice, ns_slice, |a, outs, tile| {
+                rocknpu_matmul_q_concat_f32_f32_mtile(
+                    context, count, weights, bytes, kinds, ns, a, outs.as_ptr(), tile, k,
+                )
+            })
+        };
     }
     let (weights, bytes, kinds, ns, outputs_raw) = unsafe {
         (
@@ -4523,6 +4592,16 @@ pub unsafe extern "C" fn rocknpu_matmul_q4_k_f32_f32(
 
     // SAFETY: pointer/null/size contracts are validated above. The caller owns
     // the buffers for the duration of this synchronous call.
+    if m > 1 && !MTILE_ROWS.contains(&m) && native_mtile_routes_enabled() {
+        // Other prompt/batch sizes run as native tiles: 128-row tiles plus a
+        // zero-padded tail.
+        return unsafe {
+            run_mtile_row_chunks(m, k, activations_mk_f32, &[output_mn_f32], &[n], |a, outs, tile| {
+                rocknpu_matmul_q4_k_f32_f32(context, weights_nk_q4_k, weights_bytes, a, outs[0], tile, k, n)
+            })
+        };
+    }
+
     let (weight_bytes, activations, output, context) = unsafe {
         (
             slice::from_raw_parts(weights_nk_q4_k, weights_bytes),
@@ -4783,6 +4862,16 @@ pub unsafe extern "C" fn rocknpu_matmul_q6_k_f32_f32(
 
     // SAFETY: pointer/null/size contracts are validated above. The caller owns
     // the buffers for the duration of this synchronous call.
+    if m > 1 && !MTILE_ROWS.contains(&m) && native_mtile_routes_enabled() {
+        // Other prompt/batch sizes run as native tiles: 128-row tiles plus a
+        // zero-padded tail.
+        return unsafe {
+            run_mtile_row_chunks(m, k, activations_mk_f32, &[output_mn_f32], &[n], |a, outs, tile| {
+                rocknpu_matmul_q6_k_f32_f32(context, weights_nk_q6_k, weights_bytes, a, outs[0], tile, k, n)
+            })
+        };
+    }
+
     let (weight_bytes, activations, output, context) = unsafe {
         (
             slice::from_raw_parts(weights_nk_q6_k, weights_bytes),

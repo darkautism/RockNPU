@@ -336,6 +336,11 @@ bool rocknpu_hybrid_enabled() {
     return enabled;
 }
 
+bool rocknpu_native_mtile_routes() {
+    return rocknpu_env_enabled("ROCKNPU_NATIVE_MTILE") && rocknpu_env_enabled("ROCKNPU_MTILE_PERSIST") &&
+           rocknpu_env_enabled("ROCKNPU_W8_MTILE") && rocknpu_env_enabled("ROCKNPU_MTILE_MC");
+}
+
 bool rocknpu_vk_pair_enabled() {
     return rocknpu_env_enabled_default("ROCKNPU_VK_PAIR", true);
 }
@@ -677,6 +682,11 @@ bool rocknpu_mul_mat_supported(const ggml_tensor * op) {
         }
         return quantized && k > 0 && n > 0 && k % 512 == 0 && n % 32 == 0 && n <= 8192;
     }
+    if (quantized && rocknpu_native_mtile_routes()) {
+        // Any batch size runs as native W8A8 M-tiles (the runtime tiles and
+        // pads rows); the full-K tile needs K%512 and N within one tile.
+        return k % 512 == 0 && n % 32 == 0 && n <= 8192;
+    }
     if (quantized && (m == 4 || m == 8 || m == 12)) {
         // Small-M decode is only useful through the validated persistent W8 path.
         // Never assign these graphs to RockNPU merely to fall back to the FP16 bridge.
@@ -816,7 +826,8 @@ bool rocknpu_mtile_group_m1_candidate(const ggml_tensor * node) {
     if (w == nullptr || a == nullptr || (w->type != GGML_TYPE_Q4_K && w->type != GGML_TYPE_Q6_K)) return false;
     const int64_t m = a->ne[1];
     const int64_t k = w->ne[0];
-    return (m == 32 || m == 48 || m == 64 || m == 128) && a->type == GGML_TYPE_F32 &&
+    // Larger batches are tiled into <=128-row NPU tiles by the runtime.
+    return m >= 32 && a->type == GGML_TYPE_F32 &&
            node->type == GGML_TYPE_F32 && ggml_is_contiguous(a) && ggml_is_contiguous(node) &&
            a->ne[2] == 1 && a->ne[3] == 1 && k % 512 == 0 && k <= (m > 64 ? 2048 : 4096) &&
            w->ne[1] % 32 == 0;
