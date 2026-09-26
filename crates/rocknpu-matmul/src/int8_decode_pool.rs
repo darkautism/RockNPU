@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 
 use crate::int8_decode::{
-    Int8MtileBatchOutput, Int8MtileBatchScratch, Int8MtileScratch, Int8OwnedScratch,
+    Int8MtileBatchOutput, Int8MtileBatchScratch, Int8MtileDirectScratch, Int8MtileScratch,
+    Int8OwnedScratch,
 };
 use crate::{
     Int8DecodeExecutor, Int8DecodeOutput, Int8DecodeStats, Int8PreparedWeightStats,
@@ -92,6 +93,11 @@ impl Int8DecodePoolPreparedWeights {
         self.split
     }
 
+    /// Whether these weights live on the direct-submit workers.
+    pub fn is_direct(&self) -> bool {
+        self.direct_prepared.is_some()
+    }
+
     pub const fn stats(&self) -> Int8DecodePoolPreparedStats {
         self.stats
     }
@@ -172,6 +178,7 @@ struct DirectWorker {
     device: RocketDevice,
     _guard: RocketOwnedBuffer,
     scratch: HashMap<(usize, usize), Option<Int8OwnedScratch>>,
+    mtile_scratch: HashMap<(usize, usize), Option<Int8MtileDirectScratch>>,
 }
 
 pub struct Int8DecodePool {
@@ -498,6 +505,7 @@ impl Int8DecodePool {
                     device,
                     _guard: guard,
                     scratch: HashMap::new(),
+                    mtile_scratch: HashMap::new(),
                 });
             }
             Some(direct)
@@ -513,6 +521,11 @@ impl Int8DecodePool {
             next_request_id: 1,
             next_weight_id: 1,
         })
+    }
+
+    /// Whether direct (calling-thread) submission is enabled.
+    pub fn direct_enabled(&self) -> bool {
+        self.direct_workers.is_some()
     }
 
     pub fn workers(&self) -> usize {
@@ -571,6 +584,97 @@ impl Int8DecodePool {
         split: Int8DecodeSplit,
     ) -> Result<Int8DecodePoolPreparedWeights, Int8DecodePoolError> {
         self.prepare_weights_with_split_mode(weights, k, n, workers, split, false, false)
+    }
+
+    /// Prepare resident M-tile weights on the direct-submit workers (when
+    /// enabled) so `execute_prepared_mtile_direct` can drive all cores from
+    /// the calling thread. Falls back to threaded workers otherwise.
+    pub fn prepare_weights_mtile_direct_with_split(
+        &mut self,
+        weights: Arc<[i8]>,
+        k: usize,
+        n: usize,
+        workers: usize,
+        split: Int8DecodeSplit,
+    ) -> Result<Int8DecodePoolPreparedWeights, Int8DecodePoolError> {
+        self.prepare_weights_with_split_mode(weights, k, n, workers, split, false, true)
+    }
+
+    /// Execute A[M,K] against direct-prepared M-tile weights: stage and submit
+    /// every worker's slice, then wait and write the int32 [M,N] result into
+    /// `out` (N-split slices are placed, K-split partials are summed).
+    pub fn execute_prepared_mtile_direct(
+        &mut self,
+        m: usize,
+        activation: &[i8],
+        weights: &Int8DecodePoolPreparedWeights,
+        out: &mut [i32],
+    ) -> Result<(), Int8DecodePoolError> {
+        let direct_workers = self
+            .direct_workers
+            .as_mut()
+            .ok_or_else(|| Int8DecodePoolError::Worker("direct workers missing".to_string()))?;
+        let prepared = weights.direct_prepared.as_ref().ok_or_else(|| {
+            Int8DecodePoolError::Worker("direct prepared weights missing".to_string())
+        })?;
+        if prepared.len() != weights.slices.len()
+            || prepared.len() > direct_workers.len()
+            || activation.len() != m.saturating_mul(weights.k)
+            || out.len() != m.saturating_mul(weights.n)
+        {
+            return Err(Int8DecodePoolError::InvalidInput(
+                "direct M-tile geometry mismatch",
+            ));
+        }
+        let mut pendings = Vec::with_capacity(prepared.len());
+        for (worker, (&slice, prepared_worker)) in
+            weights.slices.iter().zip(prepared.iter()).enumerate()
+        {
+            let state = &mut direct_workers[worker];
+            let key = (prepared_worker.k(), prepared_worker.n());
+            let slot = state.mtile_scratch.entry(key).or_insert(None);
+            let executor = Int8DecodeExecutor::from_externally_guarded_device(&state.device);
+            let pending = executor
+                .begin_mtile_direct(m, activation, weights.k, slice.k0, prepared_worker, slot)
+                .map_err(|err| {
+                    Int8DecodePoolError::Worker(format!("direct M-tile worker {worker} begin: {err}"))
+                })?;
+            pendings.push((worker, slice, key, pending));
+        }
+        let n = weights.n;
+        for (index, (worker, slice, key, pending)) in pendings.into_iter().enumerate() {
+            let state = &mut direct_workers[worker];
+            let slot = state.mtile_scratch.get_mut(&key).ok_or_else(|| {
+                Int8DecodePoolError::Worker("direct M-tile scratch missing".to_string())
+            })?;
+            let executor = Int8DecodeExecutor::from_externally_guarded_device(&state.device);
+            let split = weights.split;
+            let mut consume = |values: &[i32]| match split {
+                Int8DecodeSplit::N => {
+                    for row in 0..m {
+                        out[row * n + slice.n0..row * n + slice.n0 + slice.nsub]
+                            .copy_from_slice(&values[row * slice.nsub..(row + 1) * slice.nsub]);
+                    }
+                }
+                Int8DecodeSplit::K => {
+                    if index == 0 {
+                        out.copy_from_slice(&values[..m * n]);
+                    } else {
+                        for (dst, &src) in out.iter_mut().zip(&values[..m * n]) {
+                            *dst = dst.wrapping_add(src);
+                        }
+                    }
+                }
+            };
+            executor
+                .finish_mtile_direct(pending, slot, &mut consume)
+                .map_err(|err| {
+                    Int8DecodePoolError::Worker(format!(
+                        "direct M-tile worker {worker} finish: {err}"
+                    ))
+                })?;
+        }
+        Ok(())
     }
 
     pub fn prepare_weights_m1_with_split(

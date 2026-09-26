@@ -145,6 +145,21 @@ pub struct Int8MtileScratch {
     output: RocketOwnedBuffer,
 }
 
+/// Persistent per-worker scratch for the direct-submit M-tile path. Like the
+/// M=1 direct scratch it replays one cached regcmd per resident weight.
+pub(crate) struct Int8MtileDirectScratch {
+    regcmd: RocketOwnedBuffer,
+    input: RocketOwnedBuffer,
+    output: RocketOwnedBuffer,
+    regcmd_slots: HashMap<(u64, usize, usize, usize), Task>,
+    regcmd_used: usize,
+}
+
+pub(crate) struct Int8MtileDirectPending {
+    m: usize,
+    n: usize,
+}
+
 pub struct Int8MtileBatchScratch {
     regcmd: RocketOwnedBuffer,
     input: RocketOwnedBuffer,
@@ -346,6 +361,155 @@ impl<'a> Int8DecodeExecutor<'a> {
                 total_ns: total_start.elapsed().as_nanos(),
             },
         })
+    }
+
+    /// Stage and submit A[M,K] (rows `row_stride` apart in `a`, starting at
+    /// column `k0`) against one full-K resident weight slice without waiting.
+    /// The regcmd for (weights, M) is encoded once and replayed.
+    pub(crate) fn begin_mtile_direct(
+        &self,
+        m: usize,
+        a: &[i8],
+        row_stride: usize,
+        k0: usize,
+        weights: &Int8PreparedWeights,
+        scratch_slot: &mut Option<Int8MtileDirectScratch>,
+    ) -> Result<Int8MtileDirectPending, Int8DecodeError> {
+        if !matches!(m, 4 | 8 | 12 | 16 | 32 | 48 | 64 | 128) {
+            return Err(Int8DecodeError::InvalidInput(
+                "direct M-tile path requires M in {4,8,12,16,32,48,64,128}",
+            ));
+        }
+        if self.device.fd() != weights.device_fd {
+            return Err(Int8DecodeError::InvalidInput(
+                "prepared weights belong to a different Rocket device",
+            ));
+        }
+        if weights.slices != 1 || weights.k > SINGLE_SUBMIT_K_MAX {
+            return Err(Int8DecodeError::InvalidInput(
+                "direct M-tile path requires one full-K prepared weight slice",
+            ));
+        }
+        let k = weights.k;
+        let n = weights.n;
+        if m == 0 || k0 + k > row_stride || a.len() < (m - 1) * row_stride + k0 + k {
+            return Err(Int8DecodeError::InvalidInput("A rows out of range"));
+        }
+        let input_bytes = m.checked_mul(k).ok_or(Int8DecodeError::SizeOverflow)?;
+        let output_bytes = m
+            .checked_mul(n)
+            .and_then(|v| v.checked_mul(4))
+            .ok_or(Int8DecodeError::SizeOverflow)?;
+        let arena_bytes = REGCMD_BYTES
+            .checked_mul(REGCMD_ARENA_SLOTS)
+            .ok_or(Int8DecodeError::SizeOverflow)?;
+        let needs_grow = scratch_slot.as_ref().is_none_or(|scratch| {
+            scratch.input.len() < input_bytes || scratch.output.len() < output_bytes
+        });
+        if needs_grow {
+            let old = scratch_slot.as_ref();
+            let input_capacity = old.map_or(input_bytes, |s| s.input.len().max(input_bytes));
+            let output_capacity = old.map_or(output_bytes, |s| s.output.len().max(output_bytes));
+            let scratch = Int8MtileDirectScratch {
+                regcmd: self.device.alloc_owned_buffer(arena_bytes)?,
+                input: self.device.alloc_owned_buffer(input_capacity)?,
+                output: self.device.alloc_owned_buffer(output_capacity)?,
+                regcmd_slots: HashMap::new(),
+                regcmd_used: 0,
+            };
+            for (addr, len) in [
+                (scratch.regcmd.dma_address(), scratch.regcmd.len()),
+                (scratch.input.dma_address(), scratch.input.len()),
+                (scratch.output.dma_address(), scratch.output.len()),
+            ] {
+                check_dma32_range(addr, len)?;
+            }
+            *scratch_slot = Some(scratch);
+        }
+        let scratch = scratch_slot.as_mut().ok_or(Int8DecodeError::InvalidInput(
+            "direct M-tile scratch missing",
+        ))?;
+
+        // Earlier readers of this BO on this fd were already waited for
+        // through the output BO, so the CPU can write without an acquire.
+        {
+            let input = scratch.input.as_mut_slice();
+            for row in 0..m {
+                let src = &a[row * row_stride + k0..row * row_stride + k0 + k];
+                input[row * k..(row + 1) * k].copy_from_slice(bytemuck::cast_slice(src));
+            }
+        }
+        scratch.input.fini()?;
+
+        let key = (weights.bo.dma_address(), m, k, n);
+        let task = if let Some(task) = scratch.regcmd_slots.get(&key) {
+            *task
+        } else {
+            if scratch.regcmd_used + REGCMD_BYTES > scratch.regcmd.len() {
+                scratch.regcmd_slots.clear();
+                scratch.regcmd_used = 0;
+            }
+            let base = scratch.regcmd_used;
+            let ops = encode_int8_mtile(
+                m,
+                Int8DecodeDesc::new(
+                    k,
+                    n,
+                    scratch.input.dma_address(),
+                    weights.bo.dma_address(),
+                    scratch.output.dma_address(),
+                ),
+            )?;
+            scratch.regcmd.as_mut_slice()[base..base + REGCMD_BYTES].fill(0);
+            write_regcmd_bytes(scratch.regcmd.as_mut_slice(), base, &ops)?;
+            scratch.regcmd.fini()?;
+            let reg_addr = scratch.regcmd.dma_address()
+                + u64::try_from(base).map_err(|_| Int8DecodeError::SizeOverflow)?;
+            let task = Task {
+                regcmd: u32::try_from(reg_addr)
+                    .map_err(|_| Int8DecodeError::AddressAbove32Bit(reg_addr))?,
+                regcmd_count: u32::try_from(ops.len())
+                    .map_err(|_| Int8DecodeError::SizeOverflow)?,
+            };
+            scratch.regcmd_used += REGCMD_BYTES;
+            scratch.regcmd_slots.insert(key, task);
+            task
+        };
+        self.device.submit(
+            &[task],
+            &[
+                scratch.input.handle(),
+                weights.bo.handle(),
+                scratch.regcmd.handle(),
+            ],
+            &[scratch.output.handle()],
+        )?;
+        Ok(Int8MtileDirectPending { m, n })
+    }
+
+    /// Wait for a `begin_mtile_direct` submission and hand its int32 [M,N]
+    /// row-major output to `consume` straight from the mapped BO.
+    pub(crate) fn finish_mtile_direct(
+        &self,
+        pending: Int8MtileDirectPending,
+        scratch_slot: &mut Option<Int8MtileDirectScratch>,
+        consume: &mut dyn FnMut(&[i32]),
+    ) -> Result<(), Int8DecodeError> {
+        let scratch = scratch_slot.as_mut().ok_or(Int8DecodeError::InvalidInput(
+            "direct M-tile scratch missing",
+        ))?;
+        scratch.output.prep_relative(WAIT_NS)?;
+        let values = pending.m * pending.n;
+        let bytes = &scratch.output.as_slice()[..values * 4];
+        match bytemuck::try_cast_slice::<u8, i32>(bytes) {
+            Ok(ints) => consume(ints),
+            Err(_) => {
+                let copy: Vec<i32> = (0..values).map(|i| read_i32(bytes, i)).collect();
+                consume(&copy);
+            }
+        }
+        // The CPU only reads this BO; the next acquire invalidates again.
+        Ok(())
     }
 
     /// Execute several same-shape resident W8A8 M-tiles as one Rocket job.

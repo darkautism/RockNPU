@@ -226,6 +226,8 @@ pub struct RockNpuContext {
     decode_cache_miss_ns: u64,
     decode_worker_calls: [usize; 3],
     decode_ksplit_calls: usize,
+    /// Reused int32 [M,N] accumulator for the direct M-tile path.
+    mtile_i32: Vec<i32>,
     /// One-shot host work to run while the next M=1 NPU projection is in
     /// flight (see `rocknpu_context_set_overlap`).
     overlap: Option<(OverlapFn, usize)>,
@@ -272,12 +274,16 @@ fn env_enabled(name: &str) -> bool {
 }
 
 fn host_neon_enabled() -> bool {
+    // Queried per activation row on the hot path; read the environment once.
     #[cfg(target_arch = "aarch64")]
     {
-        env_enabled_default(
-            "ROCKNPU_HOST_NEON",
-            std::arch::is_aarch64_feature_detected!("neon"),
-        )
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            env_enabled_default(
+                "ROCKNPU_HOST_NEON",
+                std::arch::is_aarch64_feature_detected!("neon"),
+            )
+        })
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -1664,15 +1670,19 @@ where
     let quant_started = context.mtile_profile.as_ref().map(|_| Instant::now());
     let mut activations_i8 = vec![0i8; expected_a];
     let mut activation_scales = vec![0.0f32; m];
-    for ((row, out), scale) in activations_mk_f32
-        .chunks_exact(key.k)
-        .zip(activations_i8.chunks_exact_mut(key.k))
-        .zip(activation_scales.iter_mut())
-    {
-        let Some(row_scale) = quantize_symmetric_into(row, out) else {
-            return STATUS_INVALID_ARGUMENT;
-        };
-        *scale = row_scale;
+    let quantized_ok = activations_mk_f32
+        .par_chunks_exact(key.k)
+        .zip(activations_i8.par_chunks_exact_mut(key.k))
+        .zip(activation_scales.par_iter_mut())
+        .all(|((row, out), scale)| match quantize_symmetric_into(row, out) {
+            Some(row_scale) => {
+                *scale = row_scale;
+                true
+            }
+            None => false,
+        });
+    if !quantized_ok {
+        return STATUS_INVALID_ARGUMENT;
     }
     if let (Some(profile), Some(started)) = (context.mtile_profile.as_mut(), quant_started) {
         profile.quant_ns += started.elapsed().as_nanos();
@@ -1682,8 +1692,10 @@ where
         decode_pool,
         decode_mtile_pool_weights,
         mtile_profile,
+        mtile_i32,
         ..
     } = context;
+    let direct = decode_pool.direct_enabled();
 
     let mut cache_miss = false;
     let mut weight_prepare_ns = 0u128;
@@ -1701,13 +1713,23 @@ where
             }
             weight_prepare_ns = started.elapsed().as_nanos();
             let started = Instant::now();
-            let prepared = match decode_pool.prepare_weights_mtile_with_split(
-                Arc::<[i8]>::from(weights_i8),
-                key.k,
-                key.n,
-                3,
-                split,
-            ) {
+            let prepared = match if direct {
+                decode_pool.prepare_weights_mtile_direct_with_split(
+                    Arc::<[i8]>::from(weights_i8),
+                    key.k,
+                    key.n,
+                    3,
+                    split,
+                )
+            } else {
+                decode_pool.prepare_weights_mtile_with_split(
+                    Arc::<[i8]>::from(weights_i8),
+                    key.k,
+                    key.n,
+                    3,
+                    split,
+                )
+            } {
                 Ok(prepared) => prepared,
                 Err(err) => {
                     if env_enabled("ROCKNPU_MTILE_TRACE") {
@@ -1729,6 +1751,37 @@ where
         } else {
             profile.cache_hits += 1;
         }
+    }
+
+    if cached.prepared.is_direct() {
+        let started = Instant::now();
+        mtile_i32.resize(expected_out, 0);
+        if let Err(err) = decode_pool.execute_prepared_mtile_direct(
+            m,
+            &activations_i8,
+            &cached.prepared,
+            mtile_i32,
+        ) {
+            if env_enabled("ROCKNPU_MTILE_TRACE") {
+                eprintln!("ROCKNPU MTILE ERROR direct M={m} K={} N={} split={split:?}: {err}", key.k, key.n);
+            }
+            return STATUS_EXECUTION_ERROR;
+        }
+        if let Some(profile) = mtile_profile.as_mut() {
+            profile.calls += 1;
+            profile.execute_total_ns += started.elapsed().as_nanos();
+        }
+        let rescale_started = mtile_profile.as_ref().map(|_| Instant::now());
+        let scales = &cached.scales;
+        output_mn_f32
+            .par_chunks_exact_mut(key.n)
+            .zip(mtile_i32.par_chunks_exact(key.n))
+            .zip(activation_scales.par_iter())
+            .for_each(|((out, values), &a_scale)| rescale_i32_row(values, scales, a_scale, out));
+        if let (Some(profile), Some(started)) = (mtile_profile.as_mut(), rescale_started) {
+            profile.rescale_ns += started.elapsed().as_nanos();
+        }
+        return STATUS_OK;
     }
 
     let result = match decode_pool.execute_prepared_mtile(
@@ -2930,6 +2983,7 @@ pub extern "C" fn rocknpu_context_create() -> *mut RockNpuContext {
             decode_cache_miss_ns: 0,
             decode_worker_calls: [0; 3],
             decode_ksplit_calls: 0,
+            mtile_i32: Vec::new(),
             overlap: None,
         })),
         _ => ptr::null_mut(),
