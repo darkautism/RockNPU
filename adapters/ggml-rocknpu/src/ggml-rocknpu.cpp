@@ -28,6 +28,7 @@ struct rocknpu_qkv_weight_ref {
     const uint8_t * data = nullptr;
     size_t bytes = 0;
     uint32_t kind = 0;
+    const ggml_tensor * tensor = nullptr;
 };
 
 struct rocknpu_qkv_layer_state {
@@ -267,15 +268,15 @@ bool rocknpu_hybrid_enabled() {
 }
 
 bool rocknpu_vk_pair_enabled() {
-    return !rocknpu_hybrid_enabled() && rocknpu_env_enabled_default("ROCKNPU_VK_PAIR", true);
+    return rocknpu_env_enabled_default("ROCKNPU_VK_PAIR", true);
 }
 
 bool rocknpu_ffn_pair_enabled() {
-    return !rocknpu_hybrid_enabled() && rocknpu_env_enabled_default("ROCKNPU_FFN_PAIR", true);
+    return rocknpu_env_enabled_default("ROCKNPU_FFN_PAIR", true);
 }
 
 bool rocknpu_qkv_triple_enabled() {
-    return !rocknpu_hybrid_enabled() && rocknpu_env_enabled_default("ROCKNPU_QKV_TRIPLE", true);
+    return rocknpu_env_enabled_default("ROCKNPU_QKV_TRIPLE", true);
 }
 
 void rocknpu_hybrid_worker_loop(rocknpu_hybrid_worker * worker) {
@@ -293,47 +294,72 @@ void rocknpu_hybrid_worker_loop(rocknpu_hybrid_worker * worker) {
     }
 }
 
-// Returns -1 when the shape is not eligible so the caller keeps the NPU-only path.
-int rocknpu_hybrid_m1(
-        rocknpu_backend_context * context, const ggml_tensor * weights, const ggml_tensor * activations,
-        ggml_tensor * node, const rocknpu_w8_tensor * w8, size_t k, size_t n) {
-    const double share = rocknpu_hybrid_npu_share(k, n);
-    if (share <= 0.0 || activations->type != GGML_TYPE_F32 || !ggml_is_contiguous(activations)) return -1;
-    const size_t n_npu = static_cast<size_t>(static_cast<double>(n) * share) / 32 * 32;
-    if (n_npu < 32 || n_npu >= n) return -1;
-    const size_t n_cpu = n - n_npu;
-    if (context->hybrid_cpu == nullptr) {
-        context->hybrid_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-        if (context->hybrid_cpu == nullptr) return -1;
-        int threads = 4;
-        if (const char * value = std::getenv("ROCKNPU_HYBRID_THREADS")) {
-            const int parsed = std::atoi(value);
-            if (parsed > 0) threads = parsed;
-        }
-        ggml_backend_dev_t cpu_dev = ggml_backend_get_device(context->hybrid_cpu);
-        ggml_backend_reg_t cpu_reg = cpu_dev != nullptr ? ggml_backend_dev_backend_reg(cpu_dev) : nullptr;
-        if (cpu_reg != nullptr) {
-            auto set_n_threads = reinterpret_cast<ggml_backend_set_n_threads_t>(
-                ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_set_n_threads"));
-            if (set_n_threads != nullptr) set_n_threads(context->hybrid_cpu, threads);
-        }
-        context->hybrid_worker = new rocknpu_hybrid_worker {};
-        context->hybrid_worker->thread = std::thread(rocknpu_hybrid_worker_loop, context->hybrid_worker);
+struct rocknpu_hybrid_item {
+    const ggml_tensor * weights;
+    const rocknpu_w8_tensor * w8;
+    float * output;
+    size_t n;
+    size_t n_npu = 0;
+};
+
+bool rocknpu_hybrid_init(rocknpu_backend_context * context) {
+    if (context->hybrid_cpu != nullptr) return true;
+    context->hybrid_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (context->hybrid_cpu == nullptr) return false;
+    int threads = 3;
+    if (const char * value = std::getenv("ROCKNPU_HYBRID_THREADS")) {
+        const int parsed = std::atoi(value);
+        if (parsed > 0) threads = parsed;
     }
-    const size_t mem = ggml_tensor_overhead() * 8 + ggml_graph_overhead_custom(8, false) + 1024;
+    ggml_backend_dev_t cpu_dev = ggml_backend_get_device(context->hybrid_cpu);
+    ggml_backend_reg_t cpu_reg = cpu_dev != nullptr ? ggml_backend_dev_backend_reg(cpu_dev) : nullptr;
+    if (cpu_reg != nullptr) {
+        auto set_n_threads = reinterpret_cast<ggml_backend_set_n_threads_t>(
+            ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_set_n_threads"));
+        if (set_n_threads != nullptr) set_n_threads(context->hybrid_cpu, threads);
+    }
+    context->hybrid_worker = new rocknpu_hybrid_worker {};
+    context->hybrid_worker->thread = std::thread(rocknpu_hybrid_worker_loop, context->hybrid_worker);
+    return true;
+}
+
+// Concurrent CPU/NPU execution of 1..3 M=1 projections that share one input.
+// The NPU computes the first n_npu rows of every projection as one fused
+// submission (single/pair/triple W8 path); the frontend CPU backend computes
+// the remaining rows from the original GGUF blocks at the same time.
+// Returns -1 when the group is not eligible so the caller keeps its NPU-only path.
+int rocknpu_hybrid_group(
+        rocknpu_backend_context * context, const ggml_tensor * activations, size_t k, double share,
+        rocknpu_hybrid_item * items, size_t count) {
+    if (share <= 0.0 || count == 0 || count > 3 || activations->type != GGML_TYPE_F32 ||
+        activations->ne[1] != 1 || !ggml_is_contiguous(activations)) {
+        return -1;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (items[i].w8 == nullptr) return -1;
+        items[i].n_npu = static_cast<size_t>(static_cast<double>(items[i].n) * share) / 32 * 32;
+        if (items[i].n_npu < 32 || items[i].n_npu >= items[i].n) return -1;
+    }
+    if (!rocknpu_hybrid_init(context)) return -1;
+    const size_t mem = ggml_tensor_overhead() * 16 + ggml_graph_overhead_custom(16, false) + 1024;
     if (context->hybrid_graph_mem.size() < mem) context->hybrid_graph_mem.resize(mem);
     ggml_init_params params = { mem, context->hybrid_graph_mem.data(), true };
     ggml_context * graph_ctx = ggml_init(params);
     if (graph_ctx == nullptr) return -1;
-    ggml_tensor * w = ggml_new_tensor_2d(graph_ctx, weights->type, static_cast<int64_t>(k), static_cast<int64_t>(n_cpu));
-    w->data = static_cast<char *>(weights->data) + n_npu * weights->nb[1];
+    ggml_cgraph * graph = ggml_new_graph_custom(graph_ctx, 16, false);
     ggml_tensor * a = ggml_new_tensor_2d(graph_ctx, GGML_TYPE_F32, static_cast<int64_t>(k), 1);
     a->data = activations->data;
-    ggml_tensor * d = ggml_mul_mat(graph_ctx, w, a);
-    d->data = static_cast<float *>(node->data) + n_npu;
-    ggml_cgraph * graph = ggml_new_graph_custom(graph_ctx, 8, false);
-    ggml_build_forward_expand(graph, d);
+    for (size_t i = 0; i < count; ++i) {
+        const ggml_tensor * weights = items[i].weights;
+        const size_t n_cpu = items[i].n - items[i].n_npu;
+        ggml_tensor * w = ggml_new_tensor_2d(graph_ctx, weights->type, static_cast<int64_t>(k), static_cast<int64_t>(n_cpu));
+        w->data = static_cast<char *>(weights->data) + items[i].n_npu * weights->nb[1];
+        ggml_tensor * d = ggml_mul_mat(graph_ctx, w, a);
+        d->data = items[i].output + items[i].n_npu;
+        ggml_build_forward_expand(graph, d);
+    }
 
+    const float * input = static_cast<const float *>(activations->data);
     int npu_status = ROCKNPU_STATUS_OK;
     uint64_t npu_ns = 0;
     rocknpu_hybrid_worker * worker = context->hybrid_worker;
@@ -341,9 +367,27 @@ int rocknpu_hybrid_m1(
         std::lock_guard<std::mutex> lock(worker->mutex);
         worker->job = [&] {
             const auto started = std::chrono::steady_clock::now();
-            npu_status = rocknpu_matmul_w8a8_f32_f32_m1(
-                context->runtime, w8->weights.data(), w8->scales.data(),
-                static_cast<const float *>(activations->data), static_cast<float *>(node->data), k, n_npu);
+            const rocknpu_hybrid_item & x = items[0];
+            if (count == 1) {
+                npu_status = rocknpu_matmul_w8a8_f32_f32_m1(
+                    context->runtime, x.w8->weights.data(), x.w8->scales.data(), input, x.output, k, x.n_npu);
+            } else if (count == 2) {
+                const rocknpu_hybrid_item & y = items[1];
+                npu_status = rocknpu_matmul_w8a8_pair_f32_f32_m1(
+                    context->runtime,
+                    x.w8->weights.data(), x.w8->scales.data(), x.n_npu,
+                    y.w8->weights.data(), y.w8->scales.data(), y.n_npu,
+                    input, x.output, y.output, k);
+            } else {
+                const rocknpu_hybrid_item & y = items[1];
+                const rocknpu_hybrid_item & z = items[2];
+                npu_status = rocknpu_matmul_w8a8_triple_f32_f32_m1(
+                    context->runtime,
+                    x.w8->weights.data(), x.w8->scales.data(), x.n_npu,
+                    y.w8->weights.data(), y.w8->scales.data(), y.n_npu,
+                    z.w8->weights.data(), z.w8->scales.data(), z.n_npu,
+                    input, x.output, y.output, z.output, k);
+            }
             npu_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - started).count());
         };
@@ -364,6 +408,13 @@ int rocknpu_hybrid_m1(
     ggml_free(graph_ctx);
     if (cpu_status != GGML_STATUS_SUCCESS) return ROCKNPU_STATUS_INVALID_ARGUMENT;
     return npu_status;
+}
+
+int rocknpu_hybrid_m1(
+        rocknpu_backend_context * context, const ggml_tensor * weights, const ggml_tensor * activations,
+        ggml_tensor * node, const rocknpu_w8_tensor * w8, size_t k, size_t n) {
+    rocknpu_hybrid_item item { weights, w8, static_cast<float *>(node->data), n };
+    return rocknpu_hybrid_group(context, activations, k, rocknpu_hybrid_npu_share(k, n), &item, 1);
 }
 
 bool rocknpu_quant_kind(const ggml_tensor * weights, uint32_t * kind) {
@@ -937,7 +988,18 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                             rocknpu_w8_tensor * k_w8 = rocknpu_w8_sidecar_get(
                                 context, k_name.c_str(), 2048, 256, state.k.data, state.k.bytes);
                             const bool native_w8 = q_w8 != nullptr && v_w8 != nullptr && k_w8 != nullptr;
-                            const int status = native_w8 ? rocknpu_matmul_w8a8_triple_f32_f32_m1(
+                            const ggml_tensor * v_tensor = state.v.tensor;
+                            const ggml_tensor * k_tensor = state.k.tensor;
+                            rocknpu_hybrid_item qkv_items[3] = {
+                                { q_weights, q_w8, static_cast<float *>(node->data), 2048 },
+                                { v_tensor, v_w8, state.v_output, 256 },
+                                { k_tensor, k_w8, state.k_output, 256 },
+                            };
+                            const int hybrid_status = native_w8 && v_tensor != nullptr && k_tensor != nullptr
+                                ? rocknpu_hybrid_group(context, q_activations, 2048,
+                                    rocknpu_hybrid_npu_share(2048, 2560), qkv_items, 3)
+                                : -1;
+                            const int status = hybrid_status != -1 ? hybrid_status : native_w8 ? rocknpu_matmul_w8a8_triple_f32_f32_m1(
                                 context->runtime,
                                 q_w8->weights.data(), q_w8->scales.data(), 2048,
                                 v_w8->weights.data(), v_w8->scales.data(), 256,
@@ -1024,7 +1086,15 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                                     i += 1;
                                     break;
                                 }
-                                status = native_w8 ? rocknpu_matmul_w8a8_pair_f32_f32_m1(
+                                rocknpu_hybrid_item ffn_items[2] = {
+                                    { first_weights, first_w8, static_cast<float *>(node->data), 5632 },
+                                    { second_weights, second_w8, static_cast<float *>(second->data), 5632 },
+                                };
+                                const int hybrid_status = native_w8
+                                    ? rocknpu_hybrid_group(context, first_activations, k_pair,
+                                        rocknpu_hybrid_npu_share(k_pair, 5632), ffn_items, 2)
+                                    : -1;
+                                status = hybrid_status != -1 ? hybrid_status : native_w8 ? rocknpu_matmul_w8a8_pair_f32_f32_m1(
                                     context->runtime,
                                     first_w8->weights.data(), first_w8->scales.data(), 5632,
                                     second_w8->weights.data(), second_w8->scales.data(), 5632,
@@ -1100,10 +1170,10 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                             if (rocknpu_attention_layer(first_weights, ".attn_v.weight", &vk_layer)) {
                                 qkv_state = &context->qkv[vk_layer];
                                 const rocknpu_qkv_weight_ref current_v {
-                                    static_cast<const uint8_t *>(first_weights->data), ggml_nbytes(first_weights), first_kind
+                                    static_cast<const uint8_t *>(first_weights->data), ggml_nbytes(first_weights), first_kind, first_weights
                                 };
                                 const rocknpu_qkv_weight_ref current_k {
-                                    static_cast<const uint8_t *>(second_weights->data), ggml_nbytes(second_weights), second_kind
+                                    static_cast<const uint8_t *>(second_weights->data), ggml_nbytes(second_weights), second_kind, second_weights
                                 };
                                 const bool same_refs =
                                     qkv_state->v.data == current_v.data && qkv_state->v.bytes == current_v.bytes && qkv_state->v.kind == current_v.kind &&
