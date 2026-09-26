@@ -90,6 +90,13 @@ export LLAMA_ARG_DEVICE=ROCKNPU0
 export LLAMA_ARG_REPACK=false
 # shorter OpenMP spin: the CPU threads otherwise compete with NPU host work
 export GOMP_SPINCOUNT=20000
+# four CPU threads (the A76 cores): llama.cpp/Ollama default to all eight
+# cores and the A55 cluster stalls every step (prompt and generation)
+export LLAMA_ARG_THREADS=4
+# keep flash attention on the CPU enabled; with "auto" llama.cpp turns it
+# off because the NPU device does not run attention
+export LLAMA_ARG_FLASH_ATTN=on
+export OLLAMA_FLASH_ATTENTION=1
 EOF
 if [ "$WITH_LLAMA" = 1 ]; then
     echo "export PATH=\"$PREFIX/build/llama.cpp/bin:\$PATH\"" >>"$ENV"

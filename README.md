@@ -93,8 +93,12 @@ ollama run tinyllama:1.1b-chat-v1-q4_K_M
 
 模型請選 `Q4_K_M` 之類的 K-quant 版本（Ollama 的預設標籤常是 `Q4_0`，NPU 不加速）。
 
-Ollama 0.34.x 使用與 RockNPU 相同的 llama.cpp 版本（`b10969`），不需要修改 Ollama。
+Ollama 0.34.x 使用與 RockNPU 相同的 llama.cpp 版本（`b10969`），不需要修改 Ollama（實測 0.34.4）。
 其他版本請以 `LLAMA_REF=<該版本 llama.cpp 的 tag> ./scripts/install.sh` 重新編譯。
+
+設定檔已替 Ollama 處理好兩件事：只用 4 顆大核（`LLAMA_ARG_THREADS=4`；Ollama 預設用 8 顆，小核會拖慢每一步）以及保持 flash attention 開啟（`OLLAMA_FLASH_ATTENTION=1`）。
+Ollama（TinyLlama Q4_K_M，329 tokens 提示詞）實測：讀提示詞 **≈ 300 tok/s**、生成 **≈ 30 tok/s**；原版 Ollama（只用 CPU）為 ≈ 100 / ≈ 23 tok/s。
+模型載入後的前一兩個請求會慢一些（NPU 正在準備 8-bit 權重）。
 
 > 提醒：Ollama 本體約 2 GB。系統裝在 eMMC/SD 卡的板子，建議把 Ollama 與模型放在 NVMe/SSD 上。
 
