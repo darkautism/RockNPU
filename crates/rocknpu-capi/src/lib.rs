@@ -9,7 +9,7 @@ use rocknpu_matmul::{
     Fp16MatmulExecutor, Fp16MatmulPool, Fp16MatmulPoolPreparedWeights, Int4DecodeExecutor,
     Int4DecodePool, Int4DecodePoolPreparedWeights, Int4GroupedPreparedWeights, Int4PreparedWeights,
     Int8DecodeExecutor, Int8DecodePool, Int8DecodePoolPreparedWeights, Int8DecodePoolStats,
-    Int8DecodeSplit, Int8MtileScratch, Int8PreparedWeights,
+    Int8DecodeSplit, Int8MtileScratch, Int8PreparedWeights, WorkerSlice,
 };
 use std::collections::{hash_map::Entry, HashMap};
 use std::env;
@@ -233,6 +233,28 @@ pub struct RockNpuContext {
     /// One-shot host work to run while the next M=1 NPU projection is in
     /// flight (see `rocknpu_context_set_overlap`).
     overlap: Option<(OverlapFn, usize)>,
+}
+
+/// Shared mutable output for direct M-tile sinks: each NPU core's sink
+/// writes a disjoint set of elements concurrently.
+#[derive(Clone, Copy)]
+struct SharedMut<T> {
+    ptr: *mut T,
+    len: usize,
+}
+// SAFETY: only used for disjoint concurrent writes coordinated by the caller.
+unsafe impl<T: Send> Send for SharedMut<T> {}
+unsafe impl<T: Send> Sync for SharedMut<T> {}
+impl<T> SharedMut<T> {
+    fn new(slice: &mut [T]) -> Self {
+        Self { ptr: slice.as_mut_ptr(), len: slice.len() }
+    }
+    /// # Safety
+    /// Concurrent callers must use non-overlapping ranges.
+    unsafe fn range(&self, start: usize, len: usize) -> &mut [T] {
+        assert!(start + len <= self.len);
+        unsafe { slice::from_raw_parts_mut(self.ptr.add(start), len) }
+    }
 }
 
 /// Host callback executed between NPU submission and completion wait.
@@ -1757,13 +1779,72 @@ where
 
     if cached.prepared.is_direct() {
         let started = Instant::now();
-        mtile_i32.resize(expected_out, 0);
-        let timings = match decode_pool.execute_prepared_mtile_direct(
-            m,
-            &activations_i8,
-            &cached.prepared,
-            mtile_i32,
-        ) {
+        let n = key.n;
+        let scales = &cached.scales;
+        let a_scales = &activation_scales;
+        let workers = cached.prepared.slices().len();
+        let result = match split {
+            Int8DecodeSplit::N => {
+                // Rescale each core's [M, nsub] block straight into its columns.
+                let out = SharedMut::new(output_mn_f32);
+                let sink = |_: usize, slice: WorkerSlice, values: &[i32]| {
+                    for row in 0..m {
+                        // SAFETY: cores own disjoint column ranges of each row.
+                        let dst = unsafe { out.range(row * n + slice.n0, slice.nsub) };
+                        rescale_i32_row(
+                            &values[row * slice.nsub..(row + 1) * slice.nsub],
+                            &scales[slice.n0..slice.n0 + slice.nsub],
+                            a_scales[row],
+                            dst,
+                        );
+                    }
+                };
+                decode_pool.execute_prepared_mtile_direct(m, &activations_i8, &cached.prepared, &sink)
+            }
+            Int8DecodeSplit::K => {
+                // Each core returns a full [M, N] partial over its K range.
+                mtile_i32.resize(workers * expected_out, 0);
+                let partials = SharedMut::new(mtile_i32);
+                let sink = |worker: usize, _: WorkerSlice, values: &[i32]| {
+                    // SAFETY: each core writes its own partial region.
+                    unsafe { partials.range(worker * expected_out, expected_out) }
+                        .copy_from_slice(&values[..expected_out]);
+                };
+                let result = decode_pool.execute_prepared_mtile_direct(
+                    m,
+                    &activations_i8,
+                    &cached.prepared,
+                    &sink,
+                );
+                if result.is_ok() {
+                    let partials = &mtile_i32[..];
+                    output_mn_f32
+                        .par_chunks_exact_mut(n)
+                        .enumerate()
+                        .for_each(|(row, out)| {
+                            let mut acc = [0i32; 64];
+                            for c0 in (0..n).step_by(64) {
+                                let len = (n - c0).min(64);
+                                acc[..len].fill(0);
+                                for w in 0..workers {
+                                    let base = w * expected_out + row * n + c0;
+                                    for (a, &v) in acc[..len].iter_mut().zip(&partials[base..base + len]) {
+                                        *a = a.wrapping_add(v);
+                                    }
+                                }
+                                rescale_i32_row(
+                                    &acc[..len],
+                                    &scales[c0..c0 + len],
+                                    a_scales[row],
+                                    &mut out[c0..c0 + len],
+                                );
+                            }
+                        });
+                }
+                result
+            }
+        };
+        let timings = match result {
             Ok(timings) => timings,
             Err(err) => {
                 if env_enabled("ROCKNPU_MTILE_TRACE") {
@@ -1778,16 +1859,6 @@ where
             profile.input_stage_ns += timings.stage_submit_ns;
             profile.wait_ns += timings.wait_ns;
             profile.host_accum_ns += timings.consume_ns;
-        }
-        let rescale_started = mtile_profile.as_ref().map(|_| Instant::now());
-        let scales = &cached.scales;
-        output_mn_f32
-            .par_chunks_exact_mut(key.n)
-            .zip(mtile_i32.par_chunks_exact(key.n))
-            .zip(activation_scales.par_iter())
-            .for_each(|((out, values), &a_scale)| rescale_i32_row(values, scales, a_scale, out));
-        if let (Some(profile), Some(started)) = (mtile_profile.as_mut(), rescale_started) {
-            profile.rescale_ns += started.elapsed().as_nanos();
         }
         return STATUS_OK;
     }
@@ -1900,7 +1971,6 @@ where
         decode_pool,
         decode_mtile_concat_weights,
         mtile_profile,
-        mtile_i32,
         ..
     } = context;
     let cached = match decode_mtile_concat_weights.entry(keys.clone()) {
@@ -1946,12 +2016,38 @@ where
     }
 
     let started = Instant::now();
-    mtile_i32.resize(m * total_n, 0);
+    let scales = &cached.scales;
+    let a_scales = &activation_scales;
+    // Column start of each member within the concatenated N.
+    let mut member_starts = Vec::with_capacity(keys.len());
+    let mut column = 0usize;
+    for key in &keys {
+        member_starts.push(column);
+        column += key.n;
+    }
+    let targets: Vec<SharedMut<f32>> = outputs.iter_mut().map(|out| SharedMut::new(out)).collect();
+    let sink = |_: usize, slice: WorkerSlice, values: &[i32]| {
+        for (member, key) in keys.iter().enumerate() {
+            let lo = member_starts[member].max(slice.n0);
+            let hi = (member_starts[member] + key.n).min(slice.n0 + slice.nsub);
+            if lo >= hi {
+                continue;
+            }
+            for row in 0..m {
+                let src = row * slice.nsub + (lo - slice.n0);
+                // SAFETY: cores own disjoint concatenated column ranges.
+                let dst = unsafe {
+                    targets[member].range(row * key.n + (lo - member_starts[member]), hi - lo)
+                };
+                rescale_i32_row(&values[src..src + (hi - lo)], &scales[lo..hi], a_scales[row], dst);
+            }
+        }
+    };
     let timings = match decode_pool.execute_prepared_mtile_direct(
         m,
         &activations_i8,
         &cached.prepared,
-        mtile_i32,
+        &sink,
     ) {
         Ok(timings) => timings,
         Err(err) => {
@@ -1967,31 +2063,6 @@ where
         profile.input_stage_ns += timings.stage_submit_ns;
         profile.wait_ns += timings.wait_ns;
         profile.host_accum_ns += timings.consume_ns;
-    }
-
-    let rescale_started = mtile_profile.as_ref().map(|_| Instant::now());
-    let scales = &cached.scales;
-    let values = &mtile_i32[..];
-    let mut column = 0usize;
-    for (output, key) in outputs.iter_mut().zip(&keys) {
-        let n = key.n;
-        let member_scales = &scales[column..column + n];
-        output
-            .par_chunks_exact_mut(n)
-            .enumerate()
-            .for_each(|(row, out)| {
-                let start = row * total_n + column;
-                rescale_i32_row(
-                    &values[start..start + n],
-                    member_scales,
-                    activation_scales[row],
-                    out,
-                );
-            });
-        column += n;
-    }
-    if let (Some(profile), Some(started)) = (mtile_profile.as_mut(), rescale_started) {
-        profile.rescale_ns += started.elapsed().as_nanos();
     }
     STATUS_OK
 }

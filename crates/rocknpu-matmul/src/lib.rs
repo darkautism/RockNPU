@@ -33,7 +33,7 @@ pub use int8_decode::{
 };
 pub use int8_decode_pool::{
     Int8DecodePool, Int8DecodePoolError, Int8DecodePoolOutput, Int8DecodePoolPreparedStats,
-    Int8MtileDirectTimings,
+    Int8MtileDirectTimings, WorkerSlice,
     Int8DecodePoolPreparedWeights, Int8DecodePoolStats, Int8DecodeSplit,
 };
 pub use prepacked::{Fp16PrepackedWeights, PrepackedWeightStats};

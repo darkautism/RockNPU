@@ -58,12 +58,13 @@ pub struct Int8DecodePoolPreparedStats {
     pub prepare_wall_ns: u128,
 }
 
+/// The K/N range of the weights one worker (NPU core) owns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WorkerSlice {
-    k0: usize,
-    ksub: usize,
-    n0: usize,
-    nsub: usize,
+pub struct WorkerSlice {
+    pub k0: usize,
+    pub ksub: usize,
+    pub n0: usize,
+    pub nsub: usize,
 }
 
 pub struct Int8DecodePoolPreparedWeights {
@@ -91,6 +92,11 @@ impl Int8DecodePoolPreparedWeights {
 
     pub const fn split(&self) -> Int8DecodeSplit {
         self.split
+    }
+
+    /// Worker K/N ranges.
+    pub fn slices(&self) -> &[WorkerSlice] {
+        &self.slices
     }
 
     /// Whether these weights live on the direct-submit workers.
@@ -611,12 +617,17 @@ impl Int8DecodePool {
     /// Execute A[M,K] against direct-prepared M-tile weights: stage and submit
     /// every worker's slice, then wait and write the int32 [M,N] result into
     /// `out` (N-split slices are placed, K-split partials are summed).
+    /// Execute A[M,K] against direct-prepared M-tile weights with every
+    /// worker (NPU core) staged, submitted, waited for and consumed on its own
+    /// thread. `sink(worker, slice, values)` receives that worker's int32
+    /// row-major [M, slice.nsub] block (N-split) or [M, N] partial (K-split)
+    /// straight from the mapped output BO; calls run concurrently.
     pub fn execute_prepared_mtile_direct(
         &mut self,
         m: usize,
         activation: &[i8],
         weights: &Int8DecodePoolPreparedWeights,
-        out: &mut [i32],
+        sink: &(dyn Fn(usize, WorkerSlice, &[i32]) + Sync),
     ) -> Result<Int8MtileDirectTimings, Int8DecodePoolError> {
         let started = Instant::now();
         let direct_workers = self
@@ -629,66 +640,45 @@ impl Int8DecodePool {
         if prepared.len() != weights.slices.len()
             || prepared.len() > direct_workers.len()
             || activation.len() != m.saturating_mul(weights.k)
-            || out.len() != m.saturating_mul(weights.n)
         {
             return Err(Int8DecodePoolError::InvalidInput(
                 "direct M-tile geometry mismatch",
             ));
         }
-        let mut pendings = Vec::with_capacity(prepared.len());
-        for (worker, (&slice, prepared_worker)) in
-            weights.slices.iter().zip(prepared.iter()).enumerate()
-        {
-            let state = &mut direct_workers[worker];
-            let key = (prepared_worker.k(), prepared_worker.n());
-            let slot = state.mtile_scratch.entry(key).or_insert(None);
-            let executor = Int8DecodeExecutor::from_externally_guarded_device(&state.device);
-            let pending = executor
-                .begin_mtile_direct(m, activation, weights.k, slice.k0, prepared_worker, slot)
-                .map_err(|err| {
-                    Int8DecodePoolError::Worker(format!("direct M-tile worker {worker} begin: {err}"))
-                })?;
-            pendings.push((worker, slice, key, pending));
+        let k = weights.k;
+        let results: Vec<Result<(u128, u128), String>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = direct_workers
+                .iter_mut()
+                .zip(weights.slices.iter().zip(prepared.iter()))
+                .enumerate()
+                .map(|(worker, (state, (&slice, prepared_worker)))| {
+                    scope.spawn(move || -> Result<(u128, u128), String> {
+                        let key = (prepared_worker.k(), prepared_worker.n());
+                        let slot = state.mtile_scratch.entry(key).or_insert(None);
+                        let executor =
+                            Int8DecodeExecutor::from_externally_guarded_device(&state.device);
+                        let pending = executor
+                            .begin_mtile_direct(m, activation, k, slice.k0, prepared_worker, slot)
+                            .map_err(|err| format!("direct M-tile worker {worker} begin: {err}"))?;
+                        let mut consume = |values: &[i32]| sink(worker, slice, values);
+                        executor
+                            .finish_mtile_direct(pending, slot, &mut consume)
+                            .map_err(|err| format!("direct M-tile worker {worker} finish: {err}"))
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap_or_else(|_| Err("worker panicked".into())))
+                .collect()
+        });
+        let mut timings = Int8MtileDirectTimings::default();
+        for result in results {
+            let (wait_ns, consume_ns) = result.map_err(Int8DecodePoolError::Worker)?;
+            timings.wait_ns = timings.wait_ns.max(wait_ns);
+            timings.consume_ns = timings.consume_ns.max(consume_ns);
         }
-        let mut timings = Int8MtileDirectTimings {
-            stage_submit_ns: started.elapsed().as_nanos(),
-            ..Int8MtileDirectTimings::default()
-        };
-        let n = weights.n;
-        for (index, (worker, slice, key, pending)) in pendings.into_iter().enumerate() {
-            let state = &mut direct_workers[worker];
-            let slot = state.mtile_scratch.get_mut(&key).ok_or_else(|| {
-                Int8DecodePoolError::Worker("direct M-tile scratch missing".to_string())
-            })?;
-            let executor = Int8DecodeExecutor::from_externally_guarded_device(&state.device);
-            let split = weights.split;
-            let mut consume = |values: &[i32]| match split {
-                Int8DecodeSplit::N => {
-                    for row in 0..m {
-                        out[row * n + slice.n0..row * n + slice.n0 + slice.nsub]
-                            .copy_from_slice(&values[row * slice.nsub..(row + 1) * slice.nsub]);
-                    }
-                }
-                Int8DecodeSplit::K => {
-                    if index == 0 {
-                        out.copy_from_slice(&values[..m * n]);
-                    } else {
-                        for (dst, &src) in out.iter_mut().zip(&values[..m * n]) {
-                            *dst = dst.wrapping_add(src);
-                        }
-                    }
-                }
-            };
-            let (wait_ns, consume_ns) = executor
-                .finish_mtile_direct(pending, slot, &mut consume)
-                .map_err(|err| {
-                    Int8DecodePoolError::Worker(format!(
-                        "direct M-tile worker {worker} finish: {err}"
-                    ))
-                })?;
-            timings.wait_ns += wait_ns;
-            timings.consume_ns += consume_ns;
-        }
+        timings.stage_submit_ns = started.elapsed().as_nanos();
         Ok(timings)
     }
 

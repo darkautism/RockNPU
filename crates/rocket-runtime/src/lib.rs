@@ -229,6 +229,13 @@ pub struct RocketOwnedBuffer {
     mmap_offset: u64,
 }
 
+// SAFETY: the buffer exclusively owns its duplicated device fd and its mmap;
+// the raw pointer is only an address of that private mapping. Moving the
+// owner to another thread is sound, and shared references only allow reads
+// (writes need `&mut self`), so it is also Sync.
+unsafe impl Send for RocketOwnedBuffer {}
+unsafe impl Sync for RocketOwnedBuffer {}
+
 impl RocketOwnedBuffer {
     pub fn handle(&self) -> u32 {
         self.handle
