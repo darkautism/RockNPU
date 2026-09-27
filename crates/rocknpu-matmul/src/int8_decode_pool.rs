@@ -629,7 +629,6 @@ impl Int8DecodePool {
         weights: &Int8DecodePoolPreparedWeights,
         sink: &(dyn Fn(usize, WorkerSlice, &[i32]) + Sync),
     ) -> Result<Int8MtileDirectTimings, Int8DecodePoolError> {
-        let started = Instant::now();
         let direct_workers = self
             .direct_workers
             .as_mut()
@@ -646,24 +645,27 @@ impl Int8DecodePool {
             ));
         }
         let k = weights.k;
-        let results: Vec<Result<(u128, u128), String>> = std::thread::scope(|scope| {
+        let results: Vec<Result<(u128, u128, u128), String>> = std::thread::scope(|scope| {
             let handles: Vec<_> = direct_workers
                 .iter_mut()
                 .zip(weights.slices.iter().zip(prepared.iter()))
                 .enumerate()
                 .map(|(worker, (state, (&slice, prepared_worker)))| {
-                    scope.spawn(move || -> Result<(u128, u128), String> {
+                    scope.spawn(move || -> Result<(u128, u128, u128), String> {
                         let key = (prepared_worker.k(), prepared_worker.n());
                         let slot = state.mtile_scratch.entry(key).or_insert(None);
                         let executor =
                             Int8DecodeExecutor::from_externally_guarded_device(&state.device);
+                        let stage_submit_start = Instant::now();
                         let pending = executor
                             .begin_mtile_direct(m, activation, k, slice.k0, prepared_worker, slot)
                             .map_err(|err| format!("direct M-tile worker {worker} begin: {err}"))?;
+                        let stage_submit_ns = stage_submit_start.elapsed().as_nanos();
                         let mut consume = |values: &[i32]| sink(worker, slice, values);
-                        executor
+                        let (wait_ns, consume_ns) = executor
                             .finish_mtile_direct(pending, slot, &mut consume)
-                            .map_err(|err| format!("direct M-tile worker {worker} finish: {err}"))
+                            .map_err(|err| format!("direct M-tile worker {worker} finish: {err}"))?;
+                        Ok((stage_submit_ns, wait_ns, consume_ns))
                     })
                 })
                 .collect();
@@ -674,11 +676,12 @@ impl Int8DecodePool {
         });
         let mut timings = Int8MtileDirectTimings::default();
         for result in results {
-            let (wait_ns, consume_ns) = result.map_err(Int8DecodePoolError::Worker)?;
+            let (stage_submit_ns, wait_ns, consume_ns) =
+                result.map_err(Int8DecodePoolError::Worker)?;
+            timings.stage_submit_ns = timings.stage_submit_ns.max(stage_submit_ns);
             timings.wait_ns = timings.wait_ns.max(wait_ns);
             timings.consume_ns = timings.consume_ns.max(consume_ns);
         }
-        timings.stage_submit_ns = started.elapsed().as_nanos();
         Ok(timings)
     }
 
