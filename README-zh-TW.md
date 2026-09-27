@@ -29,9 +29,10 @@ RockNPU 數字為 NPU 700 MHz、llama-bench、4 個 A76 執行緒。詳細方法
 |---|---:|---:|---:|---:|---:|---:|
 | Llama‑3.2‑1B‑Instruct | 71 | **≈ 580** | — | 26 | 23 | — |
 | Qwen2.5‑1.5B‑Instruct | 55 | **≈ 350** | ≈ 340 | 22.5 | 19–20 | 16.7 |
+| Qwen3.5‑4B | 18.1 | **≈ 86** | — | 6.9 | 6.3 | — |
 | Qwen2.5‑0.5B‑Instruct | 71 | 71（不加速，見常見問題） | — | — | — | 41.6（Qwen2 0.5B） |
 
-白話：**貼長文件、長對話歷史給模型時，等待回應的時間縮短為 1/6–1/8**；生成仍由 CPU 負責（RK3588 的記憶體頻寬決定了生成速度的上限，CPU 的 4-bit 路徑在這一步最快），但比原版 llama.cpp 慢 5–15 %，原因見常見問題「生成比原版 llama.cpp 慢一點？」。
+白話：**貼長文件、長對話歷史給模型時，依模型不同，讀提示詞約快 4–8 倍**；生成仍由 CPU 負責（RK3588 的記憶體頻寬決定了生成速度的上限，CPU 的 4-bit 路徑在這一步最快），但比原版 llama.cpp 慢 5–15 %，原因見常見問題「生成比原版 llama.cpp 慢一點？」。
 
 ---
 
@@ -137,8 +138,8 @@ Ollama（TinyLlama Q4_K_M，329 tokens 提示詞）實測：讀提示詞 **≈ 3
 `export ROCKNPU_DECODE=npu`（約 20 tok/s，CPU 幾乎閒置）或 `ROCKNPU_DECODE=hybrid`（CPU 與 NPU 一起算，約 26 tok/s）。預設 `cpu` 最快。
 
 **Q：支援哪些模型？**
-GGUF 的 Q4_K / Q6_K 權重（例如常見的 `Q4_K_M`），隱藏層寬度是 256 的倍數的模型：Llama 3.x、TinyLlama、Qwen2.5 1.5B 以上等。NPU 以 W8A8 執行投影層；其餘運算與不支援的格式自動交給 CPU，所以任何 llama.cpp 能跑的模型都能跑，只是加速程度不同。
-Qwen2.5‑0.5B（寬度 896）的 GGUF 權重不是 K-quant 格式，會完整由 CPU 執行（結果正確，只是沒有加速）。
+RockNPU 支援 GGUF 的 Q4_K / Q6_K 投影權重，以及 prompt 階段的 Q5_K 投影（例如常見的 `Q4_K_M` 模型內也可能混有 Q5_K tensor）。代表性模型包括 Llama 3.x、TinyLlama、Qwen2.5 1.5B 以上，以及 Qwen3.5-4B。Qwen3.5-4B 是 DeltaNet / attention 混合架構；它的 Q4_K_M GGUF 會把大型 DeltaNet `attn_qkv` 投影存成 Q5_K，RockNPU 現在會轉成 resident W8 並在 prefill 時交給 NPU。
+其餘運算與不支援的格式自動交給 CPU，所以任何 llama.cpp 能跑的模型都能跑，只是加速程度不同。Qwen2.5‑0.5B（寬度 896）的 GGUF 權重不是目前支援的 K-quant 路徑，會完整由 CPU 執行（結果正確，只是沒有加速）。
 記憶體：NPU 需要另外保存一份 8-bit 權重，約為模型參數量（1B 模型約 1 GB）。
 
 **Q：NPU 頻率重要嗎？要超頻到 1 GHz 嗎？**

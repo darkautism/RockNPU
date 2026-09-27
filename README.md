@@ -27,9 +27,10 @@ Other models (tok/s; “CPU only” means stock llama.cpp defaults):
 |---|---:|---:|---:|---:|---:|---:|
 | Llama-3.2-1B-Instruct | 71 | **≈ 580** | — | 26 | 23 | — |
 | Qwen2.5-1.5B-Instruct | 55 | **≈ 350** | ≈ 340 | 22.5 | 19–20 | 16.7 |
+| Qwen3.5-4B | 18.1 | **≈ 86** | — | 6.9 | 6.3 | — |
 | Qwen2.5-0.5B-Instruct | 71 | 71 (no acceleration; see FAQ) | — | — | — | 41.6 (Qwen2 0.5B) |
 
-For long documents and long conversation history, prompt processing is typically **6–8× faster**. Single-stream decode defaults to the CPU because RK3588 memory bandwidth makes the CPU Q4_K path faster than resident W8 NPU decode. Compared with stock llama.cpp, decode can still be 5–15% slower because RockNPU must disable CPU weight repacking; see the FAQ below.
+For long documents and long conversation history, prompt processing is typically **4–8× faster**, depending on the model. Single-stream decode defaults to the CPU because RK3588 memory bandwidth makes the CPU Q4_K path faster than resident W8 NPU decode. Compared with stock llama.cpp, decode can still be 5–15% slower because RockNPU must disable CPU weight repacking; see the FAQ below.
 
 ---
 
@@ -189,7 +190,7 @@ export ROCKNPU_DECODE=hybrid
 This runs CPU and NPU concurrently and reaches roughly 26 tok/s. The default `cpu` mode is fastest for single-stream generation.
 
 **Which models are supported?**  
-RockNPU accelerates Q4_K / Q6_K GGUF projection weights, including common `Q4_K_M` models, when the relevant hidden dimensions match the supported NPU geometry. Llama 3.x, TinyLlama, and Qwen2.5 1.5B and larger are representative supported cases.
+RockNPU accelerates Q4_K / Q6_K projection weights and Q5_K prompt projections, including common `Q4_K_M` GGUF models, when the relevant dimensions match the supported NPU geometry. Llama 3.x, TinyLlama, Qwen2.5 1.5B and larger, and Qwen3.5-4B are representative supported cases. Qwen3.5-4B is a hybrid DeltaNet/attention model; its Q4_K_M GGUF stores the large DeltaNet `attn_qkv` projections as Q5_K, which RockNPU converts to resident W8 and executes on the NPU during prefill.
 
 Unsupported operations and formats remain on the CPU, so models that llama.cpp can run still work; they simply receive less or no NPU acceleration.
 
