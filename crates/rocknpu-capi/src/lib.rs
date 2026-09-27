@@ -2,7 +2,7 @@
 
 use bytemuck::pod_read_unaligned;
 use half::f16;
-use llama_gguf::tensor::quant::{dequantize_q4_k, dequantize_q6_k, BlockQ4K, BlockQ6K};
+use llama_gguf::tensor::quant::{dequantize_q4_k, dequantize_q5_k, dequantize_q6_k, BlockQ4K, BlockQ5K, BlockQ6K};
 use rayon::prelude::*;
 use rocket_runtime::RocketDevice;
 use rocknpu_matmul::{
@@ -749,6 +749,55 @@ fn prepare_q4_k_w8a8(weight_bytes: &[u8], k: usize, n: usize) -> Option<(Vec<i8>
         for bytes in encoded_row.chunks_exact(size_of::<BlockQ4K>()) {
             let block: BlockQ4K = pod_read_unaligned(bytes);
             dequantize_q4_k(&block, &mut decoded);
+            row.extend_from_slice(&decoded);
+        }
+        scales.push(append_quantized_symmetric(&row, &mut weights)?);
+    }
+    (weights.len() == total && scales.len() == n).then_some((weights, scales))
+}
+
+fn prepare_q5_k_w8a8(weight_bytes: &[u8], k: usize, n: usize) -> Option<(Vec<i8>, Vec<f32>)> {
+    const VALUES: usize = 256;
+    let row_bytes = (k / VALUES).checked_mul(size_of::<BlockQ5K>())?;
+    if weight_bytes.len() != n.checked_mul(row_bytes)? {
+        return None;
+    }
+    let total = n.checked_mul(k)?;
+    if total >= PARALLEL_DEQUANT_MIN_VALUES {
+        let mut weights = vec![0i8; total];
+        let mut scales = vec![0.0f32; n];
+        weight_bytes
+            .par_chunks_exact(row_bytes)
+            .zip(weights.par_chunks_mut(k))
+            .zip(scales.par_iter_mut())
+            .try_for_each_init(
+                || (vec![0.0f32; k], [0.0f32; VALUES]),
+                |state, ((encoded_row, output_row), output_scale)| -> Option<()> {
+                    let (row, decoded) = state;
+                    for (block_index, bytes) in
+                        encoded_row.chunks_exact(size_of::<BlockQ5K>()).enumerate()
+                    {
+                        let block: BlockQ5K = pod_read_unaligned(bytes);
+                        dequantize_q5_k(&block, decoded);
+                        let start = block_index * VALUES;
+                        row[start..start + VALUES].copy_from_slice(decoded);
+                    }
+                    *output_scale = quantize_symmetric_into(row, output_row)?;
+                    Some(())
+                },
+            )?;
+        return Some((weights, scales));
+    }
+
+    let mut weights = Vec::with_capacity(total);
+    let mut scales = Vec::with_capacity(n);
+    let mut row = Vec::with_capacity(k);
+    let mut decoded = [0.0f32; VALUES];
+    for encoded_row in weight_bytes.chunks_exact(row_bytes) {
+        row.clear();
+        for bytes in encoded_row.chunks_exact(size_of::<BlockQ5K>()) {
+            let block: BlockQ5K = pod_read_unaligned(bytes);
+            dequantize_q5_k(&block, &mut decoded);
             row.extend_from_slice(&decoded);
         }
         scales.push(append_quantized_symmetric(&row, &mut weights)?);
@@ -5217,6 +5266,116 @@ pub unsafe extern "C" fn rocknpu_matmul_q4_k_f32_f32(
 /// reference exactly `weights_bytes` readable bytes encoding N contiguous rows
 /// of K Q6_K values. Activation/output pointers must provide `M*K` readable and
 /// `M*N` writable f32 elements respectively for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rocknpu_matmul_q5_k_f32_f32(
+    context: *mut RockNpuContext,
+    weights_nk_q5_k: *const u8,
+    weights_bytes: usize,
+    activations_mk_f32: *const f32,
+    output_mn_f32: *mut f32,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> i32 {
+    const Q5_K_VALUES_PER_BLOCK: usize = 256;
+
+    if context.is_null()
+        || weights_nk_q5_k.is_null()
+        || activations_mk_f32.is_null()
+        || output_mn_f32.is_null()
+        || m == 0
+        || k == 0
+        || n == 0
+        || !k.is_multiple_of(Q5_K_VALUES_PER_BLOCK)
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let Some(a_len) = m.checked_mul(k) else { return STATUS_INVALID_ARGUMENT; };
+    let Some(out_len) = m.checked_mul(n) else { return STATUS_INVALID_ARGUMENT; };
+    let blocks_per_row = k / Q5_K_VALUES_PER_BLOCK;
+    let Some(block_count) = n.checked_mul(blocks_per_row) else { return STATUS_INVALID_ARGUMENT; };
+    let Some(expected_weight_bytes) = block_count.checked_mul(size_of::<BlockQ5K>()) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    if weights_bytes != expected_weight_bytes || m == 1 {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    if !MTILE_ROWS.contains(&m) && native_mtile_routes_enabled() {
+        return unsafe {
+            run_mtile_row_chunks(m, k, activations_mk_f32, &[output_mn_f32], &[n], |a, outs, tile| {
+                rocknpu_matmul_q5_k_f32_f32(
+                    context, weights_nk_q5_k, weights_bytes, a, outs[0], tile, k, n,
+                )
+            })
+        };
+    }
+    if native_mtile_routes_enabled() {
+        let split = unsafe {
+            split_wide_mtile(
+                m,
+                k,
+                n,
+                weights_nk_q5_k,
+                weights_bytes,
+                activations_mk_f32,
+                output_mn_f32,
+                |w, bytes, a, out, rows, cols| {
+                    rocknpu_matmul_q5_k_f32_f32(context, w, bytes, a, out, rows, k, cols)
+                },
+            )
+        };
+        if let Some(status) = split {
+            return status;
+        }
+    }
+
+    let (weight_bytes, activations, output, context) = unsafe {
+        (
+            slice::from_raw_parts(weights_nk_q5_k, weights_bytes),
+            slice::from_raw_parts(activations_mk_f32, a_len),
+            slice::from_raw_parts_mut(output_mn_f32, out_len),
+            &mut *context,
+        )
+    };
+
+    if matches!(m, 4 | 8 | 12 | 16 | 32 | 48 | 64 | 128)
+        && env_enabled("ROCKNPU_NATIVE_MTILE")
+        && env_enabled("ROCKNPU_MTILE_PERSIST")
+        && k <= 4096
+        && k.is_multiple_of(512)
+        && n.is_multiple_of(32)
+        && n <= 8192
+        && mtile_shape_enabled(k, n)
+    {
+        // Q5_K is converted to the same resident W8 form as Q4_K/Q6_K.
+        // Reuse the generic prompt-cache key namespace; tensor addresses are unique.
+        let key = DecodeWeightKey {
+            address: weight_bytes.as_ptr() as usize,
+            bytes: weight_bytes.len(),
+            k,
+            n,
+            kind: DecodeWeightKind::Q4K,
+        };
+        if env_enabled("ROCKNPU_MTILE_MC") && n >= MTILE_POOL_MIN_N {
+            return execute_cached_w8a8_mtile_pool(
+                context,
+                key,
+                m,
+                Int8DecodeSplit::N,
+                activations,
+                output,
+                || prepare_q5_k_w8a8(weight_bytes, k, n),
+            );
+        }
+        return execute_cached_w8a8_mtile(context, key, m, activations, output, || {
+            prepare_q5_k_w8a8(weight_bytes, k, n)
+        });
+    }
+
+    STATUS_INVALID_ARGUMENT
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rocknpu_matmul_q6_k_f32_f32(
     context: *mut RockNpuContext,

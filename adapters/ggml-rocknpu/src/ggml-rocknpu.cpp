@@ -619,7 +619,7 @@ bool rocknpu_mul_mat_supported(const ggml_tensor * op) {
     const ggml_tensor * weights = op->src[0];
     const ggml_tensor * activations = op->src[1];
     if ((weights->type != GGML_TYPE_F16 && weights->type != GGML_TYPE_Q4_K &&
-         weights->type != GGML_TYPE_Q6_K) ||
+         weights->type != GGML_TYPE_Q5_K && weights->type != GGML_TYPE_Q6_K) ||
         activations->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
         return false;
     }
@@ -636,7 +636,12 @@ bool rocknpu_mul_mat_supported(const ggml_tensor * op) {
     const int64_t k = weights->ne[0];
     const int64_t n = weights->ne[1];
     const int64_t m = activations->ne[1];
-    const bool quantized = weights->type == GGML_TYPE_Q4_K || weights->type == GGML_TYPE_Q6_K;
+    const bool quantized = weights->type == GGML_TYPE_Q4_K || weights->type == GGML_TYPE_Q5_K || weights->type == GGML_TYPE_Q6_K;
+    const bool q5_prompt = weights->type == GGML_TYPE_Q5_K;
+    if (q5_prompt && !(m > 1 && k <= 4096 && k % 512 == 0 &&
+                       n % 32 == 0 && n <= 8192 && rocknpu_native_mtile_routes())) {
+        return false;
+    }
     // The native W8 M-tile path takes N up to 8192 per tile (wider FFNs run
     // as column chunks, up to 3 tiles). Vocabulary heads (N=32000+) stay on
     // the optimized CPU backend.
@@ -994,7 +999,7 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
             const ggml_tensor * weights = node->src[0];
             const ggml_tensor * activations = node->src[1];
             const bool quantized = weights != nullptr &&
-                (weights->type == GGML_TYPE_Q4_K || weights->type == GGML_TYPE_Q6_K);
+                (weights->type == GGML_TYPE_Q4_K || weights->type == GGML_TYPE_Q5_K || weights->type == GGML_TYPE_Q6_K);
             if (prewarm_mtile && quantized) {
                 const size_t k = static_cast<size_t>(weights->ne[0]);
                 const size_t n = static_cast<size_t>(weights->ne[1]);
@@ -1010,7 +1015,9 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                     static_cast<size_t>(activations->ne[1]),
                     static_cast<size_t>(weights->ne[0]),
                     static_cast<size_t>(weights->ne[1]));
-            const bool native_batch = native_small_batch ||
+            const bool q5_chunked_batch = native_mtile && weights != nullptr &&
+                weights->type == GGML_TYPE_Q5_K && activations != nullptr && activations->ne[1] > 1;
+            const bool native_batch = native_small_batch || q5_chunked_batch ||
                 (native_mtile && quantized && activations != nullptr &&
                  activations->ne[1] >= 32 && activations->ne[1] <= 128 && activations->ne[1] % 16 == 0);
             const bool supported_batch = activations != nullptr &&
@@ -1470,6 +1477,8 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                 if (weights->type == GGML_TYPE_Q4_K) {
                     context->q4_k_mul_mat_calls++;
                     weight_type = "q4_K";
+                } else if (weights->type == GGML_TYPE_Q5_K) {
+                    weight_type = "q5_K";
                 } else if (weights->type == GGML_TYPE_Q6_K) {
                     context->q6_k_mul_mat_calls++;
                     weight_type = "q6_K";
@@ -1497,9 +1506,10 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                 }
                 const auto node_started = std::chrono::steady_clock::now();
                 int status;
-                const bool quantized_mtile = weights->type == GGML_TYPE_Q4_K || weights->type == GGML_TYPE_Q6_K;
+                const bool quantized_mtile = weights->type == GGML_TYPE_Q4_K || weights->type == GGML_TYPE_Q5_K || weights->type == GGML_TYPE_Q6_K;
                 const bool native_mtile = quantized_mtile &&
                     (rocknpu_small_native_mtile_supported(m, k, n) ||
+                     (weights->type == GGML_TYPE_Q5_K && m > 1 && rocknpu_env_enabled("ROCKNPU_NATIVE_MTILE")) ||
                      (m >= 32 && m <= 128 && m % 16 == 0 && rocknpu_env_enabled("ROCKNPU_NATIVE_MTILE")));
                 const bool split_m32 = !native_mtile && m == 32 && rocknpu_env_enabled("ROCKNPU_M32_AS_2X16");
                 const bool split_chunked = !native_mtile && m >= 32 && m <= 128 && m % 16 == 0 &&
@@ -1572,6 +1582,16 @@ enum ggml_status rocknpu_backend_graph_compute(ggml_backend_t backend, ggml_cgra
                     if (status == ROCKNPU_STATUS_OK) context->native_w8_calls++;
                 } else if (weights->type == GGML_TYPE_Q4_K) {
                     status = rocknpu_matmul_q4_k_f32_f32(
+                        context->runtime,
+                        static_cast<const uint8_t *>(weights->data),
+                        ggml_nbytes(weights),
+                        static_cast<const float *>(activations->data),
+                        static_cast<float *>(node->data),
+                        m,
+                        k,
+                        n);
+                } else if (weights->type == GGML_TYPE_Q5_K) {
+                    status = rocknpu_matmul_q5_k_f32_f32(
                         context->runtime,
                         static_cast<const uint8_t *>(weights->data),
                         ggml_nbytes(weights),

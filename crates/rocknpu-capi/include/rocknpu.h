@@ -201,6 +201,16 @@ int rocknpu_matmul_q4_k_f32_f32(
     size_t k,
     size_t n);
 
+int rocknpu_matmul_q5_k_f32_f32(
+    rocknpu_context * context,
+    const uint8_t * weights_nk_q5_k,
+    size_t weights_bytes,
+    const float * activations_mk_f32,
+    float * output_mn_f32,
+    size_t m,
+    size_t k,
+    size_t n);
+
 int rocknpu_matmul_q6_k_f32_f32(
     rocknpu_context * context,
     const uint8_t * weights_nk_q6_k,
