@@ -66,6 +66,7 @@ Disposition:
 | Hybrid helper thread (big cores or A55 cluster) | Oversubscribes the OpenMP team or slows NPU submission; replaced by the overlap callback. | C4 | CLOSED |
 | NPU 1 GHz (850 mV) for LLM work | Decode primitive and pp128 unchanged within 2 % vs 700 MHz. | C4 | CLOSED |
 | `-fa off` with NPU prefill | pp128 452 → 326. | C4 | CLOSED |
+| FP16 GQA attention as NPU QK^T -> CPU softmax -> NPU AV | Hardware oracle is accurate (causal prefill max abs <=2.67e-4), but q_len=128 costs 2.873 ms per KV group; four TinyLlama KV groups concurrently cost 5.801 ms/layer, ~127.6 ms over 22 layers before integration overhead. Current pp128 is ~225 ms total and CPU flash attention is only ~17% of TinyLlama CPU samples. Reopen only with a different fused/batched dataflow. | C4 | CLOSED |
 | Wide shapes on the native M-tile path (K-split to 12288, 64-row halves, N chunks, K zero-padding, pool from N ≥ 768) | Llama‑3.2‑1B pp128 260 → 580, Qwen2.5‑1.5B 31 → 311; TinyLlama KL bit-identical. | C4 | KEEP |
 | Two-part activation encoding (`ROCKNPU_PREFILL_HILO`) as default | KLD 4–5× lower but prefill speed halves (`down`: ~2× lower KLD, −23 %). Opt-in only. | C4 | CLOSED as default |
 | LLM.int8()-style fixed outlier channels for W8A8 prefill | Outliers are per-token over tens–hundreds of channels; scale gain only 2–4×. | C4 | CLOSED |

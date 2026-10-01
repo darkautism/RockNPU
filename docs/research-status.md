@@ -312,19 +312,15 @@ Do not repeat the scheduler-boundary-only variant unchanged. H1 remains useful
 only if the next composite FFN path removes more real work or intermediate
 ownership than merely relabeling the CPU SwiGLU under the RockNPU backend.
 
-### H2 — end-to-end NPU attention
+### H2 — FP16 GQA attention via QK^T -> CPU softmax -> AV (closed as formulated)
 
-Second priority.
+A 2026-10-01 o16 hardware oracle tested the proposed TinyLlama GQA mapping without changing the kernel. Eight query heads sharing one KV head were stacked into the NPU M dimension. Correctness passed when QK^T and AV used separate fixed-shape FP16 executors: decode-shaped contexts 32..1024 had max absolute error about 1e-5..7e-5, and causal prefill q_len 32..256 had max absolute error 2.67e-4 or less.
 
-TinyLlama GQA gives a useful mapping for decode: eight query heads share one KV head. Treating those heads as an M=8 batch can map attention matmuls onto the already validated FP16 geometry instead of the invalid FP16 M=1 path.
+The performance bound is not competitive with the current CPU flash-attention path. For causal q_len=128, one KV group (`M=1024,K=64,N=128` QK^T; CPU softmax; `M=1024,K=128,N=64` AV) measured 2.873 ms: QK^T 0.924 ms, softmax 1.283 ms, AV 0.662 ms. Four real TinyLlama KV groups run concurrently in 5.801 ms/layer on o16, or about 127.6 ms across 22 layers. Current RockNPU pp128 is roughly 225 ms for the entire model, while CPU flash attention accounts for only about 17% of TinyLlama CPU samples. Moving this attention slice to the NPU would also contend with the already-useful NPU projection work.
 
-Candidate first slice for one GQA group:
+Therefore the two-matmul FP16 mapping is closed. Do not integrate it into llama.cpp/Ollama. Reopen attention offload only with a materially different mechanism that removes the four-GQA/two-submit structure and demonstrates a whole-model wall-time win over CPU flash attention.
 
-- QK^T: M=8, K=64, N padded to 16;
-- AV: M=8, K=context padded to 32, N=64;
-- softmax remains CPU initially.
-
-Start with a small exact/tolerance hardware oracle. Do not mirror KV state unless its consumers move with it.
+The experiment also exposed a separate reusable-FP16-executor correctness hazard: some mixed QK/AV sequences produced NaNs when one executor/scratch set was reused, while separate fixed-shape executors and the raw single FP16 smoke tests were correct. Treat that as an independent userspace bug before relying on generic FP16 executor/pool reuse.
 
 ### H3 — make M128 verifier capacity useful
 
@@ -343,7 +339,7 @@ Only a cold-start project. It is not a steady-state decode priority. Any format 
 ## Priority order
 
 1. quality-equivalent userspace FFN dataflow;
-2. exact/tolerance M=8 GQA attention slice;
+2. cheaper prefill activation precision / host-quantization mechanism;
 3. improve speculative proposer acceptance so M128 matters in general generation;
 4. high-precision M=1 output head;
 5. cold-start packed format.
